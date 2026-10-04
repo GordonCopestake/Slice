@@ -27,7 +27,7 @@ The tests use the Pi AI faux provider, disposable SQLite files, and fake externa
 - Return an unknown remote status: the operation stays `uncertain`, raises `UncertainExternalOperationError`, and is not dispatched a second time.
 - Call the same active operation through two journal instances: it is dispatched once, and reuse with changed input is rejected.
 - Abort a durable background task: its abort handler records an aborted terminal state.
-- Start a second owner for the same state directory: it fails closed. The lock releases after shutdown, a restarted service reports healthy, and an existing state directory is restricted to owner access.
+- Start a second owner for the same state directory: it fails closed. The lock releases after shutdown and a restarted service reports healthy. On Unix, startup rejects a state directory with broader permissions without changing them.
 - Start the HTTP service on loopback: `/healthz` returns the runtime health response.
 
 ## Live provider checks
