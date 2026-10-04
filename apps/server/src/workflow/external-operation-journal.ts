@@ -33,9 +33,13 @@ type OperationRow = {
 
 /** At-most-once local dispatch with explicit reconciliation after an ambiguous result. */
 export class ExternalOperationJournal {
+  static readonly #inFlightByDatabase = new WeakMap<
+    DatabaseSync,
+    Map<string, { payloadHash: string; promise: Promise<JsonValue> }>
+  >();
+
   readonly #database: DatabaseSync;
   readonly #ownerId: string;
-  readonly #inFlight = new Map<string, { payloadHash: string; promise: Promise<JsonValue> }>();
 
   constructor(database: DatabaseSync, ownerId: string = randomUUID()) {
     this.#database = database;
@@ -49,16 +53,21 @@ export class ExternalOperationJournal {
   ): Promise<R> {
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(operationId)) throw new TypeError("Invalid external operation ID");
     const payloadHash = hashJson(payload);
-    const active = this.#inFlight.get(operationId);
+    let inFlight = ExternalOperationJournal.#inFlightByDatabase.get(this.#database);
+    if (inFlight === undefined) {
+      inFlight = new Map();
+      ExternalOperationJournal.#inFlightByDatabase.set(this.#database, inFlight);
+    }
+    const active = inFlight.get(operationId);
     if (active !== undefined) {
       if (active.payloadHash !== payloadHash) throw new Error("An active operation ID cannot be reused with different input");
       return active.promise as Promise<R>;
     }
 
     const promise = this.#run(operationId, payload, payloadHash, driver);
-    this.#inFlight.set(operationId, { payloadHash, promise: promise as Promise<JsonValue> });
+    inFlight.set(operationId, { payloadHash, promise: promise as Promise<JsonValue> });
     void promise.finally(() => {
-      if (this.#inFlight.get(operationId)?.promise === promise) this.#inFlight.delete(operationId);
+      if (inFlight?.get(operationId)?.promise === promise) inFlight.delete(operationId);
     }).catch(() => {});
     return promise;
   }
