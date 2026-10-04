@@ -1,6 +1,6 @@
 # Phase 0 runtime results
 
-Status: **synthetic recovery checks pass; live model checks are not tested**.
+Status: **synthetic recovery checks pass; the local model check passed; the OpenAI cloud check is not tested**.
 
 ## Runtime and pinned packages
 
@@ -16,7 +16,7 @@ Direct dependencies are pinned exactly. `package-lock.json` pins the complete in
 
 ## Checks run
 
-`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 17 Node tests.
+`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 20 Node tests.
 
 The tests use the Pi AI faux provider, disposable SQLite files, and fake external systems. The process tests send `SIGKILL` to a real Node worker and then reopen its state.
 
@@ -32,6 +32,7 @@ The tests use the Pi AI faux provider, disposable SQLite files, and fake externa
 - Cancel a thread through the adapter while a conversation-owned background task is live: the task reaches an aborted terminal state before `cancel()` returns.
 - Start a second owner for the same state directory: it fails closed. The lock releases after shutdown, a restarted service reports healthy, and an existing state directory is restricted to owner access.
 - Start the HTTP service on loopback: `/healthz` returns the runtime health response.
+- Local model configuration against a loopback endpoint: a configured API key arrives as the `Authorization` header, an endpoint without a key receives the non-secret placeholder, and a base URL carrying credentials, a non-HTTP scheme, or a key with a control character is rejected.
 
 ## Pinned runtime API checks
 
@@ -56,7 +57,13 @@ Both are dominated by Node process start-up, not by Slice state replay. These ar
 
 ## Live provider checks
 
-Local model smoke test: **not tested**. No local endpoint was configured for this run.
+Local model smoke test: **passed** on 2026-10-04.
+
+- Endpoint: `http://ws-p3:8080/v1`, an OpenAI-compatible llama-swap server.
+- Model: `Qwen3.8-27B-ABLITERATED-GGUF`, the model reported as `loaded` at the time of the run.
+- Result: `{"status":"passed","provider":"slice-local","model":"Qwen3.8-27B-ABLITERATED-GGUF","stopReason":"stop"}`.
+
+The endpoint requires an API key and answers `401` without one, so `SLICE_LOCAL_API_KEY` was set for the run. The key was passed in the process environment only and is not committed. The response was a streamed chat completion and the model returned the exact requested string.
 
 OpenAI smoke test: **not tested**. No approved model profile and API credential were configured for this run.
 
@@ -69,9 +76,16 @@ npm run smoke:openai
 
 Each command sends a short text prompt and reports the provider and model ID. These smoke tests do not prove tool-call, streaming, cancellation, structured-output, image, long-context, or privacy-policy compatibility. Those checks remain required before a profile can serve a production role.
 
+Notes on this endpoint, for whoever picks the production profile:
+
+- The server listed eight models. Most were `unloaded`, so the first request against one would pay a model load. Several carry `abliterated` or `uncensored` names, which means refusal behaviour was deliberately removed. That is a policy decision for the owner, not a default to inherit from a smoke test.
+- The chosen model is a reasoning model: it emits `reasoning_content` first. A small output budget is consumed before any visible text appears, so `SLICE_LOCAL_OUTPUT_TOKENS` must leave room for reasoning or the response reads as empty.
+- The server reports `function_calling: true` and `tools` in `supported_parameters`. This smoke test sent a text-only prompt and did not exercise tool calls.
+
 ## API and recovery limits
 
 - Pi Durable `1.0.2` is experimental. Keep it behind `PiDurableAdapter` and rerun the recovery tests before any upgrade.
+- The pinned Pi AI OpenAI-compatible client refuses to send any request whose auth carries no API key. A keyless local endpoint therefore receives a non-secret placeholder from `SLICE_LOCAL_API_KEY`'s absence. An endpoint that checks a real key must set that variable; the key is read from the environment only and rejected if it carries a control character.
 - `watchEvents` is marked experimental by Pi Durable. One `AgentEventStream` accepts `start()` only once; a second call throws `Watch is already started`. Keep one listener per stream for the life of the subscription.
 - A document draft from `tx.doc()` is a settled overlay once its commit ends and throws `Cannot use a settled overlay` on a later read. Read the value inside its own commit, including when reading a stored document back.
 - `Conversation.abort()` only reaches non-background tasks unless it is passed `{ background: true }`. Cancelling user work must pass that option or conversation-owned background tasks keep running.
@@ -84,5 +98,5 @@ Each command sends a short text prompt and reports the provider and model ID. Th
 
 ## Outstanding for the phase gate
 
-- Live model checks are still **not tested**. They need an owner-supplied local endpoint and an approved cloud model profile, so the phase exit check cannot be signed off until they run.
+- The OpenAI cloud smoke test is still **not tested**. It needs an approved cloud model profile and an API credential, so the phase exit check cannot be signed off until it runs.
 - Code review and security review need a second person. The author implemented this work and cannot approve it; no security review record exists yet.

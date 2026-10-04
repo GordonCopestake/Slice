@@ -36,6 +36,8 @@ export SLICE_LOCAL_MODEL_ID=your-model-id
 npm run smoke:local
 ```
 
+Set `SLICE_LOCAL_API_KEY` only when the local endpoint checks an API key. A keyless endpoint is sent a non-secret placeholder, because the Pi AI client refuses to send a request with no API key at all.
+
 For OpenAI:
 
 ```sh
