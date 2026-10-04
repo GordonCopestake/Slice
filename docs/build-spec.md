@@ -1,6 +1,8 @@
 # Pi Durable agent build specification
 
-Version 1.0 · 4 October 2026 · Proposed implementation
+Version 1.2 · 4 October 2026 · Reviewed implementation design
+
+The design review and corrections are recorded in [spec-review.md](spec-review.md).
 
 ## 1 Purpose and main decision
 
@@ -120,7 +122,7 @@ The main actions are “Request a change”, “Accept result”, and “Open PR
 
 ### Step 6 Merge and deploy
 
-The Git host enforces the required checks. The release system tests the actual merge result and creates a versioned release artifact. The user authorises deployment through the existing release system. The agent service can track the release and show the rollback action or instructions.
+The Git host enforces the required checks. The release system obtains the actual merged revision from the Git host, tests it, and creates a versioned release artifact independently of the job checkout. The user authorises deployment through the existing release system. The agent service can track the release and show the rollback action or instructions. Thread archiving and pending workspace cleanup do not block deployment or rollback.
 
 Version 1 does not hold production deployment credentials. A later release integration may offer “Deploy” and “Roll back” in the web app. Those actions must use a separate executor and fresh user authorisation tied to the exact release and environment.
 
@@ -155,7 +157,7 @@ The owner configures available models. Example profiles are `author`, `code-revi
 
 ## 6 Review and repair rules
 
-Every review must produce a validated structured report. Reject missing fields, unknown verdicts, or unsupported claims. Limit formatting repair to two attempts. Invalid output is a failed review task, not a pass.
+Every review must produce a validated structured report. Reject missing fields, unknown verdicts, and evidence references that cannot be resolved to the reviewed source or recorded checks. Limit formatting repair to two attempts. Invalid output is a failed review task, not a pass. The coordinator verifies format, provenance, and check results; reviewers and independent validation assess what the evidence means. This gate does not prove that code has no defects.
 
 Each report contains the job and requirements revision, repository identity, base and head commit IDs, test-environment identity, model identity, review scope, verdict, findings, and evidence references.
 
@@ -170,28 +172,32 @@ Each finding contains:
 
 Allowed verdicts are `pass`, `changes_required`, and `unable_to_review`. Missing context or missing tools must produce `unable_to_review` where they prevent a sound review.
 
-Critical, high, and medium findings block readiness. Fix low findings where practical. A low finding can remain only under a preconfigured policy with a stated reason in the final packet. The agent must not lower severity merely to clear the gate.
+Critical, high, and medium findings block readiness and cannot be waived. Fix low findings where practical. A low finding can remain only when a reviewer returns `pass` and a preconfigured severity policy permits it with a stated reason in the final packet. The agent must not lower severity to clear the gate.
 
-The author cannot close a reviewer finding. The originating reviewer can mark it `verified_fixed` or `not_applicable` with evidence. A separate escalation reviewer can propose a resolution. A disputed blocking finding remains blocked unless a supported reviewer resolution exists or the owner accepts a documented exception. Such a result is labelled “Ready with accepted exception”, not “All checks passed”.
+The author cannot close a reviewer finding. The originating reviewer can mark it `verified_fixed` or `not_applicable` with evidence. A separate escalation reviewer can propose a resolution. Disputed blocking findings stay blocked. Owner exceptions are disabled by default. If enabled for a project, an exception can cover only a named low or informational finding with a `pass` review, or a pre-existing check failure with the same recorded signature at baseline. Bind it to the verification key and state the accepted risk. Record `owner_accepted` separately; it does not alter the original review verdict or test result. Label the result “Ready with accepted exception”. Required reviews, unresolved critical/high/medium findings, unknown model identity, invalid evidence, stale revisions, source-integrity failure, and isolation or credential failures cannot be waived.
 
 Start with at most four review and repair rounds. Escalate earlier when the same issue repeats, reviewers disagree on a blocking issue, or a security-sensitive change needs stronger inspection. At the round or budget limit, stop in `blocked` and provide a short explanation with completed evidence. Never convert a time limit into approval.
 
 ### The readiness gate
 
-Readiness is true only when all of these are true:
+A candidate is eligible for publication when the following prerequisites hold. It can still be a draft PR with pending Slice status checks at this point:
 
 1. Requirements have a valid revision and no unresolved material question.
 2. The branch exists, is committed, and has no uncommitted changes relevant to delivery.
-3. Baseline failures are recorded. Required changed-behaviour tests and regression checks pass, or an explicit owner exception identifies a pre-existing failure.
+3. Baseline failures are recorded. Required changed-behaviour tests pass. A pre-existing check failure can proceed only through the enabled, verification-key-bound exception policy; confirm the same failure signature existed at baseline.
 4. Every acceptance criterion has independent evidence. A screenshot alone does not prove access control or data integrity.
-5. Code review passes on the final head commit and current review context.
-6. Security review passes on that same commit and context.
+5. Code review is complete on the final head commit and current review context, and passes on the normal path.
+6. Security review is complete on that same commit and context, and passes on the normal path.
 7. Required validation, secret scanning, dependency checks, and applicable static checks are complete.
-8. No unresolved blocking finding remains.
+8. No unresolved critical, high, or medium finding remains. A low or informational finding follows the preconfigured rule above. A pre-existing test failure can remain only through an exception that matches its recorded baseline signature. Every non-waivable prerequisite still holds.
 9. Documentation, preview evidence where applicable, and rollback records are complete.
 10. The remote PR head and the recorded head match.
-11. The target branch is current under the repository's merge policy. The tested merge candidate satisfies required checks.
-12. The PR is open, is no longer draft, and required checks were published by the trusted gate identity.
+11. The base commit still matches the reviewed merge context. An explicit merge candidate built from that base and head passes the required build and test checks from the project profile. These checks are separate from the Slice checks that this gate is about to publish.
+12. The linked PR is open and still targets the configured repository and base branch.
+
+Record the candidate verdict as `pass`, `pass_with_owner_exception`, or `blocked`. For an eligible candidate, enter `publishing`: publish the Slice checks for the recorded head and merge context, and promote the PR from draft through idempotent external operations. Re-read the PR and check results after those operations. Mark the job `ready` and send the completion notification only when the head and base still match, every required check has been acknowledged, and the PR is no longer draft. A publication outage leaves the job in `publishing`; it does not force another authoring cycle or falsely report completion.
+
+New work on an already-ready PR first requires acknowledged removal of readiness: set the existing gate checks pending and return the PR to draft. If the PR has already merged, create a new linked job. Do not push repairs into a branch whose PR was merged.
 
 The gate evaluation is recorded with its input hashes and policy version. A blocked or unsupported scan is not a successful scan.
 
@@ -199,7 +205,7 @@ The gate evaluation is recorded with its input hashes and policy version. A bloc
 
 Bind each approval and evidence record to a verification key: repository, base commit, head commit, merge-candidate commit where applicable, requirements revision, policy version, tool configuration, and environment image or build profile.
 
-A head change always invalidates both reviewer approvals and prior readiness. A requirements change, relevant base change, toolchain change, or policy change also invalidates affected evidence. Reuse content as background information, but issue fresh approvals for the new key.
+A head change always invalidates both reviewer approvals and prior readiness. A requirements change, relevant base change, toolchain change, source-input change, resolved model change, or policy change also invalidates affected evidence. Reuse content as background information, but issue fresh approvals for the new key.
 
 A rebase can keep the same textual patch and still change its behaviour. Revalidate it. If the target branch moves after the user accepts the result, show the acceptance as stale until the merge policy and required checks are satisfied again. Test the actual merged commit before production deployment, including after squash or rebase merge.
 
@@ -209,7 +215,9 @@ Register cloud providers through Pi AI. Register local servers through a custom 
 
 Support separate URLs and capacities for llama.cpp, NInfer, Strata, llama-swap, and future servers, subject to capability checks. These names identify possible endpoints, not a promise that each server implements every required protocol feature.
 
-Each configured profile declares the provider, model ID, stable model family or weight identity, context limit, output limit, tool support, image support, reasoning options, pricing metadata, privacy policy, concurrency limit, and permitted fallback profiles.
+Each configured profile declares the provider, model ID, stable model family or weight identity, context limit, output limit, tool support, image support, reasoning options, pricing metadata, privacy policy, concurrency limit, and permitted fallback profiles. Record the resolved model returned by the provider and the endpoint configuration revision for each attempt. Local model aliases and proxy URLs can change weights without changing their display names. Distinct profile names do not prove distinct models. Use pinned model versions or owner-maintained identity metadata where available, and record any identity limits. A detected identity change invalidates the affected attempt.
+
+Track every model that authored the current change, including repair and fallback attempts. Required code and security reviewer identities must be distinct from each other and from those author identities. Recheck that constraint when choosing a fallback.
 
 Run a capability check before a profile can serve an agent role. Check tool argument validation, streaming, cancellation, error responses, long-context limits, and structured report output. Check image input only for roles that need it. A code reviewer need not have vision if a separate validation role handles images.
 
@@ -230,7 +238,9 @@ These are planning shares. Repairs count as implementation. The author cannot la
 
 Track input, output, cached input, and reasoning tokens where the provider exposes them. Do not double-count reasoning tokens included in output. Show provider-reported and estimated usage separately. Track spend, elapsed time, and tool use as separate measures. Equal token counts do not imply equal cost or equal review quality.
 
-Set a per-job money limit, token limit, round limit, elapsed-time limit, and model concurrency limit. Reserve verification capacity before authoring starts. Warn at 70% of the configured money budget. At the hard limit, checkpoint and pause until the owner raises it. Lower-cost reuse or local processing can continue only within the stated limits and data policy.
+Each project must provide default per-job money, token, round, active-time, and concurrency limits before paid work can start. A job can override them within owner policy. Report active work time and total elapsed time separately. Reserve verification capacity before authoring starts and warn at 70% of the configured money budget.
+
+The model gateway reserves a conservative maximum cost and token allowance before every request, including compaction, formatting repair, retries, and escalation. Concurrent reservations draw from one job budget. Use the measured input, configured output and reasoning limits, and versioned price data; do not assume a cache discount in the reservation. Settle reservations from reported usage. Unknown usage remains uncertain and charged against a conservative allowance, never zero. Block paid requests whose cost cannot be bounded under policy. The budget limits admission of requests; provider billing is not an atomic part of the local database, so in-flight reservations remain accountable after cancellation or restart. Reaching a limit pauses further work until the owner raises it.
 
 Use focused context and evidence links. Avoid replaying every author message to every reviewer. The two 5060 Ti cards need an endpoint capacity queue: several review conversations can exist at once while model requests run one at a time. Do not assume an always-on conversation needs an always-running inference request.
 
@@ -248,7 +258,9 @@ Register hosts and repositories before accepting work. A model chooses a registe
 | Capabilities | Toolchain versions, sandbox type, browser support, capacity |
 | Limits | CPU, memory, disk, process count, output size, runtime |
 
-Register more than one repository as a separate project profile. Each profile declares its stable project ID, Git provider and URL, default branch, allowed SSH endpoints, build commands, required checks, test fixtures, browser scenarios, preview requirements, allowed cloud profiles, deployment adapter, and rollback policy. Settings are owner-controlled and versioned outside the untrusted feature branch. The user chooses a project for each task; a worker receives only that project's repository, endpoint, and permitted credentials. Keep workspaces, policies, PR records, and evidence tied to the project ID.
+Register more than one repository as a separate project profile. Each profile declares its stable project ID, Git provider and URL, default branch, allowed SSH endpoints, build commands, required checks, test fixtures, browser scenarios, preview requirements, branch-writer credential, PR and check publishers, allowed cloud profiles, release tracker, and rollback policy. Settings are owner-controlled and versioned outside the untrusted feature branch. Jobs record the profile revision used for each stage. The user chooses a project for each task; a worker receives only that project's repository, endpoint, and permitted credentials. Keep workspaces, policies, PR records, and evidence tied to the project ID.
+
+Check current permission and privacy policy before admitting each new operation. Revoking cloud permission stops new cloud requests, including queued fallbacks; settle or cancel requests already admitted. Changing a build or gate profile invalidates affected evidence. Pausing or removing a project stops new jobs and pauses its active work at a safe boundary. Retain a tombstone and historical profile revisions for its threads, PRs, and release records.
 
 The Linux control host must be able to use a Windows runner. For example, legacy ASP.NET WebForms and .NET Framework 4.8 builds need a compatible Windows toolchain. A successful Linux-only check cannot stand in for that build. The repository profile chooses the correct runner before work starts.
 
@@ -256,9 +268,13 @@ The Linux control host must be able to use a Windows runner. For example, legacy
 
 Use SSH to invoke a small installed runner. Send typed JSON input on stdin. Receive structured status and artifact references. Avoid constructing shell text from model-provided strings.
 
-The runner exposes operations such as `prepare_job`, `run_check`, `get_process_status`, `cancel_process`, `create_snapshot`, and `collect_artifacts`. It records operation IDs, process groups, start time, exit code, and output files. Builds and tests can continue while the control service restarts.
+The runner exposes operations such as `prepare_job`, `run_check`, `get_process_status`, `cancel_process`, `create_snapshot`, and `collect_artifacts`. It records operation IDs, process groups, start time, exit code, and output files. Keep its protected journal outside disposable job directories. Builds and tests can continue while the control service restarts.
 
-Use dedicated runner accounts, pinned host keys, and no SSH agent forwarding. The runner verifies the job ID, role, path, and lease before it starts work. A reviewer cannot use the author's write lease. SSH provides transport; it does not provide the execution sandbox.
+Use dedicated runner accounts, pinned host keys, and no SSH agent forwarding. The trusted runner and sandboxed job commands use separate OS identities. Job commands cannot access the runner's SSH credentials, operation journal, control socket, or other jobs. A reviewer cannot use the author's write lease. SSH provides transport; it does not provide the execution sandbox.
+
+Every operation carries the job ID, role, operation ID, and a monotonically increasing lease generation. The runner checks them at admission. Revoking a generation prevents new coding and check operations; it does not prove an existing process stopped. Trusted status, cancellation, artifact export, and cleanup operations use separate permissions bound to the current job record. They remain available after author leases are revoked. After a restart or lease timeout, reconcile existing work before granting a replacement lease.
+
+Start remote commands under a supervisor with a deterministic operation name, such as a container or service unit ID. The runner must find that operation even after a crash between process start and PID recording. A missing PID alone is not permission to start a duplicate. Reconcile any operation admitted before revocation.
 
 ### Worktree layout
 
@@ -271,14 +287,22 @@ Example Linux runner paths:
 /srv/slice/jobs/<job-id>/author/
 /srv/slice/jobs/<job-id>/snapshots/<head-sha>/
 /srv/slice/jobs/<job-id>/tests/<check-id>/
-/srv/slice/jobs/<job-id>/artifacts/
+/srv/slice/jobs/<job-id>/export/
 ```
 
-The service creates `slice/<job-id>/<short-title>` and a coding worktree from the recorded base commit. One author lease owns the branch. Reviewers receive immutable exports or isolated clones of the exact frozen revision. Disposable test copies can write build output and temporary data without writing the PR branch.
+The service creates `slice/<job-id>/<short-title>` and a coding worktree from the recorded base commit. One author lease owns the branch. Record a source manifest covering the Git tree, submodule revisions, LFS objects, and other approved build inputs. Missing inputs block checks that depend on them.
 
-Only service-controlled Git operations can commit and push the feature branch. Keep Git host credentials out of author shells. Validate the branch, worktree, allowed file changes, and expected parent before each push. Never use a user's live checkout, remove their files, or reset their work.
+Resolve submodules, LFS, and build dependencies only from project-approved hosts. Never forward repository credentials to URLs supplied by repository content.
 
-Track filesystem changes as well as commits. After an uncertain edit, inspect the workspace before deciding to retry. Preserve failed work for inspection. When the linked PR is confirmed merged, archive the thread and schedule its local worktree and per-job checkout for deletion. Never delete the durable conversation, review history, merge record, or evidence packet as part of worktree cleanup. Remove a worktree only after its processes stop, artifacts are retained outside the worktree, and no active lease exists. Do not use force removal as the normal cleanup path. For other closed jobs, use a configurable cleanup period, initially 30 days after close.
+Reviewers and previews use frozen source. Mount it read-only and keep outputs, fixtures, and independently supplied tests separate. For a toolchain that needs a writable source copy, record its initial and final source digests and reject undeclared source changes. Explicit generated inputs belong in the build profile and manifest. A check cannot cite the original commit if it actually ran against altered code.
+
+Only service-controlled Git operations can commit and push the feature branch. The trusted runner owns the authoritative Git metadata. The author can write permitted source and scratch files but has only read access to that metadata for inspection. It cannot write the common Git directory, change remotes or hooks, or access publishing credentials. A private sandbox Git repository has no publishing authority. The service validates and imports the source changes before making an authoritative commit.
+
+Before each commit or push, validate the lease generation, branch, allowed paths, expected parent, remote head, and PR state. Never use a user's live checkout, remove their files, or reset their work.
+
+Track filesystem changes as well as commits. After an uncertain edit, inspect the workspace before deciding to retry. Preserve failed work for inspection. A confirmed merge archives the thread immediately and schedules asynchronous workspace cleanup. Copy required artifacts to persistent control-service storage and verify their digests before readiness and before deletion; the runner's export directory is temporary.
+
+Never delete durable conversations, review history, merge records, or retained evidence as part of workspace cleanup. Delete only after job processes stop and leases are revoked. Do not use force removal as the normal cleanup path. For other closed jobs, use a configurable cleanup period, initially 30 days after close.
 
 Allow work in several registered repositories at once, subject to endpoint and model capacity limits. Start with one active author per repository to avoid branch and resource collisions. Queue a second task for the same repository or let the user start it after the first author releases its lease. Different repositories can proceed concurrently with separate clones, policies, and credentials.
 
@@ -323,17 +347,28 @@ flowchart TD
   C --> G["Readiness gate"]
   S --> G
   G -->|"Findings or failed checks"| I
-  G -->|"All required evidence passes"| R["Ready for user"]
+  G -->|"Prerequisites pass"| H["Publish checks and promote PR"]
+  H -->|"Publication confirmed"| R["Ready for user"]
   R -->|"User requests a change"| Q
   R -->|"User accepts result"| U["Accepted result"]
   U --> M["User merges"]
-  M --> A["Archive thread and clean worktree"]
-  A --> D["User deploys tested release"]
+  M --> A["Archive thread and schedule cleanup"]
+  M --> D["User deploys tested release"]
 ```
 
 Use durable task IDs for workflow stages. The control service reads committed state before selecting the next stage. A restart must not create a second author or lose a pending user question.
 
-The technical state also includes `waiting_for_user`, `waiting_for_capacity`, `paused`, `blocked`, `cancel_requested`, `cancelled`, `failed`, `archived`, and `cleanup_pending`. The UI shows plain-language equivalents. These are not successful completion states. An archived job remains searchable and read-only in the thread picker. To continue work after merge, the user starts a new linked job with a new branch and workspace.
+Use separate state fields so archiving, cleanup, and release tracking cannot overwrite one another:
+
+| Field | Values or purpose |
+|---|---|
+| Stage | Requirements, planning, implementation, checks, publication, ready, finished |
+| Run state | Running, waiting for user or capacity, pause requested, paused, blocked, cancel requested, cancelled, failed, completed |
+| Archive state | Active or archived, with reason and verified merge time |
+| Cleanup state | Workspace available, cleanup pending, cleanup failed, cleaned |
+| Release state | Not started, waiting for approval, deploying, deployed, failed, rolled back |
+
+Bind task results and transitions to a workflow generation and verification key. Late results from a superseded generation can remain in the audit record but cannot advance the current job. An archived job is searchable and read-only. Follow-up work creates a linked new job with a new branch and workspace.
 
 ### External operation records
 
@@ -344,13 +379,13 @@ Every external mutation has an operation ID and record with `planned`, `running`
 | Read file or Git status | Replay if safe and preserve evidence revision |
 | Create job directory or worktree | Check job marker, branch and base; reuse only if they match |
 | Edit source | Inspect current file and expected content; do not replay an arbitrary shell edit |
-| Start a build or test | Query runner operation ID; reattach or rerun in a fresh sandbox |
+| Start a build or test | Find the supervised operation even if no PID was recorded; reattach or reconcile before any replacement run |
 | Commit or push | Inspect commit ID and remote branch; reconcile before retry |
 | Create a PR | Find the recorded head branch and existing PR before another create |
 | Publish checks | Use exact commit and gate ID; reconcile existing result |
 | Send Telegram alert | Outbox with deduplication; allow for an occasional duplicate after uncertainty |
 | Observe PR merge | Verify the PR's merged state and merge commit from the Git host; treat webhook or poll events as hints until verified |
-| Delete merged worktree | Wait for all owned tasks and remote processes to stop; verify the job manifest, path boundary, and no active lease; remove only that job's workspace; record the result |
+| Delete merged workspace | Confirm executable job tasks and remote processes stopped, leases revoked, and required artifacts exported; verify manifest and path boundary; delete only that job's resources |
 | Deploy or roll back | Separate release executor; inspect actual release state; no blind replay |
 
 The local database and a remote Git host cannot commit atomically. Persist intent, act, then persist the result. After a crash, reconcile. Pi Durable's replay setting is not a replacement for this external operation journal.
@@ -359,7 +394,11 @@ Treat request retries as the same submission when they carry the same request ID
 
 ### Pause and cancel
 
-Pause checkpoints work and stops new model and tool calls. Cancel requests stop the owned job tasks and remote process groups. The runner confirms termination. If a host cannot be reached, show “Cancellation pending on host” and retain the lease. Do not claim the job stopped until that is known. Preserve the branch and PR; do not automatically delete them.
+Pause enters `pause_requested`, stops admission of new model and tool calls, and lets in-flight work reach a safe checkpoint. Show “Finishing the current step” until the job is actually paused.
+
+Cancellation explicitly targets foreground and background job tasks, model requests, previews, and remote process groups. Pi Durable conversation abort can leave owned background tasks running, so the adapter must request their cancellation too. [S1] Reporting timers and release tracking are separate tasks with their own lifecycle policy.
+
+The runner confirms termination. If a host cannot be reached, show “Cancellation pending on host”, revoke admission, and retain the outstanding operation records. Do not grant a replacement lease or claim that work stopped until remote state is known. Preserve the branch and PR; do not automatically delete them.
 
 A browser or Telegram disconnect never cancels work. Reconnect obtains a state snapshot, then resumes the event stream from a cursor. Cancellation and confirmation operate on the same durable job regardless of the surface used.
 
@@ -367,15 +406,17 @@ A browser or Telegram disconnect never cancels work. Reconnect obtains a state s
 
 In the UI, “thread” means the user-facing history for one change request and its durable conversations. The picker has Active and Archived views. Archived rows remain searchable by project, title, PR number, branch, and date. Opening one shows its transcript, status reports, final summary, review findings, checks, acceptance record, merge commit, and retained evidence. It does not reconnect the user to a running agent.
 
-Detect merges through a verified Git-host webhook where available, with a periodic reconciliation poll as a recovery path. Deduplicate webhook deliveries. Do not archive or delete a workspace from a branch name, a closed PR event, or an unverified notification. Confirm the exact linked PR is merged and record its merge commit.
+Detect merges through a verified Git-host webhook where available, with a periodic reconciliation poll as a recovery path. Deduplicate webhook deliveries. Do not archive or delete a workspace from a branch name, a closed PR event, or an unverified notification. Confirm that the exact linked PR has `merged: true` and record its actual merged revision. A non-null GitHub `merge_commit_sha` on an unmerged PR can identify a test merge; it is not merge confirmation. [S7]
 
-After merge confirmation, stop new job work, wait for all owned conversations, tasks, and runner processes to finish, retain the final packet and required artifacts outside the workspace, then mark the thread archived and remove only its local worktree and per-job checkout. Keep the remote merged branch and Git history under the Git host's normal retention policy. Do not delete shared repository caches or another job's worktree.
+After merge confirmation, record the actual merged revision, archive the thread, revoke its workflow generation, and stop its periodic reports. Persisted conversations are history, not running processes. Cleanup runs separately: stop or settle active job tasks and runner processes, stop previews, release mounts, and verify retained artifacts before deletion. An offline host leaves cleanup pending without delaying archive visibility or release tracking.
+
+Remove the complete job workspace: its worktree, disposable repository, snapshots, test copies, dependency directories, build outputs, preview containers, and job-owned volumes. Release ports and other job resources. Retain exported evidence, release artifacts, and bounded shared caches outside that workspace. Keep the remote merged branch and Git history under the Git host's normal retention policy. Do not delete another job's files.
 
 Cleanup runs through an idempotent runner operation. It checks the job ID, a service-owned manifest, path containment under the configured job root, process state, and lease. It refuses paths that resolve outside the root or no longer match the manifest. It records `cleanup_pending`, `cleaned`, or `cleanup_failed`. A failure leaves the archived thread and records intact, keeps the error visible in the picker, and allows a safe retry. Never report disk cleanup as complete until the runner confirms deletion.
 
 The archived transcript and result summary remain in durable storage. Keep the final evidence packet outside the worktree for a configurable retention period, initially 365 days. Show the user when an individual large artifact expires; preserve the review report, merge record, and evidence manifest for the thread's configured history period. Apply the same retention policy to backups.
 
-If the user merges a PR while a job is unexpectedly still active, block new model and runner calls, cancel or settle child work safely, then clean up. Do not let a late author push add commits to the merged branch. If any owned process cannot be confirmed stopped, keep cleanup pending and alert the user.
+If the user merges a PR while work is unexpectedly active, block new author and publishing operations, then cancel or settle child work. Reconcile any operation admitted before revocation. Record the actual merged revision separately from any later feature-branch commit; never attribute late work to the merged release. If a process cannot be confirmed stopped, keep cleanup pending and alert the user.
 
 ## 11 Mobile web and Telegram
 
@@ -385,11 +426,33 @@ If the user merges a PR while a job is unexpectedly still active, block new mode
 2. **New request:** app selector, text, attachments, optional budget.
 3. **Request detail:** conversation, requirements, current stage, questions, spend, pause and cancel. Show a status report every 10 minutes by default. Let the user change the interval or turn reports off for that job.
 4. **Result:** preview, screenshots, evidence, limits, rollback plan, PR link, acceptance and change request.
-5. **Settings:** registered projects, hosts, models, privacy rules, budgets, default report interval, and alerts. The owner can add multiple repositories, assign allowed SSH endpoints and model profiles, test connectivity, and pause or remove a project. Removing a project blocks new work but does not erase its archived threads or evidence.
+5. **Settings:** registered projects, hosts, models, privacy rules, budgets, default report interval, and alerts. The owner can add multiple repositories, assign allowed SSH endpoints and model profiles, test connectivity, and pause or remove a project. Pausing or removing it pauses active jobs and blocks new work while preserving threads, PR links, and evidence.
+
+Use pi-mobile's low-chrome mobile layout as a reference: a compact header, a slide-out thread and project picker, focused work view, and controls near the user's thumb. Keep a visible path back to the thread list. The screenshot below is from the upstream repository's desktop replay test; its text is a fixture, not a proposed Slice transcript:
+
+![Pi-mobile desktop replay screenshot used as a visual reference.](images/pi-mobile/desktop-conversation.png)
+
+*The reference is pinned to commit `4cc9b712254d84c90a00373c972c8a417fd26fb9`. Reuse the compact layout and session navigation; Slice's own screens below show the task workflow.*
+
+Use these Slice concept screens as layout references:
+
+![Slice mobile interface concepts: thread picker, progress report, and review-ready result. Example data only.](images/slice-mockups/01-threads.png)
+
+*Thread picker concept. Active work and archived results share one searchable list. A merged thread stays visible after workspace cleanup.*
+
+![Slice mobile progress screen concept. Example data only.](images/slice-mockups/02-working.png)
+
+*Work status concept. Show stage, checks, next step, last worker signal, elapsed time, budget use, and next report. Do not show private reasoning or an unfiltered action stream.*
+
+![Slice mobile review-ready result concept. Example data only.](images/slice-mockups/03-result.png)
+
+*Result concept. Lead with user-facing behaviour and verified evidence. Keep requesting changes, accepting the result, and opening the PR as separate choices; acceptance does not merge or deploy.*
+
+These concept images use example data. They are product references, not captures of a running Slice app or proof that any check passed. Slice captures real screenshots only from a tested preview at the revision and environment recorded in its evidence manifest.
 
 The new-task flow has “Describe a change” and “Start from a GitHub issue” entry points. Issue selection searches only registered repositories and excludes pull requests. The issue view identifies its repository, number, title, state, labels, author, latest update, and relevant comments before the user starts a task.
 
-Make the result usable on an iPhone or iPad without horizontal scrolling. Put behaviour and preview evidence first. Put source diffs, raw logs, and agent transcripts behind optional detail controls. Show “Not tested” and “Blocked” clearly; do not replace them with a green summary.
+Make the result usable on an iPhone or iPad without horizontal scrolling. Put behaviour and preview evidence first. Put source diffs, redacted tool logs, user dialogue, and review reports behind optional detail controls. Never expose private model reasoning. Show “Not tested” and “Blocked” clearly; do not replace them with a green summary.
 
 Use a responsive web app with an optional home-screen install. Cache the app shell only. Sensitive job records and evidence require authentication. Browsers closing or sleeping must not affect worker execution.
 
@@ -419,7 +482,7 @@ GET  /api/jobs/:id/evidence
 GET  /api/jobs/:id/artifacts/:artifactId
 ```
 
-Mutating routes require a request ID and an expected job revision. Conflicting revisions return the current state and a conflict response. Validate artifact IDs against the job; never turn a URL parameter into an unrestricted path.
+Mutating routes require a request ID and payload hash. Creating a project or job does not require a revision of a resource that does not yet exist. Updates require the expected revision of the affected resource. Requirements answers also identify the pending question and its revision. Conflicts return the current state; late answers cannot change an archived or superseded request. Keep command revisions separate from telemetry so a status report does not invalidate an owner's form. Validate artifact IDs against the job; never turn a URL parameter into an unrestricted path.
 
 ### Periodic progress reports
 
@@ -429,17 +492,23 @@ Build the report from committed workflow events, runner state, completed checks,
 
 Each report contains:
 
-- Project and change title, current stage, time in that stage, and last report time.
+- Project and change title, current stage, time in that stage, last progress time, and age of the last observed worker heartbeat.
 - What completed since the previous report and what is in progress now.
 - What the next stage is, where the workflow has enough information to say.
 - Any blocker, dependency, queued capacity, or answer needed from the user.
-- Elapsed time, actual recorded spend, and the configured budget remaining.
+- Elapsed and active work time, provider-reported spend, estimated or uncertain usage, and the budget remaining after reservations.
 - A remaining-time range and confidence label when there is enough history to estimate it.
 - The time of the next scheduled report and a link to the thread.
 
-If nothing changed, say so and identify what the job is waiting for. Do not emit an empty message or imply that work is active if the worker is idle. Until at least 10 comparable completed jobs exist, say “Not enough data to estimate remaining time.” Then use calibrated durations from similar project and workflow stages. Include a range and confidence, account for known queue time, and refresh the estimate from observed task and check duration. Do not show a precise countdown or invent progress percentages.
+If nothing changed, identify what the job is waiting for. Distinguish slow work with a current heartbeat from a worker whose status is unknown. Do not treat a heartbeat as proof of useful progress.
 
-Persist the interval, next due time, and each scheduled report as durable job state. Reports are created once per scheduled time, survive service restarts, and continue while a job is paused so the user can see that it remains paused. Cancellation or completion stops future periodic reports and sends the normal final update. Reject intervals outside the configured range. A report delivery failure does not stop work; record it and retry through the notification outbox without creating a duplicate report. The web UI shows the report even when the device missed a push notification.
+Estimate stage time and whole-job remaining time separately. Use comparable project, change, and workflow history only when it supports a calibrated range. Record the cohort, sample count, observed error or coverage, and confidence basis; a fixed number of completed jobs does not prove calibration. Account for queue time and further repair rounds. Without usable history, say “Remaining time unknown”. A configured build duration can support a labelled planning estimate for that stage, with low confidence. Do not turn it into a whole-job countdown or invent progress percentages.
+
+Persist the interval, reporting generation, next due time, and report records. Create one report record per job, generation, and due time. After a restart or several missed ticks, coalesce overdue ticks into one current report, then schedule the next future tick. Do not send a backlog of stale updates.
+
+Reports continue during paused, waiting, and blocked work. Reaching `ready`, confirmed cancellation, terminal failure, or archive stops periodic reports and records the final update. A new request for changes starts a new reporting generation. Changing the interval or disabling reports also invalidates queued periodic delivery for the old generation.
+
+Before delivery, recheck enabled channels, reporting generation, terminal state, and message expiry. A failed delivery uses the outbox without duplicating the report record; uncertain Telegram delivery can still produce an occasional duplicate message. Notification failure does not stop work. Reject intervals outside the configured range. The web UI shows the report even when the device missed a push notification, and shows when its source status is stale.
 
 ### Telegram defaults
 
@@ -451,7 +520,7 @@ The user must first start the bot and link the chat to the authenticated account
 
 Optional version 2 commands are `/new`, `/status`, `/pause`, `/resume`, and `/cancel`, with inline requirement answers. They call the same authenticated workflow API and use durable request IDs. Telegram cannot bypass the web or workflow permissions. Exclude merge and deployment commands from the initial Telegram scope.
 
-For notification-only use, no inbound webhook is needed. If commands are enabled, use either long polling from the control service or a verified webhook. Deduplicate update IDs, enforce the linked account, and validate the webhook secret header when webhooks are used. [S5]
+Use long polling to receive the bot start and account-link messages even when job commands are disabled; no inbound webhook is required. If commands are enabled, use either long polling or a verified webhook. Deduplicate update IDs, enforce the linked account, and validate the webhook secret header when webhooks are used. [S5]
 
 ## 12 Evidence and user acceptance
 
@@ -462,6 +531,8 @@ Use a browser test tool in an isolated preview to capture real UI evidence. Capt
 Screenshots must come from a running tested app. Do not generate images to stand in for proof. Where the change has no visible UI, provide API examples, test output, or an operational demonstration instead. Mark screenshots “Not applicable” with a reason.
 
 A preview must use synthetic or sanitised data and have no route to production services. Preview routing and authentication are separate from the control UI. Serve stored HTML and other active artifacts from an isolated origin or as safe downloads, so evidence cannot execute scripts inside the authenticated control page.
+
+Export verified evidence to persistent control-service storage, for example `/var/lib/slice/artifacts/<job-id>/`, and register its digests and artifact IDs before promoting the PR. Runner paths are not permanent evidence links. Release artifacts live in the existing release system's retained artifact store, outside disposable job directories.
 
 The final packet includes:
 
@@ -484,13 +555,23 @@ User acceptance is bound to the same verification key as the result. If new code
 
 Use separate author-publishing and gate-publishing identities. The author never receives a token that can post successful gate checks. The gate identity publishes results only from validated application records.
 
-Required checks should include `slice/requirements`, `slice/validation`, `slice/code-review`, `slice/security-review`, and `slice/release-plan`. Configure them as required checks for the target branch and bind them to the expected GitHub App where supported. Enable current-branch testing and stale approval handling under the repository's merge policy. [S4]
+Required checks should include `slice/requirements`, `slice/validation`, `slice/code-review`, `slice/security-review`, and `slice/release-plan`. Configure them as required checks for the target branch and bind them to the expected GitHub App. Require the branch to be up to date before merge and dismiss stale human approvals under the repository's policy. A base update must not silently reuse checks for an earlier merge context. A later merge-queue integration must publish checks for the queue's merge-group revision too. [S4]
+
+The candidate gate distinguishes prerequisite build checks from the Slice checks it publishes. Final readiness requires all configured check names, identities, and passing results on the exact applicable revision. An owner exception is visible in check details and the result page; it never rewrites the original test or reviewer result.
 
 LLM reviewers do not need separate human GitHub accounts. Their reports are distinct application records. One trusted gate App can expose separate status checks. Do not count an AI status as a required human approval if the repository also requires a human review.
 
-Repository write permission can be broader than the desired branch restriction. Do not claim a scoped token alone prevents merge. Enforce branch protection or rulesets, no bypass for the agent identity, and an API wrapper that exposes only permitted operations. The service has no normal merge route. Test that its configured identity cannot merge, delete the protected branch, or alter protection.
+Separate the Git identities so no service credential can both write source and merge a PR:
 
-If repository plan or permissions cannot enforce the required restrictions, show the missing control and block unattended publishing until a supported configuration is chosen. The onboarding check must not infer protection from a successful push.
+1. A repository-scoped SSH deploy key lets the trusted Git service push source branches. Keep it on the control host. Do not forward it to workers or expose it to a model. Host branch controls must allow it to update only the registered feature-branch pattern and reject its direct push to the target branch. Verify this exact behavior in the disposable repository before enabling a project.
+2. A GitHub App with `Pull requests: write` creates, promotes, and updates PRs. Give it no `Contents: write` permission. The PR merge endpoint requires `Contents: write`, so this identity cannot merge through that API. [S7]
+3. A separate GitHub App publishes required checks. Give it only the check permission it needs and bind the required checks to this App. Do not give it source or PR write permissions. [S4]
+
+No runner, author, control-surface request, or model can select other credentials. Restrict branch-creation and update rules to the registered feature-branch pattern where supported. Protect the target branch with required PRs, strict up-to-date checks, stale approval handling, and no bypass for service identities. Keep required checks separate from any direct-update rule; a human's permission to update a ref must not bypass PR checks. Confirm the exact ruleset and plan on each project before work is enabled. [S8]
+
+In a disposable onboarding repository, satisfy every check and human approval first. Verify the branch key can push the intended feature branch but cannot directly update the target branch; the PR App can create and promote a draft PR but its merge request is denied for lack of `Contents: write`; the check App can publish only its bound checks; and the owner can merge through GitHub. Confirm service identities cannot change or delete the protection. A denied merge with failing checks proves nothing. Do not probe permissions on a production PR.
+
+If a repository cannot enforce these permissions, show the missing control and block real PR publishing until an owner-approved configuration passes this test. The onboarding check must not infer protection from a successful push.
 
 ## 14 Deployment and rollback
 
@@ -498,7 +579,7 @@ The release system must retain the previous working artifact. A rollback normall
 
 For each release, record the merged commit, artifact digest, dependency lockfile digest, build environment, configuration version, migration IDs, previous release ID, health checks, deployment time, and operator approval. Preserve the same build artifact through staging and production. A source change after acceptance must not enter the release unnoticed.
 
-The initial service prepares these records and instructions for the existing release system. The release system must supply an enforceable user approval and health-check step. If these do not exist, implementing them is a prerequisite for safe production use, not something screenshots can replace.
+The initial service prepares records and instructions for each project's existing release system. Version 1 does not build a general deployment engine. The release system must supply an enforceable user approval and health-check step. If these do not exist, implementing them is a prerequisite for production use.
 
 ### Normal deployment procedure
 
@@ -535,21 +616,24 @@ Use versioned typed documents for application records. Add migrations before cha
 
 | Record | Required content |
 |---|---|
-| Project | Stable ID, repo identity, host, build and test profiles, issue settings, privacy and gate policy |
-| Job or thread | ID, owner, project, request source, GitHub issue identity and snapshot time where applicable, state, revision, timestamps, budget, report interval, next report time, archive reason and date, linked predecessor if any |
+| Project | Stable ID, repo identity, allowed hosts, versioned build and test profiles, issue settings, privacy and gate policy, Git identity references, default budgets, active or tombstoned state |
+| Job or thread | ID, owner, project and profile revision, request source and issue snapshot, stage, run/archive/cleanup/release states, command revision, workflow generation, timestamps, budgets, report settings and generation, next report time, linked predecessor |
 | Issue link | Provider, repository ID, issue ID and number, URL, captured update time, linked job IDs |
 | Requirements | Revision, criteria, assumptions, decisions, scope |
-| Workspace | Host, repo, branch, base, paths, lease, head, process IDs, cleanup status and timestamp |
-| Stage run | Role, conversation and task IDs, model, prompt and policy versions, outcome |
-| Finding | Claim, severity, source review, evidence, response, resolution history |
+| Workspace | Host, repo, branch, base, paths, lease generation, head, supervised operation IDs, resource manifest, cleanup status and timestamp |
+| Git identity | Project, branch-writer key, PR metadata App, check publisher App, granted permissions, credential references, verified ruleset revision |
+| Source snapshot | Commit and tree, submodule and LFS identities, approved input digests, build profile, initial and final tested source digests |
+| Stage run | Workflow generation, role, conversation and task IDs, resolved model and endpoint revision, prompt and policy versions, attempt usage, outcome |
+| Budget reservation | Job, model request and attempt, maximum tokens and cost, price revision, admission and settlement state, reported or uncertain usage |
+| Finding | Claim, severity, source review and original verdict, evidence, response, resolution history, owner exception and verification key if permitted |
 | Review report | Verification key, reviewer identity, scope, verdict, findings |
-| Check result | Verification key, command profile, environment, exit code, artifacts |
+| Check result | Verification key, source snapshot, command profile, environment, exit code, artifacts, original result and any separately recorded exception |
 | Artifact | Job, type, digest, size, location, verification key, retention |
-| External operation | Operation ID, intent, preconditions, status, observed external ID |
+| External operation | Job and generation, operation ID, intent, preconditions, status, observed external or supervised ID, reconciliation result |
 | Acceptance | Owner, timestamp, exact verification key, exceptions, stale status |
-| PR record | Repository, number, URL, branch, head, draft and merge status, merge commit, verified merge time, gate result |
-| Notification | Outbox ID, job event, channel, recipient reference, status |
-| Status report | Job and report IDs, scheduled time, stage snapshot, progress, blockers, spend, ETA range and confidence basis, content version, delivery state |
+| PR record | Repository, number, URL, branch, base and head, draft and verified merge status, actual merged revision, gate candidate and publication result |
+| Notification | Outbox ID, job event, reporting generation where applicable, channel, recipient reference, expiry, status |
+| Status report | Job, generation and report IDs, due and creation times, stage snapshot, progress and heartbeat age, blockers, reported/reserved/uncertain spend, stage and whole-job ETA basis, content version, delivery state |
 | Release record | Release artifact, actual merged commit, approval, previous release, recovery plan |
 
 A finding can refer to an earlier commit, but its final resolution must identify evidence on the current one. Store test and screenshot metadata outside the conversation summary. Compaction must never erase requirements, unresolved findings, approval identity, budgets, or operation state.
@@ -581,10 +665,14 @@ Slice/
     integration/
   docs/
     build-spec.md
+    spec-review.md
     operations.md
+    images/
+      slice-mockups/
+      pi-mobile/
 ```
 
-These paths are a proposed future structure. At the time this specification was added, Slice contained only its initial README and this document.
+These paths are a proposed future structure. Slice currently contains its initial README and design documents.
 
 Hide experimental Pi Durable APIs behind one adapter. The application depends on operations such as open store, resume tasks, create role conversation, submit input, cancel work, read state, and subscribe to committed events. These are internal contracts, not upstream method signatures.
 
@@ -608,31 +696,31 @@ Each phase produces a usable, checked result. Complete the earlier phase's exit 
 
 ### Phase 0 Prove the experimental runtime
 
-Pin dependencies. Build the Pi Durable adapter. Use a fake model and tool service, then one actual local model and one approved cloud model. Prove persisted submission deduplication, resume, safe tool replay, uncertain tool handling, compaction, conversation isolation, and cancellation.
+Pin dependencies. Build the Pi Durable adapter. Use a fake model and tool service, then one configured local model and one approved cloud model. Verify the actual task, document, event, compaction, and cancellation APIs against the pinned version. Prove persisted submission deduplication, resume, safe tool replay, uncertain tool handling, conversation isolation, and explicit background-task cancellation.
 
-Exit check: kill the service at known task boundaries, restart it, and recover the correct state without duplicate external actions. Measure recovery rather than assuming it from persistence. Do not connect production repositories yet.
+Exit check: kill the service at known task boundaries, restart it, and recover the correct state without duplicate external actions. Keep synthetic and live results separate. Missing live credentials or endpoints must be reported as not tested, not as a passing live check. Measure recovery rather than assuming it from persistence. Do not connect production repositories yet.
 
 ### Phase 1 Deliver mobile requests for registered projects
 
-Add single-owner authentication, a project registry for multiple repositories, job creation from a user request or selected GitHub issue, requirements, a state page, event reconnection, pause and cancel. Add SSH endpoint profiles and a disposable demo repository. Add the runner operation journal and a single author workspace per active repository job.
+Add single-owner authentication, a project registry for multiple repositories, job creation from a user request or selected GitHub issue, requirements, a state page, event reconnection, pause and cancel. Use two disposable demo repositories on one Linux runner with explicit build profiles. Add the runner journal, supervised operation IDs, fenced leases, and a single author workspace per active repository job. Support only the configured demo toolchains at this stage.
 
 Exit check: a user submits a small change from a phone against each of two registered demo repositories, then starts a task from an issue in one of them. The issue maps to one job with its source link intact. The user answers a necessary question, closes the browser, reconnects, and sees the same job continue. Concurrent jobs in different repositories do not share a workspace or project policy. No user checkout is touched.
 
 ### Phase 2 Deliver a checked PR
 
-Add branch and draft PR creation, test profiles, independent validation, separate code and security model profiles, structured findings, repair rounds, readiness checks, and protected Git host check publication.
+Add branch and draft PR creation, test profiles, independent validation, separate code and security model identities, structured findings, repair rounds, readiness and publication states, and protected Git host checks. Include verified merge observation, basic archival, artifact export, and idempotent complete-workspace deletion before trials with real PRs.
 
-Exit check: an intentionally faulty author output is blocked, fixed, and reviewed again on the new commit. A PR becomes ready only after all required evidence passes. The agent identity cannot merge it.
+Exit check: an intentionally faulty author output is blocked, fixed, and reviewed again on the new commit. A PR becomes ready only after evidence and publication are confirmed. In the disposable repository, all checks and any human approval pass, the owner can merge, and the publisher still cannot. Confirm merge archives the job and cleanup removes only its resources while retaining evidence.
 
 ### Phase 3 Deliver evidence, thread history, and notifications
 
-Add isolated previews, browser scenarios, baseline and after screenshots, documentation records, the result page, a searchable thread picker, verified merge observation, archived result views, 10-minute default status reports with configurable intervals, and a notification outbox. Add Telegram account linking and alerts.
+Add isolated previews, browser scenarios, baseline and after screenshots, documentation records, the result page, a searchable thread picker, archived result views, calibrated status reports with a 10-minute default interval, and a notification outbox. Add Telegram account linking and alerts.
 
 Exit check: the user can assess the result from an iPhone or iPad without opening source files. Closing a preview does not stop the job. Evidence remains accessible after workspace cleanup.
 
 ### Phase 4 Add more hosts and release readiness
 
-Add additional SSH hosts and runner pools, refine per-project model and privacy rules, capacity limits, Windows build profiles, idempotent worktree deletion and cleanup recovery, release tracking, and rollback rehearsal records. Connect existing release controls without giving workers production credentials.
+Add additional SSH hosts and runner pools, refine per-project model and privacy rules, capacity limits, Windows build profiles, cleanup recovery across host outages, release tracking, and rollback rehearsal records. Connect existing release controls without giving workers production credentials. A project requiring Windows remains disabled until its enforced sandbox and real toolchain checks pass.
 
 Exit check: a Linux project and a Windows project complete on the correct hosts. A previous release is restored in staging using its retained artifact. A database-sensitive change cannot claim easy rollback without compatibility evidence.
 
@@ -654,8 +742,8 @@ These checks test system properties and failures. They are not a request to writ
 | Job is paused across a report boundary | Report says the job is paused and shows no false active progress |
 | Job finishes or is cancelled | No later periodic report is sent; a final status is recorded |
 | No comparable task history exists for an ETA | Report says the remaining time cannot yet be estimated |
-| Fewer than 10 comparable completed jobs exist | Report says there is not enough data to estimate remaining time |
-| At least 10 comparable jobs exist | Report shows a calibrated range and confidence, never a precise countdown |
+| Comparable history is absent or fails the calibration check | Report says remaining time is unknown |
+| Comparable history supports a calibrated estimate | Report gives a range, confidence basis, cohort size, and estimation error measured against held-out jobs |
 | Inspect report text for private reasoning or raw commands | Report contains only the approved workflow summary fields |
 | Telegram periodic delivery is off | Reports remain in the web thread and no periodic Telegram message is sent |
 | A report notification is retried | One report appears in history; delivery status shows the retry |
@@ -701,6 +789,22 @@ These checks test system properties and failures. They are not a request to writ
 | Repository text tells the model to disable security checks | Policy remains unchanged |
 | PR modifies its own gate workflow | External gate still applies and sensitive-change policy triggers |
 | Author tries to publish a passing gate check | Credentials and API permissions deny access |
+| All checks pass and approval is present, but a service PR App tries to merge | Host denies the request because the identity has no merge permission |
+| Feature-branch writer pushes directly to the target branch | Host rejects the push |
+| Base advances or a PR enters a merge queue | Required checks apply to the current merge context; old checks cannot publish readiness |
+| Test mutates source after its revision was recorded | Source digest mismatch blocks the result |
+| Service crashes after starting a named remote operation but before recording its PID | Runner reconciles the operation ID; it does not start a duplicate |
+| Merge is confirmed while the SSH host is unavailable | Thread archives and release remains visible; workspace cleanup is pending |
+| Several report ticks are missed while the service is down | One current report is generated, without stale backlog messages |
+| Several model requests compete for one job budget | Reservations share the cap; unknown usage is not counted as zero |
+| Owner changes the model behind a configured alias | New identity is recorded; old review evidence is invalidated |
+| Profile removal or cloud permission revocation arrives during active work | No new request uses the revoked profile; in-flight work is reconciled or cancelled |
+| Publishing starts from an eligible draft PR | Check publication and draft conversion are idempotent; readiness waits for host acknowledgement |
+| Head, base, or required check changes during publishing | Re-read detects stale context; PR does not become ready |
+| Owner accepts a permitted baseline exception | Raw failed check remains visible; separate acceptance and gate decision use the same verification key |
+| Test result omits its declared source or environment digest | Evidence is rejected |
+| Create-request retry arrives after a lost response | Idempotency key and payload hash return the same job |
+| Answer arrives for an old question after requirements changed | Stale answer is rejected without changing the new revision |
 | Required human review is configured | AI checks do not satisfy it |
 | A green summary lacks actual test artifacts | Packet validation fails |
 | Screenshot is from an older commit | Packet validation fails |
@@ -719,7 +823,7 @@ Use seeded code defects to evaluate reviewer profiles: access-control errors, cr
 
 Version 1 is done when a user can submit a scoped app change from a mobile browser and receive a real checked PR, with independent code and security reviews, verification evidence, documentation where needed, and a usable rollback plan. The user can return to active or archived threads in the picker. A confirmed merge archives the thread, preserves its history and final evidence, and removes the local worktree after the runner verifies that no process or lease remains.
 
-It must survive a control-service restart and a temporary model or SSH outage. It must enforce distinct reviewer profiles, privacy policy, budgets, and current-commit approvals. It must not expose production credentials to workers or merge automatically. The owner must be able to pause, cancel, request changes, accept the result, and use the normal merge and deployment controls.
+It must survive a control-service restart and a temporary model or SSH outage. It must enforce distinct reviewer model identities, privacy policy, budgets, source provenance, and current-revision approvals. It must not expose production credentials to workers or merge automatically. The owner must be able to pause, cancel, request changes, accept the result, and use the normal merge and deployment controls.
 
 The first production trial should be a small code-only change with easy staging verification and rollback. Add database changes only after the compatibility and recovery path is proven. This keeps the initial build focused without changing the final goal.
 
@@ -741,3 +845,6 @@ The sources below support the current upstream facts. The workflow, policies, bu
 - **S4** GitHub protected branch and required status check documentation, checked 4 October 2026. https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches and https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
 - **S5** Telegram Bot API, checked 4 October 2026. https://core.telegram.org/bots/api
 - **S6** GitHub REST API documentation for issues, checked 4 October 2026. GitHub treats pull requests as a subset of issue records, so the issue picker must exclude records with a `pull_request` field. https://docs.github.com/en/rest/issues/issues
+- **S7** GitHub REST API documentation for pull requests, checked 4 October 2026. The merge endpoint accepts fine-grained tokens with Contents write permission. https://docs.github.com/en/rest/pulls/pulls
+- **S8** GitHub available rules for rulesets, checked 4 October 2026. Restrict updates permits only configured bypass actors to update matching refs. https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+- **S9** `p1rallels/pi-mobile`, web UI for the Pi coding agent. Visual reference: the repository's basic Playwright desktop replay screenshot, pinned to commit `4cc9b712254d84c90a00373c972c8a417fd26fb9`. The published iPhone test image currently shows a Face ID error, so it is not used as a successful mobile-flow example. UI screenshot and mockups are not application test evidence. Screenshot copyright and MIT license notice are retained in `docs/images/pi-mobile/LICENSE`. https://github.com/p1rallels/pi-mobile/tree/4cc9b712254d84c90a00373c972c8a417fd26fb9
