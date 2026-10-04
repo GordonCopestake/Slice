@@ -16,7 +16,7 @@ Direct dependencies are pinned exactly. `package-lock.json` pins the complete in
 
 ## Checks run
 
-`npm run check` passes on Node `v24.19.0`. This runs `npm run typecheck`, `npm run build`, and the Node test runner.
+`npm run check` passes on Node `v24.19.0`: typecheck, build, and all 9 Node tests.
 
 The tests use the Pi AI faux provider, disposable SQLite files, and fake external systems. The process tests send `SIGKILL` to a real Node worker and then reopen its state.
 
@@ -25,8 +25,9 @@ The tests use the Pi AI faux provider, disposable SQLite files, and fake externa
 - Kill a worker after a fake external effect: Pi replays the explicitly replay-safe tool; the remote idempotency key keeps the effect count at one.
 - Kill a worker after an external effect but before the journal records success: restart reconciliation finds the remote receipt and does not dispatch the effect again.
 - Return an unknown remote status: the operation stays `uncertain`, raises `UncertainExternalOperationError`, and is not dispatched a second time.
+- Call the same active operation through two journal instances: it is dispatched once, and reuse with changed input is rejected.
 - Abort a durable background task: its abort handler records an aborted terminal state.
-- Start a second owner for the same state directory: it fails closed. The lock releases after shutdown and a restarted service reports healthy.
+- Start a second owner for the same state directory: it fails closed. The lock releases after shutdown, a restarted service reports healthy, and an existing state directory is restricted to owner access.
 - Start the HTTP service on loopback: `/healthz` returns the runtime health response.
 
 ## Live provider checks
