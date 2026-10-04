@@ -20,6 +20,15 @@ export type ModelEnvironment = {
 /** Sent to a local endpoint that does not check authorization; not a secret and not used as one. */
 export const KEYLESS_PLACEHOLDER_API_KEY = "slice-local-no-auth";
 
+/** Default room for one reply. Reasoning models spend part of this before any visible text appears. */
+const DEFAULT_LOCAL_OUTPUT_TOKENS = 32_768;
+
+/**
+ * Default prompt window. 256k matches the context length the local test endpoint advertises for its models; a model
+ * with a smaller window must set SLICE_LOCAL_CONTEXT_TOKENS, because a request is rejected rather than truncated.
+ */
+const DEFAULT_LOCAL_CONTEXT_TOKENS = 262_144;
+
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
   if (value === undefined) return fallback;
   const parsed = Number(value);
@@ -51,6 +60,19 @@ export function createConfiguredModels(environment: ModelEnvironment = process.e
     // The pinned OpenAI-compatible client refuses to send any request whose auth carries no API key, so a keyless
     // local server still needs a placeholder value. Servers that ignore authorization never read it.
     const localApiKey = configuredApiKey ?? KEYLESS_PLACEHOLDER_API_KEY;
+    const contextTokens = positiveInteger(
+      environment.SLICE_LOCAL_CONTEXT_TOKENS,
+      DEFAULT_LOCAL_CONTEXT_TOKENS,
+      "SLICE_LOCAL_CONTEXT_TOKENS",
+    );
+    const outputTokens = positiveInteger(
+      environment.SLICE_LOCAL_OUTPUT_TOKENS,
+      DEFAULT_LOCAL_OUTPUT_TOKENS,
+      "SLICE_LOCAL_OUTPUT_TOKENS",
+    );
+    if (outputTokens > contextTokens) {
+      throw new Error("SLICE_LOCAL_OUTPUT_TOKENS must not exceed SLICE_LOCAL_CONTEXT_TOKENS");
+    }
     const localModel: Model<"openai-completions"> = {
       id: localModelId,
       name: `Local ${localModelId}`,
@@ -60,8 +82,8 @@ export function createConfiguredModels(environment: ModelEnvironment = process.e
       reasoning: false,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: positiveInteger(environment.SLICE_LOCAL_CONTEXT_TOKENS, 32_000, "SLICE_LOCAL_CONTEXT_TOKENS"),
-      maxTokens: positiveInteger(environment.SLICE_LOCAL_OUTPUT_TOKENS, 4_096, "SLICE_LOCAL_OUTPUT_TOKENS"),
+      contextWindow: contextTokens,
+      maxTokens: outputTokens,
     };
     models.setProvider(
       createProvider({

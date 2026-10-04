@@ -61,6 +61,45 @@ test("request IDs survive a harness restart and reject different input", async (
   }
 });
 
+test("a request reserved before a crash does not call the model twice", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-adapter-crash-"));
+  const { faux, models, registry } = newModels();
+  const statePath = join(directory, "state.sqlite");
+  const content = "Add a status label";
+  const agent = { model: { provider: "faux", modelId: "faux-1" } };
+  try {
+    faux.setResponses([fauxAssistantMessage("accepted")]);
+    let state = ApplicationStateStore.open(statePath);
+    let adapter = await PiDurableAdapter.open({ durableDatabasePath: statePath, state, models, registry });
+    const threadId = await adapter.createThread(agent);
+
+    // Reproduce a crash in the window the adapter cannot close: the request index is reserved, the submission is
+    // admitted, and the process stops before the submission ID is recorded against the index row.
+    const conversation = await adapter.conversation(threadId);
+    assert.ok(conversation);
+    const admitted = await conversation.submit(
+      { type: "input", content, requestId: "req-crash" },
+      BACKGROUND_CONTEXT,
+    );
+    assert.equal(state.reserveSubmission(String(threadId), "req-crash", { content }), undefined);
+    assert.equal((await admitted.wait(BACKGROUND_CONTEXT)).status, "done");
+    await adapter.close();
+    state.close();
+
+    faux.setResponses([fauxAssistantMessage("must not be used")]);
+    state = ApplicationStateStore.open(statePath);
+    adapter = await PiDurableAdapter.open({ durableDatabasePath: statePath, state, models, registry });
+    const retried = await adapter.submit(threadId, "req-crash", content);
+    assert.equal(retried.id, admitted.id, "the reserved request must resolve to the submission already admitted");
+    assert.equal((await retried.wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.equal(faux.state.callCount, 1, "the model must not be called a second time for a reserved request");
+    await adapter.close();
+    state.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("threads keep independent transcripts", async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-threads-"));
   const { faux, models, registry } = newModels();

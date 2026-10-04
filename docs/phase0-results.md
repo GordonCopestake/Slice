@@ -16,11 +16,12 @@ Direct dependencies are pinned exactly. `package-lock.json` pins the complete in
 
 ## Checks run
 
-`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 20 Node tests.
+`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 23 Node tests.
 
 The tests use the Pi AI faux provider, disposable SQLite files, and fake external systems. The process tests send `SIGKILL` to a real Node worker and then reopen its state.
 
 - Repeat a completed submission after restart: Pi returns the same submission, no second model call occurs, and changed input under the same request ID is rejected.
+- Crash between reserving a request ID and recording its submission: the retried request resolves to the submission already admitted and the model is not called again, because Pi treats `requestId` as a deduplication key scoped to the conversation.
 - Create two conversations: their transcripts and model replies stay separate.
 - Kill a worker after a fake external effect: Pi replays the explicitly replay-safe tool; the remote idempotency key keeps the effect count at one.
 - Kill a worker after an external effect but before the journal records success: restart reconciliation finds the remote receipt and does not dispatch the effect again.
@@ -33,6 +34,7 @@ The tests use the Pi AI faux provider, disposable SQLite files, and fake externa
 - Start a second owner for the same state directory: it fails closed. The lock releases after shutdown, a restarted service reports healthy, and an existing state directory is restricted to owner access.
 - Start the HTTP service on loopback: `/healthz` returns the runtime health response.
 - Local model configuration against a loopback endpoint: a configured API key arrives as the `Authorization` header, an endpoint without a key receives the non-secret placeholder, and a base URL carrying credentials, a non-HTTP scheme, or a key with a control character is rejected.
+- Local model token limits: the reply budget defaults to 32768 inside a 262144 context window, both are configurable, and a reply budget larger than the window is rejected at startup.
 
 ## Pinned runtime API checks
 
@@ -60,12 +62,12 @@ Both are dominated by Node process start-up, not by Slice state replay. These ar
 Local model smoke test: **passed** on 2026-10-04.
 
 - Endpoint: `http://ws-p3:8080/v1`, an OpenAI-compatible llama-swap server.
-- Model: `Qwen3.8-27B-ABLITERATED-GGUF`, the model reported as `loaded` at the time of the run.
-- Result: `{"status":"passed","provider":"slice-local","model":"Qwen3.8-27B-ABLITERATED-GGUF","stopReason":"stop"}`.
+- Model: `qwen27b`, the server's alias for `Qwen3.8-27B-UD-Q5_K_XL`, reported as Qwen3.8 27B Q5.
+- Result: `{"status":"passed","provider":"slice-local","model":"qwen27b","stopReason":"stop"}`.
 
 The endpoint requires an API key and answers `401` without one, so `SLICE_LOCAL_API_KEY` was set for the run. The key was passed in the process environment only and is not committed. The response was a streamed chat completion and the model returned the exact requested string.
 
-OpenAI smoke test: **not tested**. No approved model profile and API credential were configured for this run.
+OpenAI smoke test: **not tested**. No approved cloud model profile and API credential were configured for this run.
 
 Run the checks after configuring the service environment:
 
@@ -76,16 +78,21 @@ npm run smoke:openai
 
 Each command sends a short text prompt and reports the provider and model ID. These smoke tests do not prove tool-call, streaming, cancellation, structured-output, image, long-context, or privacy-policy compatibility. Those checks remain required before a profile can serve a production role.
 
-Notes on this endpoint, for whoever picks the production profile:
+### Model selection
 
-- The server listed eight models. Most were `unloaded`, so the first request against one would pay a model load. Several carry `abliterated` or `uncensored` names, which means refusal behaviour was deliberately removed. That is a policy decision for the owner, not a default to inherit from a smoke test.
-- The chosen model is a reasoning model: it emits `reasoning_content` first. A small output budget is consumed before any visible text appears, so `SLICE_LOCAL_OUTPUT_TOKENS` must leave room for reasoning or the response reads as empty.
-- The server reports `function_calling: true` and `tools` in `supported_parameters`. This smoke test sent a text-only prompt and did not exercise tool calls.
+The models on the test endpoint exist for testing only. Production does not adopt any of them: the owner selects a model when they configure a profile, and later phases attach per-project model and privacy rules. Phase 0 therefore records the model used for a check, not a preferred or approved model.
+
+Notes on the endpoint, for whoever selects a model:
+
+- The endpoint listed eight models, most `unloaded`, so the first request against one pays a model load. Several carry `abliterated` or `uncensored` names, meaning refusal behaviour was deliberately removed; none is a production candidate by default.
+- Every model reports `function_calling: true` with `tools` in `supported_parameters`. This check sent a text-only prompt and did not exercise tool calls.
+- These models are reasoning models: they emit `reasoning_content` before any visible text. The reply budget must leave room for it. At 32 output tokens the model returned an empty body with `finish_reason: "length"`, which is why the smoke test now names that cause instead of reporting a bare failure.
 
 ## API and recovery limits
 
 - Pi Durable `1.0.2` is experimental. Keep it behind `PiDurableAdapter` and rerun the recovery tests before any upgrade.
 - The pinned Pi AI OpenAI-compatible client refuses to send any request whose auth carries no API key. A keyless local endpoint therefore receives a non-secret placeholder from `SLICE_LOCAL_API_KEY`'s absence. An endpoint that checks a real key must set that variable; the key is read from the environment only and rejected if it carries a control character.
+- The local profile's window and reply budget are declared configuration, not discovered facts. The defaults are 262144 and 32768, chosen to match the context length the test endpoint advertises. Nothing reads `/v1/models` at startup, so a model with a different window must set `SLICE_LOCAL_CONTEXT_TOKENS`; an over-long request is rejected by the server rather than truncated by Slice.
 - `watchEvents` is marked experimental by Pi Durable. One `AgentEventStream` accepts `start()` only once; a second call throws `Watch is already started`. Keep one listener per stream for the life of the subscription.
 - A document draft from `tx.doc()` is a settled overlay once its commit ends and throws `Cannot use a settled overlay` on a later read. Read the value inside its own commit, including when reading a stored document back.
 - `Conversation.abort()` only reaches non-background tasks unless it is passed `{ background: true }`. Cancelling user work must pass that option or conversation-owned background tasks keep running.
@@ -99,4 +106,4 @@ Notes on this endpoint, for whoever picks the production profile:
 ## Outstanding for the phase gate
 
 - The OpenAI cloud smoke test is still **not tested**. It needs an approved cloud model profile and an API credential, so the phase exit check cannot be signed off until it runs.
-- Code review and security review need a second person. The author implemented this work and cannot approve it; no security review record exists yet.
+- Code review and security review need a second person. The author implemented this work and cannot approve it. A self-review with its findings and open questions is recorded in [the Phase 0 security review](phase0-security-review.md); it is explicitly not an approval.

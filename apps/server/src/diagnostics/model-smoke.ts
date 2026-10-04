@@ -25,8 +25,12 @@ if (profile !== "local" && profile !== "openai") {
       { signal: AbortSignal.timeout(60_000) },
     );
     const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("");
-    if (response.stopReason === "error" || text.trim().length === 0) {
-      throw new Error("The provider returned no usable text response");
+    if (response.stopReason === "error") {
+      throw new Error(`The provider returned an error: ${response.errorMessage ?? "no reason given"}`);
+    }
+    if (text.trim().length === 0) {
+      // A reasoning model spends part of its output budget before any visible text appears.
+      throw new Error("The provider returned no visible text; a reasoning model may need a larger SLICE_LOCAL_OUTPUT_TOKENS");
     }
     process.stdout.write(
       `${JSON.stringify({ status: "passed", provider, model: model.id, stopReason: response.stopReason })}\n`,

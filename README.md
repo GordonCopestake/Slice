@@ -6,7 +6,7 @@ Slice is a small, self-hosted agent service. Its goal is to turn a plain-languag
 
 Phase 0 is in progress. This repository has a compiled TypeScript service, a typed Pi Durable adapter, a single-owner SQLite store, durable request deduplication, and crash-recovery tests. The HTTP service currently exposes only `GET /healthz`. It does not yet accept change requests or connect to GitHub repositories, SSH runners, Telegram, or deployment systems.
 
-See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), and [Phase 0 results](docs/phase0-results.md).
+See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), [Phase 0 results](docs/phase0-results.md), and the [Phase 0 security review](docs/phase0-security-review.md).
 
 ## Run locally
 
@@ -37,6 +37,8 @@ npm run smoke:local
 ```
 
 Set `SLICE_LOCAL_API_KEY` only when the local endpoint checks an API key. A keyless endpoint is sent a non-secret placeholder, because the Pi AI client refuses to send a request with no API key at all.
+
+`SLICE_LOCAL_CONTEXT_TOKENS` defaults to 262144 and `SLICE_LOCAL_OUTPUT_TOKENS` to 32768. Set both to match the model you select: a reply budget larger than the context window is rejected at startup, and a model with a smaller window than the default will reject an over-long request.
 
 For OpenAI:
 

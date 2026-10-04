@@ -81,6 +81,28 @@ test("a local model endpoint receives the configured API key", async () => {
   }
 });
 
+test("local model token limits default to a 32k reply inside a 256k window", () => {
+  const models = createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m" });
+  const model = models.getModel("slice-local", "m");
+  assert.ok(model);
+  assert.equal(model.maxTokens, 32_768);
+  assert.equal(model.contextWindow, 262_144);
+  assert.ok(model.contextWindow > model.maxTokens, "the reply budget must fit inside the context window");
+});
+
+test("the local model reply budget is configurable", () => {
+  const models = createConfiguredModels({
+    SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1",
+    SLICE_LOCAL_MODEL_ID: "m",
+    SLICE_LOCAL_OUTPUT_TOKENS: "65536",
+    SLICE_LOCAL_CONTEXT_TOKENS: "200000",
+  });
+  const model = models.getModel("slice-local", "m");
+  assert.ok(model);
+  assert.equal(model.maxTokens, 65_536);
+  assert.equal(model.contextWindow, 200_000);
+});
+
 test("local model configuration rejects unsafe values", () => {
   assert.throws(
     () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://user:pw@127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m" }),
@@ -97,5 +119,13 @@ test("local model configuration rejects unsafe values", () => {
   assert.throws(
     () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1" }),
     /Set both SLICE_LOCAL_BASE_URL and SLICE_LOCAL_MODEL_ID/,
+  );
+  assert.throws(
+    () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m", SLICE_LOCAL_OUTPUT_TOKENS: "0" }),
+    /must be a positive integer/,
+  );
+  assert.throws(
+    () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m", SLICE_LOCAL_OUTPUT_TOKENS: "900000", SLICE_LOCAL_CONTEXT_TOKENS: "1000" }),
+    /must not exceed SLICE_LOCAL_CONTEXT_TOKENS/,
   );
 });
