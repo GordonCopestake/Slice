@@ -48,6 +48,87 @@ test("an unresolved external operation stays blocked and does not dispatch again
   }
 });
 
+test("journals on separate connections share in-flight operation deduplication", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-operation-two-connections-"));
+  const databasePath = join(directory, "state.sqlite");
+  const firstState = ApplicationStateStore.open(databasePath);
+  const secondState = ApplicationStateStore.open(databasePath);
+  let dispatches = 0;
+  let finishExecution: ((value: { completed: true }) => void) | undefined;
+  const execution = new Promise<{ completed: true }>((resolve) => {
+    finishExecution = resolve;
+  });
+  const driver = {
+    execute: async () => {
+      dispatches += 1;
+      return execution;
+    },
+    reconcile: async () => ({ status: "not_started" as const }),
+  };
+  try {
+    const first = new ExternalOperationJournal(firstState.database, "first-owner").run(
+      "publish:two-connections",
+      { version: "v1" },
+      driver,
+    );
+    const second = new ExternalOperationJournal(secondState.database, "second-owner").run(
+      "publish:two-connections",
+      { version: "v1" },
+      driver,
+    );
+    assert.equal(dispatches, 1, "a second connection must not dispatch an operation already in flight");
+    assert.throws(
+      () => new ExternalOperationJournal(secondState.database, "second-owner").run(
+        "publish:two-connections",
+        { version: "v2" },
+        driver,
+      ),
+      /different input/,
+    );
+    finishExecution?.({ completed: true });
+    assert.deepEqual(await Promise.all([first, second]), [{ completed: true }, { completed: true }]);
+    assert.equal(dispatches, 1);
+  } finally {
+    firstState.close();
+    secondState.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an operation is dispatched again once the in-flight call has settled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-operation-settled-"));
+  const databasePath = join(directory, "state.sqlite");
+  const firstState = ApplicationStateStore.open(databasePath);
+  const secondState = ApplicationStateStore.open(databasePath);
+  try {
+    const first = new ExternalOperationJournal(firstState.database, "first-owner").run(
+      "publish:settled",
+      { version: "v1" },
+      {
+        execute: async () => {
+          throw new Error("dispatch failed after the remote call");
+        },
+        reconcile: async () => ({ status: "not_started" as const }),
+      },
+    );
+    await assert.rejects(first, /dispatch failed/);
+
+    const second = new ExternalOperationJournal(secondState.database, "second-owner").run(
+      "publish:settled",
+      { version: "v1" },
+      {
+        execute: async () => ({ published: true }),
+        reconcile: async () => ({ status: "not_started" as const }),
+      },
+    );
+    assert.deepEqual(await second, { published: true });
+  } finally {
+    firstState.close();
+    secondState.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("separate journal instances share in-flight operation deduplication", async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-operation-concurrent-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));

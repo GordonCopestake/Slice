@@ -73,7 +73,9 @@ export class PiDurableAdapter {
   async cancel(threadId: ConversationId): Promise<void> {
     const conversation = await this.harness.conversation(threadId, BACKGROUND_CONTEXT);
     if (conversation === undefined) throw new Error("Unknown thread");
-    await conversation.abort(BACKGROUND_CONTEXT);
+    // `background` crosses background boundaries: an ordinary abort only reaches non-background tasks and leaves
+    // conversation-owned background work running after this returns.
+    await conversation.abort(BACKGROUND_CONTEXT, { background: true });
   }
 
   close(): Promise<void> {

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { hashJson, type JsonValue } from "../state/application-state.js";
 
@@ -31,19 +32,25 @@ type OperationRow = {
   result_json: string | null;
 };
 
+type InFlightOperation = { payloadHash: string; promise: Promise<JsonValue> };
+
 /** At-most-once local dispatch with explicit reconciliation after an ambiguous result. */
 export class ExternalOperationJournal {
-  static readonly #inFlightByDatabase = new WeakMap<
-    DatabaseSync,
-    Map<string, { payloadHash: string; promise: Promise<JsonValue> }>
-  >();
+  /** Keyed by resolved database file so that separate connections to one file share in-flight operations. */
+  static readonly #inFlightByFile = new Map<string, Map<string, InFlightOperation>>();
+  /** An in-memory database has no shared file, so its connections are coordinated by object identity instead. */
+  static readonly #inFlightByDatabase = new WeakMap<DatabaseSync, Map<string, InFlightOperation>>();
 
   readonly #database: DatabaseSync;
   readonly #ownerId: string;
+  readonly #inFlight: Map<string, InFlightOperation>;
+  readonly #inFlightFile: string | null;
 
   constructor(database: DatabaseSync, ownerId: string = randomUUID()) {
     this.#database = database;
     this.#ownerId = ownerId;
+    this.#inFlightFile = ExternalOperationJournal.#fileOf(database);
+    this.#inFlight = ExternalOperationJournal.#sharedInFlight(database, this.#inFlightFile);
   }
 
   run<P extends JsonValue, R extends JsonValue>(
@@ -53,23 +60,45 @@ export class ExternalOperationJournal {
   ): Promise<R> {
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(operationId)) throw new TypeError("Invalid external operation ID");
     const payloadHash = hashJson(payload);
-    let inFlight = ExternalOperationJournal.#inFlightByDatabase.get(this.#database);
-    if (inFlight === undefined) {
-      inFlight = new Map();
-      ExternalOperationJournal.#inFlightByDatabase.set(this.#database, inFlight);
-    }
-    const active = inFlight.get(operationId);
+    const active = this.#inFlight.get(operationId);
     if (active !== undefined) {
       if (active.payloadHash !== payloadHash) throw new Error("An active operation ID cannot be reused with different input");
       return active.promise as Promise<R>;
     }
 
     const promise = this.#run(operationId, payload, payloadHash, driver);
-    inFlight.set(operationId, { payloadHash, promise: promise as Promise<JsonValue> });
-    void promise.finally(() => {
-      if (inFlight?.get(operationId)?.promise === promise) inFlight.delete(operationId);
-    }).catch(() => {});
+    this.#inFlight.set(operationId, { payloadHash, promise: promise as Promise<JsonValue> });
+    void promise.finally(() => this.#release(operationId, promise)).catch(() => {});
     return promise;
+  }
+
+  static #fileOf(database: DatabaseSync): string | null {
+    const location = database.location();
+    return location === null || location === "" ? null : resolve(location);
+  }
+
+  static #sharedInFlight(database: DatabaseSync, file: string | null): Map<string, InFlightOperation> {
+    if (file === null) {
+      const existing = ExternalOperationJournal.#inFlightByDatabase.get(database);
+      if (existing !== undefined) return existing;
+      const created = new Map<string, InFlightOperation>();
+      ExternalOperationJournal.#inFlightByDatabase.set(database, created);
+      return created;
+    }
+    const existing = ExternalOperationJournal.#inFlightByFile.get(file);
+    if (existing !== undefined) return existing;
+    const created = new Map<string, InFlightOperation>();
+    ExternalOperationJournal.#inFlightByFile.set(file, created);
+    return created;
+  }
+
+  /** Forget a settled operation, and the shared set once the last operation on that file settles. */
+  #release(operationId: string, promise: Promise<JsonValue>): void {
+    if (this.#inFlight.get(operationId)?.promise !== promise) return;
+    this.#inFlight.delete(operationId);
+    if (this.#inFlight.size === 0 && this.#inFlightFile !== null) {
+      ExternalOperationJournal.#inFlightByFile.delete(this.#inFlightFile);
+    }
   }
 
   async #run<P extends JsonValue, R extends JsonValue>(
