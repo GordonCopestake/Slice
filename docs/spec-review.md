@@ -4,9 +4,9 @@ Reviewed 4 October 2026 against the draft build specification at PR head `a5579f
 
 ## Decision
 
-The design is ready to start Phase 0. The reviewed specification now separates application policy from Pi Durable, closes the major readiness and permission gaps, and sets explicit recovery and evidence rules. It keeps the first delivery small: one TypeScript service, one SQLite owner, one demo runner, and a minimal mobile web app.
+The design is ready to start Phase 0. The reviewed specification now separates application policy from Pi Durable, closes the major readiness and permission gaps, and sets explicit recovery and evidence rules. Version 1.3 adds the desktop experience and safe thread steering. It keeps the first delivery small: one TypeScript service, one SQLite owner, one demo runner, and a minimal responsive web app.
 
-The draft PR contains design documents and images only. No Slice application code has been implemented. The design and its acceptance tests have not been run against real model providers, SSH hosts, or the GitHub protection settings for a registered repository. Phase 0 and the disposable-repository tests are required before production use.
+This PR contains design documents and images only. No Slice application code has been implemented. The design and its acceptance tests have not been run against real model providers, SSH hosts, or the GitHub protection settings for a registered repository. Phase 0 and the disposable-repository tests are required before production use.
 
 ## Findings and changes
 
@@ -24,6 +24,16 @@ The draft PR contains design documents and images only. No Slice application cod
 | Exception policy was ambiguous | The old rules could allow an owner exception to conflict with review verdicts or failure results. | Keep exceptions disabled by default. Block critical, high, and medium findings and non-waivable identity, provenance, evidence, and isolation failures. Bind any permitted low-risk or pre-existing-check exception to a recorded verification key and keep the underlying result visible. |
 | Mobile UI lacked a concrete direction | The user-facing pages were described in prose without a visual reference or a clear separation between progress, evidence, and code. | Add a pinned pi-mobile desktop reference plus labelled Slice mock-ups for threads, status, and the review-ready result. The mock-ups contain example data; they are not product screenshots or test evidence. |
 
+## Version 1.3 desktop and steering addendum
+
+The web app is responsive, not mobile-only. It now has three desktop concepts: a thread workspace with steering controls, a Gantt-style activity timeline with an event inspector, and a review result with evidence and PR actions. The phone concepts stay focused and do not become crowded with desktop details.
+
+The activity view can show actual stage durations, parallel review lanes, tool names, safe input summaries, results, usage, and evidence links. It also has a linear event ledger. In-flight events show their start and state without a made-up duration. This follows the layout idea in DeepSeek Harness's Trajectory view; Slice does not copy its source or screenshot. Private model reasoning and system prompts remain hidden. Summaries and structured review findings provide the user-facing explanation.
+
+The thread composer can steer an active or paused job. A steering command is versioned and stored. Active work stops admitting new calls until current operations reach a safe point; changed requirements make affected evidence stale. A merged thread stays archived and can link to a new follow-up job. Acceptance tests now cover steering, readiness withdrawal, desktop activity details, and phone/desktop layouts.
+
+All six Slice concepts are labelled as mock-ups with example data. They do not show a running Slice app or pass any tests.
+
 ## First implementation boundary
 
 Implement and test Phase 0 before connecting a production repository. Then prove one complete change in a disposable repository: requirements, isolated worktree, authoring, separate validation and reviews, readiness publication, user merge, archive, cleanup, and retained evidence. Run the GitHub permissions test with all checks and required approval satisfied. Keep real release credentials and production deployment outside the worker.
@@ -38,3 +48,4 @@ The token allocation in the spec dedicates 80% to validation, code review, secur
 - [GitHub pull request REST API](https://docs.github.com/en/rest/pulls/pulls): merge endpoint permissions and merge result semantics.
 - [GitHub ruleset rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets): branch update and required-check controls.
 - [p1rallels/pi-mobile](https://github.com/p1rallels/pi-mobile/tree/4cc9b712254d84c90a00373c972c8a417fd26fb9): Pi mobile-web UI and replay fixture. Its screenshot is licensed under MIT; the copyright and license notice are included with the image. Mario Zechner's Pi SDK is the upstream agent runtime.
+- [DeepSeek Harness Trajectory view](https://github.com/deepseek-ai/deepseek-harness/blob/5badb15009ae1756c3afe0ae0cef1faafc290ccc/packages/client/ui-trajectory/README.md): pinned reference for the turn-aware event ledger and timing overview.
