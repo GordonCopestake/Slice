@@ -1,75 +1,168 @@
 # Phase 0 security review
 
-Status: **author self-review complete; independent review still required**.
+Status: **independent review returned CHANGES REQUESTED**. Two P2 findings are open, so the Phase 0 gate is not
+signed off. This record holds both the author's self-review and the independent reviewer's findings.
 
-The repository rules state that the author cannot approve its own work, so this record is **not** an approval. It
-is the reviewer's checklist plus the evidence the implementer gathered, written so a second person can check the
-same properties instead of starting from scratch. Nothing here should be read as a sign-off.
+The repository rules state that the author cannot approve its own work. Two roles are recorded separately below.
+Neither is an approval, and the author may not close the independent reviewer's own findings.
 
-Reviewer: unassigned. Date of self-review: 2026-10-04. Scope: the Phase 0 diff against `main`, plus the whole of
-`apps/server/src`.
+- Self-review: implementer, 2026-10-04. Evidence gathered by the author.
+- Independent review: separate reviewer context, 2026-10-04, over `apps/server/src` and `git diff main...HEAD` at
+  `51482ee`. Reviewed read-only; no file, dependency, or git state was changed by the reviewer.
 
-## Properties checked, and how
+## Verdict
 
-| Property | Evidence | Result |
+`CHANGES REQUESTED`. No P1. The reviewer found no SQL injection, no committed credentials, no command execution, no
+non-loopback listener, and no path from model output or repository content into a command, path, host, or SQL string.
+
+One finding retracts a claim in the self-review below: the at-most-once dispatch fix from this phase does not hold.
+
+## Open findings
+
+### F1 — P2 — At-most-once external dispatch is still broken
+
+`apps/server/src/workflow/external-operation-journal.ts:96`
+
+`#release` deletes the shared per-file map out of the static registry once it empties, while journals that already
+hold it keep the orphaned map. A journal constructed after that point gets a fresh empty map, cannot see the
+in-flight operation, reads `running`, reconciles to `not_started`, and dispatches the same operation again.
+
+Reproduced twice by the reviewer, including across two separate SQLite connections to one file, with a doubled
+dispatch count for one operation ID.
+
+Not reachable in the shipped service: `ExternalOperationJournal` is instantiated only in tests. It becomes reachable
+when Phase 1 adds the runner journal, which is the at-most-once guarantee the phase exists to prove.
+
+Why the suite missed it: the dedup test constructs both journals before any operation runs, so the registry entry is
+still live. The `SIGKILL` test asserts the fake remote's idempotency, not Slice's dispatch control.
+
+### F2 — P2 — `payload_hash` depends on the host locale
+
+`apps/server/src/state/application-state.ts:20`
+
+Canonical JSON sorts object keys with `localeCompare`, so the hash of one payload changes with `LANG`. The reviewer
+showed `en_US.UTF-8` and `sv_SE.UTF-8` disagreeing on a multi-key payload, and a byte-identical retried request
+rejected with `IdempotencyConflictError` across locales. It fails safe, blocking rather than duplicating, but it
+turns a recoverable crash into an operation needing manual intervention. Single-key payloads such as the adapter's
+`{ content }` collate identically everywhere, which is why the suite passes.
+
+### F3 — P3 — State files are created world-readable
+
+`apps/server/src/main.ts:18`. `state.sqlite`, its `-wal` and `-shm`, and `owner.sqlite` are created `0644`. The
+`0700` parent directory is the only protection, which makes the directory check load-bearing for the whole store.
+
+### F4 — P3 — A symlinked `SLICE_STATE_DIR` is followed silently
+
+`apps/server/src/main.ts:17`. `statSync` follows symlinks. An attacker who can write the *parent* of the configured
+path can plant a symlink and have Slice create and trust its entire store, pre-seedable with a crafted
+`state.sqlite`, inside a directory they own. No race required; this defeats the permission check outright rather
+than winning a timing window.
+
+### F5 — P3 — An empty `SLICE_STATE_DIR` writes state into the working directory
+
+`apps/server/src/main.ts:17`. `??` does not catch an empty string, and `resolve("")` is the working directory.
+`.gitignore` only covers `/.slice/`, so transcripts could be committed.
+
+### F6 — P3 — Shutdown can block forever, holding the owner lock
+
+`apps/server/src/main.ts:58`. `server.close()` waits for every connection with no timeout. The reviewer held
+shutdown open past `headersTimeout` with a trickled request, so `lock.release()` never runs and a restart fails
+until the old process is killed.
+
+### F7 — P3 — Unbounded growth in the request index and journal
+
+`apps/server/src/state/application-state.ts:44`. No cap, TTL, or prune for either table; `result_json` is unbounded;
+`threadId` enters the primary key unvalidated, unlike `requestId`.
+
+### F8 — P3 — `hashJson` recursion is unbounded
+
+`apps/server/src/state/application-state.ts:13`. Deep JSON overflows the stack at roughly depth 5000, before any
+write. Phase 1 payloads will carry untrusted issue text.
+
+### F9 — P3 — `config/examples/local.env` is not ignored
+
+`.gitignore`. The example is `local.env.example`; its natural copy target matches no ignore rule, so a real
+`SLICE_LOCAL_API_KEY` written there would be committable.
+
+### F10 — P3 — No `Host` validation on the listener
+
+`apps/server/src/main.ts:36`. Harmless now; becomes a DNS-rebinding vector when Phase 1 adds cookie-authenticated
+endpoints.
+
+### F11 — P3 — `SLICE_LOCAL_BASE_URL` is not constrained to a local host
+
+`apps/server/src/adapters/models/configured-models.ts:47`. Only scheme and userinfo are checked, so a link-local
+address such as `169.254.169.254` is accepted and the API key is sent to it. Configuration-only, so hardening.
+
+### F12 — P3 — Windows silently skips the state privacy check
+
+`apps/server/src/main.ts:19`. The `process.platform !== "win32"` guard skips enforcement instead of refusing to
+start.
+
+### F13 — P3 — Handle leaks on partial startup failure
+
+`apps/server/src/state/application-state.ts:66` leaks the database handle if the DDL throws, and
+`apps/server/src/adapters/pi-durable/pi-durable-adapter.ts:34` leaks the storage handle if `Harness.open` throws.
+
+### F14 — P3 — Smaller items
+
+`server.once("error", rejectListen)` is never removed after a successful listen, so later server errors are
+swallowed. The API key control-character guard covers C0 and DEL but not `U+0085` or `U+2028`. An explicit
+`undefined` in a payload yields a confusing `TypeError`. `docs/phase0-results.md` commits a LAN hostname and port.
+The recorded recovery timings did not reproduce on the reviewer's fourth sample. Thirty commits share only two
+distinct subjects, which weakens the commit-bound evidence the specification asks for.
+
+## Self-review evidence, as checked by the independent reviewer
+
+| Property | Self-review said | Reviewer verdict |
 | --- | --- | --- |
-| No SQL built by string interpolation | Every statement in `application-state.ts` and `external-operation-journal.ts` uses bound parameters; searched for `` prepare(`…${ `` and `` exec(`…${ `` | Pass |
-| No command execution from Slice | No `child_process`, `eval`, or `new Function` in `apps/server/src`; `SIGKILL` tests spawn workers from test fixtures only | Pass |
-| Credentials absent from source and committed configuration | `SLICE_LOCAL_API_KEY` is read from the environment; `config/examples/local.env.example` holds a placeholder; no `Bearer` literal in any tracked file | Pass |
-| Credentials refused in configuration that gets logged or stored | Base URL with userinfo is rejected; a key containing a control character is rejected to block header injection | Pass |
-| Model endpoints restricted to configured hosts | The service only ever calls the configured base URL; the model cannot choose an endpoint or a path | Pass |
-| State directory private to its owner | `main.ts` creates it `0700` and refuses to start when the existing mode grants any group or other access | Pass |
-| One process owns a state directory | `SingleOwnerLock` takes a SQLite write transaction and fails closed; covered by two tests | Pass |
-| Service not reachable off the host | Listener binds `127.0.0.1` only | Pass |
-| Minimal HTTP surface | Only `GET /healthz`; an exact path match, no body parsing, no dynamic routing | Pass |
-| Untrusted input bounded | Request IDs and operation IDs are length- and charset-checked; submission content is capped at 100,000 characters | Pass |
-| External dispatch at most once | The operation journal records `running`/`uncertain`/`succeeded` before dispatch, and an ambiguous result stays blocked rather than replayed | Pass |
-| Model output never trusted as policy | Policy, paths, and hosts come from configuration; nothing in this phase lets model output select a command, path, or host | Pass |
-| No secrets in logs | `/healthz` returns a fixed body. Startup failures print `error.message` only | Pass with a note, see below |
+| No SQL built by string interpolation | Pass | Confirmed; all 12 sites use bound parameters |
+| No command execution from Slice | Pass | Confirmed; imports limited to five `node:` builtins |
+| Credentials absent from source and config | Pass, "no `Bearer` literal in any tracked file" | Property confirmed, **stated evidence false**: two test files contain synthetic `Bearer` literals |
+| Credentials refused in logged or stored config | Pass | Confirmed; `new URL` fails with a bare message and does not echo the input |
+| Model endpoints restricted to configured hosts | Pass | Confirmed with a qualification; see F11 |
+| State directory private to its owner | Pass | Confirmed with gaps; see F3 and F4 |
+| One process owns a state directory | Pass | Confirmed; `busy_timeout=0` plus `BEGIN IMMEDIATE`, fails closed |
+| Service not reachable off the host | Pass | Confirmed; loopback listener only, external address refused |
+| Minimal HTTP surface | Pass | Confirmed across 14 request variants |
+| Untrusted input bounded | Pass | **Partially refuted**: `threadId` unvalidated, `hashJson` unbounded depth, no retention bound |
+| External dispatch at most once | Pass | **Refuted**; see F1 |
+| Model output never trusted as policy | Pass | Confirmed; no model-derived value reaches a command, path, host, or SQL text |
+| No secrets in logs | Pass with a note | Confirmed; worst case is a filesystem path |
 
-## Findings
+## Confirmed clean
 
-### 1. The local model endpoint had no way to authenticate, and the keyless path was broken
+SQL injection, command execution, prompt-injection and trust boundaries, `ReDoS` in the three anchored validator
+regexes, network exposure, and supply-chain spot checks: three direct dependencies pinned exactly, `lockfileVersion`
+3, 136 of 136 entries with integrity hashes from the npm registry, three install scripts all from the registry, and
+the transitively added `pi-telemetry` contains no network code. The approved specification and mockups are
+unmodified.
 
-Found while running the live check, and fixed in this phase. The local provider resolved auth to an empty object,
-and the base URL was rejected if it carried credentials, so an endpoint requiring a key could not be called at all.
-Separately, the pinned Pi AI client refuses to send any request whose auth carries no API key, so the keyless path
-always failed with `No API key for provider`. That path had never been exercised because no endpoint was configured.
-A keyless endpoint now receives a non-secret placeholder and an endpoint that checks a key receives
-`SLICE_LOCAL_API_KEY` from the environment.
+## Accepted risks, as argued by the reviewer
 
-### 2. Cancelling a thread left conversation-owned background tasks running
+- **Unfiltered startup error text** is low for Phase 0. Every message reachable today is Slice's own text or a
+  filesystem or SQLite message whose worst content is a path. Revisit when an authenticated API arrives.
+- **The non-atomic permission check** stays low, but for different reasons than the self-review gave: the default
+  `.slice` under a non-shared working directory is safe, the specification places state in root-owned
+  `/var/lib/slice`, the listener is loopback-only, and the database holds transcripts rather than credentials. The
+  author added this risk by considering only a same-user race and did not consider F4's parent-directory attacker,
+  who does not need a race at all.
 
-Fixed in this phase. `Conversation.abort()` reaches only non-background tasks unless passed `{ background: true }`,
-so a background task could continue and commit its outcome after `cancel()` returned.
+## Next steps, in order
 
-### 3. Two connections to one state file could dispatch an external operation twice
+1. Fix F1 and add a regression test that constructs the second journal after an operation has settled and while
+   another is in flight.
+2. Fix F2 with locale-independent ordering and pin a hash for a key set containing non-ASCII keys.
+3. Fix F3 through F6, which are cheap and remove the load-bearing single controls.
+4. Fix F7 through F12 and the F14 items.
+5. Correct the self-review rows the reviewer refuted.
+6. Re-run the independent review over the fixes.
+7. Build the OpenAI cloud login, run the cloud smoke test, and record it.
+8. Sign off only when the reviewer and the owner both agree, and when the cloud check is no longer "not tested".
 
-Fixed in this phase. In-flight deduplication was keyed by `DatabaseSync` object identity, so a second connection
-missed the first's in-flight call, saw `running`, and dispatched again when reconciliation reported `not_started`.
-Deduplication is now keyed by resolved database file.
+## Still required before the gate closes
 
-### 4. Startup error text is not filtered
-
-Accepted, not fixed. `main.ts` prints `error.message` to stderr when startup fails. Today every message that can
-reach that path is Slice's own text and names no secret, and the service is loopback-only. If a future failure can
-carry provider or driver text, that text must be sanitised before it is printed. Watch this when the service gains
-an authenticated user API.
-
-### 5. The state directory permission check is not atomic with opening the database
-
-Accepted for Phase 0. The mode is checked with `statSync` before the database is opened, so a process able to change
-the directory mode in that window could widen access. The directory is owner-only `0700` and the threat requires
-local access as the same user, who can read the database directly regardless. Revisit if the state directory ever
-lives somewhere other users can write.
-
-### 6. No rate limiting or authentication on the HTTP listener
-
-Not applicable yet. Phase 0 exposes one unauthenticated read-only endpoint on loopback. Phase 1 adds
-authentication and must add rate limiting with it.
-
-## Still required before the phase gate closes
-
-- An independent reviewer signs off on this record. The implementer cannot approve it.
-- The OpenAI cloud smoke test is **not tested**; it needs an approved cloud model profile and a credential.
+- An independent reviewer signs off. The author cannot approve this record or close F1 and F2.
+- The OpenAI cloud smoke test is **not tested**; it needs an approved cloud model and a credential.
 - A dependency review of the three pinned `@earendil-works` packages, which are experimental and unreviewed here.
+- Power-loss and host-failure durability is documented as unproven, with `synchronous=NORMAL` in WAL mode.

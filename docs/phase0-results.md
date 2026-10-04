@@ -105,5 +105,6 @@ Notes on the endpoint, for whoever selects a model:
 
 ## Outstanding for the phase gate
 
-- The OpenAI cloud smoke test is still **not tested**. It needs an approved cloud model profile and an API credential, so the phase exit check cannot be signed off until it runs.
-- Code review and security review need a second person. The author implemented this work and cannot approve it. A self-review with its findings and open questions is recorded in [the Phase 0 security review](phase0-security-review.md); it is explicitly not an approval.
+- The OpenAI cloud smoke test is still **not tested**. It needs an approved cloud model profile and a credential, so the phase exit check cannot be signed off until it runs.
+- An independent security review returned **CHANGES REQUESTED** with two P2 findings open, including one that retracts this phase's at-most-once dispatch claim. The findings, the self-review rows they refute, and the ordered fix list are in [the Phase 0 security review](phase0-security-review.md). The author cannot close the reviewer's own findings.
+- The author implemented this work and cannot approve it.
