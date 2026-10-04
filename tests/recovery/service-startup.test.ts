@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -58,6 +58,7 @@ async function stopService(child: ReturnType<typeof spawn>): Promise<void> {
 
 test("service health works and the state lock releases after restart", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-service-"));
+  await chmod(directory, 0o755);
   const firstPort = await unusedPort();
   const secondPort = await unusedPort();
   const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
@@ -66,6 +67,9 @@ test("service health works and the state lock releases after restart", { timeout
   try {
     first = startService(script, directory, firstPort);
     await waitForHealth(firstPort, first);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(directory)).mode & 0o777, 0o700, "existing state directories are made private");
+    }
     const contender = startService(script, directory, secondPort);
     const [contenderCode] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
       const timer = setTimeout(() => rejectExit(new Error("Second service did not fail fast")), 5_000);
