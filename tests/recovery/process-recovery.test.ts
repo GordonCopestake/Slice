@@ -4,8 +4,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import type { TestContext } from "node:test";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+/** A recovered state must be usable well inside this budget; the assertion catches a recovery regression. */
+const RECOVERY_BUDGET_MS = 10_000;
 
 async function waitForFile(path: string, child: ReturnType<typeof spawn>): Promise<void> {
   const deadline = Date.now() + 15_000;
@@ -27,7 +31,31 @@ function spawnWorker(script: string, args: string[]) {
   return spawn(process.execPath, [script, ...args], { stdio: "ignore" });
 }
 
-test("SIGKILL during a replay-safe tool resumes without duplicating its effect", { timeout: 45_000 }, async () => {
+/**
+ * Run a resume worker to completion and report how long the recovery took. The Phase 0 exit check asks for a
+ * measurement rather than an assumption from persistence, so the elapsed time is reported and bounded.
+ */
+async function runResume(script: string, args: string[], label: string, t: TestContext): Promise<number> {
+  const startedAt = performance.now();
+  const resumed = spawnWorker(script, args);
+  const [resumedCode, resumedSignal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
+    const stderr: Buffer[] = [];
+    resumed.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    resumed.once("error", rejectExit);
+    resumed.once("exit", (code, exitSignal) => {
+      if (code !== 0) rejectExit(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exit: ${exitSignal ?? code}`));
+      else resolveExit([code, exitSignal]);
+    });
+  });
+  const recoveryMs = performance.now() - startedAt;
+  assert.equal(resumedCode, 0);
+  assert.equal(resumedSignal, null);
+  t.diagnostic(`${label}: recovered in ${recoveryMs.toFixed(0)}ms`);
+  assert.ok(recoveryMs < RECOVERY_BUDGET_MS, `${label} recovery took ${recoveryMs.toFixed(0)}ms, over the ${RECOVERY_BUDGET_MS}ms budget`);
+  return recoveryMs;
+}
+
+test("SIGKILL during a replay-safe tool resumes without duplicating its effect", { timeout: 45_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "slice-replay-"));
   const statePath = join(directory, "state.sqlite");
   const durablePath = statePath;
@@ -47,18 +75,7 @@ test("SIGKILL during a replay-safe tool resumes without duplicating its effect",
     assert.equal(exitCode, null);
     assert.equal(signal, "SIGKILL");
 
-    const resumed = spawnWorker(script, ["resume", ...common]);
-    const [resumedCode, resumedSignal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
-      const stderr: Buffer[] = [];
-      resumed.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-      resumed.once("error", rejectExit);
-      resumed.once("exit", (code, exitSignal) => {
-        if (code !== 0) rejectExit(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exit: ${exitSignal ?? code}`));
-        else resolveExit([code, exitSignal]);
-      });
-    });
-    assert.equal(resumedCode, 0);
-    assert.equal(resumedSignal, null);
+    await runResume(script, ["resume", ...common], "replay-safe tool", t);
     assert.equal(await readFile(resultPath, "utf8"), "done");
 
     const { DatabaseSync } = await import("node:sqlite");
@@ -73,7 +90,7 @@ test("SIGKILL during a replay-safe tool resumes without duplicating its effect",
   }
 });
 
-test("SIGKILL after an external effect is reconciled without a second dispatch", { timeout: 20_000 }, async () => {
+test("SIGKILL after an external effect is reconciled without a second dispatch", { timeout: 20_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "slice-operation-"));
   const statePath = join(directory, "application.sqlite");
   const remotePath = join(directory, "remote.sqlite");
@@ -91,17 +108,7 @@ test("SIGKILL after an external effect is reconciled without a second dispatch",
     assert.equal(exitCode, null);
     assert.equal(signal, "SIGKILL");
 
-    const resumed = spawnWorker(script, ["resume", ...common]);
-    const [resumedCode] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
-      const stderr: Buffer[] = [];
-      resumed.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-      resumed.once("error", rejectExit);
-      resumed.once("exit", (code, exitSignal) => {
-        if (code !== 0) rejectExit(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exit: ${exitSignal ?? code}`));
-        else resolveExit([code, exitSignal]);
-      });
-    });
-    assert.equal(resumedCode, 0);
+    await runResume(script, ["resume", ...common], "external operation", t);
     assert.deepEqual(JSON.parse(await readFile(resultPath, "utf8")), { receipt: "receipt:external:test-1" });
 
     const { DatabaseSync } = await import("node:sqlite");
