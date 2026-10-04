@@ -18,7 +18,7 @@ npm run check
 npm start
 ```
 
-The service stores state in `.slice/state.sqlite` and listens on `127.0.0.1:3000`. Set `SLICE_STATE_DIR` or `SLICE_PORT` to change these values. Only one process can own a state directory. Check it with:
+The service stores state in `.slice/state.sqlite` and listens on `127.0.0.1:3000`. Set `SLICE_STATE_DIR` or `SLICE_PORT` to change these values. On Unix, an existing state directory must be owner-only (`0700`); startup refuses broader permissions without changing them. Only one process can own a state directory. Check it with:
 
 ```sh
 curl http://127.0.0.1:3000/healthz
