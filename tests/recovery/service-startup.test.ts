@@ -58,18 +58,27 @@ async function stopService(child: ReturnType<typeof spawn>): Promise<void> {
 
 test("service health works and the state lock releases after restart", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-service-"));
-  await chmod(directory, 0o755);
-  const firstPort = await unusedPort();
-  const secondPort = await unusedPort();
   const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
   let first: ReturnType<typeof spawn> | undefined;
   let restarted: ReturnType<typeof spawn> | undefined;
   try {
+    await chmod(directory, 0o755);
+    const rejected = startService(script, directory, await unusedPort());
+    const [rejectedCode] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
+      const timer = setTimeout(() => rejectExit(new Error("Service did not reject a non-private state directory")), 5_000);
+      rejected.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        resolveExit([code, signal]);
+      });
+    });
+    assert.equal(rejectedCode, 1);
+    assert.equal((await stat(directory)).mode & 0o777, 0o755, "unsafe directory permissions are not changed");
+
+    await chmod(directory, 0o700);
+    const firstPort = await unusedPort();
+    const secondPort = await unusedPort();
     first = startService(script, directory, firstPort);
     await waitForHealth(firstPort, first);
-    if (process.platform !== "win32") {
-      assert.equal((await stat(directory)).mode & 0o777, 0o700, "existing state directories are made private");
-    }
     const contender = startService(script, directory, secondPort);
     const [contenderCode] = await new Promise<[number | null, NodeJS.Signals | null]>((resolveExit, rejectExit) => {
       const timer = setTimeout(() => rejectExit(new Error("Second service did not fail fast")), 5_000);
