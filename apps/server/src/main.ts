@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { createConfiguredModels } from "./adapters/models/configured-models.js";
@@ -16,6 +16,7 @@ function configuredPort(value: string | undefined): number {
 export async function startSlice(): Promise<void> {
   const stateDirectory = resolve(process.env.SLICE_STATE_DIR ?? ".slice");
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(stateDirectory, 0o700);
   const lock = SingleOwnerLock.acquire(join(stateDirectory, "owner.sqlite"));
   let state: ApplicationStateStore | undefined;
   let adapter: PiDurableAdapter | undefined;
