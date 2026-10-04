@@ -36,7 +36,11 @@ type InFlightOperation = { payloadHash: string; promise: Promise<JsonValue> };
 
 /** At-most-once local dispatch with explicit reconciliation after an ambiguous result. */
 export class ExternalOperationJournal {
-  /** Keyed by resolved database file so that separate connections to one file share in-flight operations. */
+  /**
+   * Keyed by resolved database file so that separate connections to one file share in-flight operations. Entries are
+   * kept for the life of the process: removing an emptied map orphans the reference held by journals that already
+   * share it, and a journal built afterwards would start with an empty map and dispatch an in-flight operation twice.
+   */
   static readonly #inFlightByFile = new Map<string, Map<string, InFlightOperation>>();
   /** An in-memory database has no shared file, so its connections are coordinated by object identity instead. */
   static readonly #inFlightByDatabase = new WeakMap<DatabaseSync, Map<string, InFlightOperation>>();
@@ -44,13 +48,11 @@ export class ExternalOperationJournal {
   readonly #database: DatabaseSync;
   readonly #ownerId: string;
   readonly #inFlight: Map<string, InFlightOperation>;
-  readonly #inFlightFile: string | null;
 
   constructor(database: DatabaseSync, ownerId: string = randomUUID()) {
     this.#database = database;
     this.#ownerId = ownerId;
-    this.#inFlightFile = ExternalOperationJournal.#fileOf(database);
-    this.#inFlight = ExternalOperationJournal.#sharedInFlight(database, this.#inFlightFile);
+    this.#inFlight = ExternalOperationJournal.#sharedInFlight(database);
   }
 
   run<P extends JsonValue, R extends JsonValue>(
@@ -77,7 +79,8 @@ export class ExternalOperationJournal {
     return location === null || location === "" ? null : resolve(location);
   }
 
-  static #sharedInFlight(database: DatabaseSync, file: string | null): Map<string, InFlightOperation> {
+  static #sharedInFlight(database: DatabaseSync): Map<string, InFlightOperation> {
+    const file = ExternalOperationJournal.#fileOf(database);
     if (file === null) {
       const existing = ExternalOperationJournal.#inFlightByDatabase.get(database);
       if (existing !== undefined) return existing;
@@ -92,13 +95,9 @@ export class ExternalOperationJournal {
     return created;
   }
 
-  /** Forget a settled operation, and the shared set once the last operation on that file settles. */
+  /** Forget a settled operation so a later call dispatches again instead of replaying a stale promise. */
   #release(operationId: string, promise: Promise<JsonValue>): void {
-    if (this.#inFlight.get(operationId)?.promise !== promise) return;
-    this.#inFlight.delete(operationId);
-    if (this.#inFlight.size === 0 && this.#inFlightFile !== null) {
-      ExternalOperationJournal.#inFlightByFile.delete(this.#inFlightFile);
-    }
+    if (this.#inFlight.get(operationId)?.promise === promise) this.#inFlight.delete(operationId);
   }
 
   async #run<P extends JsonValue, R extends JsonValue>(

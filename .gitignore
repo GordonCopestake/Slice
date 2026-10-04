@@ -14,6 +14,9 @@ playwright-report/
 .env.*
 !.env.example
 !.env.test.example
+# The natural copy target of config/examples/local.env.example, which would hold a real key.
+config/examples/*.env
+config/examples/local.env
 .ssh/
 id_rsa
 id_ed25519
@@ -21,6 +24,12 @@ id_ed25519
 # Local Slice state, artifacts, and worktrees
 /.slice/
 /.artifacts/
+# Backstop: a state database must never be committed, whatever directory it lands in.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
 
 # Logs and temporary files
 *.log

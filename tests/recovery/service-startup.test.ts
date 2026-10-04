@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { connect } from "node:net";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -55,6 +56,91 @@ async function stopService(child: ReturnType<typeof spawn>): Promise<void> {
   assert.equal(code, 0);
   assert.equal(signal, null);
 }
+
+test("service refuses an empty, symlinked, or non-private state directory", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-service-guard-"));
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+
+  const runUntilExit = async (env: NodeJS.ProcessEnv): Promise<number | null> => {
+    const child = spawn(process.execPath, [script], {
+      env: { ...process.env, SLICE_PORT: String(await unusedPort()), ...env },
+      stdio: "ignore",
+    });
+    return new Promise<number | null>((resolveExit, rejectExit) => {
+      const timer = setTimeout(() => rejectExit(new Error("Service did not exit as expected")), 5_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolveExit(code);
+      });
+    });
+  };
+
+  try {
+    // An empty value must not resolve to the working directory.
+    assert.equal(await runUntilExit({ SLICE_STATE_DIR: "" }), 1);
+    assert.equal(await runUntilExit({ SLICE_STATE_DIR: "   " }), 1);
+
+    // A symlinked state directory would redirect the whole store into a directory the owner of the link controls.
+    const target = await mkdtemp(join(tmpdir(), "slice-service-target-"));
+    await chmod(target, 0o700);
+    const link = join(directory, "linked");
+    await symlink(target, link);
+    assert.equal(await runUntilExit({ SLICE_STATE_DIR: link }), 1);
+    assert.equal((await readdir(target)).length, 0, "a refused symlinked directory must not receive state");
+    await rm(target, { recursive: true, force: true });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("state files are created private to their owner", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-service-mode-"));
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+  const port = await unusedPort();
+  const child = startService(script, directory, port);
+  try {
+    await waitForHealth(port, child);
+    for (const name of ["state.sqlite", "owner.sqlite"]) {
+      const mode = (await stat(join(directory, name))).mode & 0o777;
+      assert.equal(mode & 0o077, 0, `${name} must not be readable by group or other (saw ${mode.toString(8)})`);
+    }
+  } finally {
+    await stopService(child);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+/** `fetch` refuses to set Host, so the header is written on a raw socket. */
+function rawStatus(port: number, host: string): Promise<number> {
+  return new Promise<number>((resolveStatus, rejectStatus) => {
+    const socket = connect(port, "127.0.0.1", () => {
+      socket.write(`GET /healthz HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+    });
+    let received = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+    });
+    socket.on("end", () => resolveStatus(Number(/^HTTP\/1\.1 (\d{3})/.exec(received)?.[1] ?? 0)));
+    socket.on("error", rejectStatus);
+  });
+}
+
+test("the listener refuses an unknown Host header", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-service-host-"));
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+  const port = await unusedPort();
+  const child = startService(script, directory, port);
+  try {
+    await waitForHealth(port, child);
+    assert.equal(await rawStatus(port, "evil.example"), 421, "a rebound DNS name must not reach the listener");
+    assert.equal(await rawStatus(port, `127.0.0.1:${port}`), 200);
+    assert.equal(await rawStatus(port, `localhost:${port}`), 200);
+  } finally {
+    await stopService(child);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("service health works and the state lock releases after restart", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-service-"));

@@ -10,6 +10,9 @@ type SubmissionRow = {
   submission_id: number | null;
 };
 
+/** Deepest payload accepted. Issue text and tool arguments are untrusted, so the walk is bounded rather than recursive to the stack limit. */
+const MAX_JSON_DEPTH = 64;
+
 function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number") {
@@ -17,11 +20,28 @@ function canonicalJson(value: JsonValue): string {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+  const entries = Object.entries(value).sort(([left], [right]) => compareKeys(left, right));
   return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
 }
 
+/** UTF-16 code-unit order, so the canonical form does not change with the host locale or collation tables. */
+function compareKeys(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertDepth(value: JsonValue, depth: number): void {
+  if (depth > MAX_JSON_DEPTH) throw new TypeError(`Request values must not nest deeper than ${MAX_JSON_DEPTH} levels`);
+  if (Array.isArray(value)) {
+    for (const item of value) assertDepth(item, depth + 1);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const entry of Object.values(value)) assertDepth(entry, depth + 1);
+  }
+}
+
 export function hashJson(value: JsonValue): string {
+  assertDepth(value, 0);
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
@@ -38,10 +58,11 @@ export class ApplicationStateStore {
 
   private constructor(database: DatabaseSync) {
     this.#database = database;
-    this.#database.exec("PRAGMA journal_mode = WAL;");
-    this.#database.exec("PRAGMA synchronous = NORMAL;");
-    this.#database.exec("PRAGMA busy_timeout = 5000;");
-    this.#database.exec(`
+    try {
+      this.#database.exec("PRAGMA journal_mode = WAL;");
+      this.#database.exec("PRAGMA synchronous = NORMAL;");
+      this.#database.exec("PRAGMA busy_timeout = 5000;");
+      this.#database.exec(`
       CREATE TABLE IF NOT EXISTS slice_submission_requests (
         thread_id TEXT NOT NULL,
         request_id TEXT NOT NULL,
@@ -51,7 +72,7 @@ export class ApplicationStateStore {
         PRIMARY KEY (thread_id, request_id)
       );
     `);
-    this.#database.exec(`
+      this.#database.exec(`
       CREATE TABLE IF NOT EXISTS slice_external_operations (
         operation_id TEXT PRIMARY KEY,
         payload_hash TEXT NOT NULL,
@@ -61,6 +82,11 @@ export class ApplicationStateStore {
         updated_at INTEGER NOT NULL
       );
     `);
+    } catch (error) {
+      // A half-initialised store must not keep its handle open on the state file.
+      this.#database.close();
+      throw error;
+    }
   }
 
   static open(filePath: string): ApplicationStateStore {
@@ -70,6 +96,9 @@ export class ApplicationStateStore {
 
   /** Reserve an API request ID and reject reuse with a different payload. */
   reserveSubmission(threadId: string, requestId: string, payload: JsonValue): number | undefined {
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(threadId)) {
+      throw new TypeError("Thread IDs must be 1–128 letters, numbers, dots, underscores, colons, or hyphens");
+    }
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(requestId)) {
       throw new TypeError("Request IDs must be 1–128 letters, numbers, dots, underscores, colons, or hyphens");
     }

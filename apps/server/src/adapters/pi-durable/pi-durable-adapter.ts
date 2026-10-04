@@ -32,9 +32,15 @@ export class PiDurableAdapter {
   static async open(options: PiDurableAdapterOptions): Promise<PiDurableAdapter> {
     const registry = options.registry ?? createRegistry();
     const storage = await openNodeSqliteStorage(options.durableDatabasePath, { busyTimeoutMs: 5000 });
-    const harness = await Harness.open(storage, { models: options.models, registry }, BACKGROUND_CONTEXT);
-    harness.resume();
-    return new PiDurableAdapter(harness, options.state);
+    try {
+      const harness = await Harness.open(storage, { models: options.models, registry }, BACKGROUND_CONTEXT);
+      harness.resume();
+      return new PiDurableAdapter(harness, options.state);
+    } catch (error) {
+      // A half-open storage handle would keep the SQLite file locked after a failed start.
+      await storage.close(BACKGROUND_CONTEXT).catch(() => {});
+      throw error;
+    }
   }
 
   async createThread(agent: AgentChange): Promise<ConversationId> {

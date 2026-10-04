@@ -129,6 +129,51 @@ test("an operation is dispatched again once the in-flight call has settled", asy
   }
 });
 
+test("a journal built after an operation settled still shares in-flight state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-operation-late-journal-"));
+  const databasePath = join(directory, "state.sqlite");
+  const firstState = ApplicationStateStore.open(databasePath);
+  const secondState = ApplicationStateStore.open(databasePath);
+  let dispatches = 0;
+  let finishB: ((value: { id: string }) => void) | undefined;
+  const gateB = new Promise<{ id: string }>((resolve) => {
+    finishB = resolve;
+  });
+  const driver = {
+    execute: async (key: string) => {
+      dispatches += 1;
+      return key === "publish:settled-first" ? { id: "done" } : gateB;
+    },
+    reconcile: async () => ({ status: "not_started" as const }),
+  };
+  try {
+    // Settle one operation so the shared in-flight set becomes empty, which previously deleted it from the registry.
+    const first = new ExternalOperationJournal(firstState.database, "first-owner");
+    assert.deepEqual(
+      await first.run("publish:settled-first", { version: "v1" }, driver),
+      { id: "done" },
+    );
+    assert.equal(dispatches, 1);
+
+    // Start a second operation that stays in flight, then build a fresh journal on another connection.
+    const inFlight = first.run("publish:b", { version: "v1" }, driver);
+    assert.equal(dispatches, 2);
+    const late = new ExternalOperationJournal(secondState.database, "late-owner").run(
+      "publish:b",
+      { version: "v1" },
+      driver,
+    );
+    assert.equal(dispatches, 2, "a journal built after a settle must still see the operation in flight");
+    finishB?.({ id: "publish:b" });
+    assert.deepEqual(await Promise.all([inFlight, late]), [{ id: "publish:b" }, { id: "publish:b" }]);
+    assert.equal(dispatches, 2);
+  } finally {
+    firstState.close();
+    secondState.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("separate journal instances share in-flight operation deduplication", async () => {
   const directory = await mkdtemp(join(tmpdir(), "slice-operation-concurrent-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));

@@ -113,6 +113,21 @@ test("local model configuration rejects unsafe values", () => {
     /must use HTTP or HTTPS/,
   );
   assert.throws(
+    () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://169.254.169.254/v1", SLICE_LOCAL_MODEL_ID: "m" }),
+    /must not be a link-local or metadata address/,
+  );
+  assert.throws(
+    () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://[fe80::1]/v1", SLICE_LOCAL_MODEL_ID: "m" }),
+    /must not be a link-local or metadata address/,
+  );
+  // A model server on the local network stays reachable.
+  assert.doesNotThrow(() =>
+    createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://192.168.1.20:8080/v1", SLICE_LOCAL_MODEL_ID: "m" }),
+  );
+  assert.doesNotThrow(() =>
+    createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1234/v1", SLICE_LOCAL_MODEL_ID: "m" }),
+  );
+  assert.throws(
     () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m", SLICE_LOCAL_API_KEY: "key\r\nX-Injected: 1" }),
     /must not contain control characters/,
   );

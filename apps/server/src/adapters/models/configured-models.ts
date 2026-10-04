@@ -36,6 +36,18 @@ function positiveInteger(value: string | undefined, fallback: number, name: stri
   return parsed;
 }
 
+/**
+ * A local endpoint must not be written as a link-local or metadata address. Loopback and private LAN addresses stay
+ * allowed, so a model server on the local network keeps working. This checks the literal only; resolving a name at
+ * startup would add a blocking network call, and the value is operator configuration rather than request input.
+ */
+function assertNotLinkLocal(hostname: string): void {
+  const address = hostname.replace(/^\[|\]$/g, "");
+  if (address.startsWith("169.254.") || address === "0.0.0.0" || address.toLowerCase().startsWith("fe80:")) {
+    throw new Error("A local model endpoint must not be a link-local or metadata address");
+  }
+}
+
 export function createConfiguredModels(environment: ModelEnvironment = process.env): MutableModels {
   const models = createModels();
   const localBaseUrl = environment.SLICE_LOCAL_BASE_URL;
@@ -52,6 +64,7 @@ export function createConfiguredModels(environment: ModelEnvironment = process.e
     if (endpoint.username.length > 0 || endpoint.password.length > 0) {
       throw new Error("Do not put credentials in SLICE_LOCAL_BASE_URL");
     }
+    assertNotLinkLocal(endpoint.hostname);
     // Read from the environment only. A key that carries a control character could inject request headers.
     const configuredApiKey = environment.SLICE_LOCAL_API_KEY;
     if (configuredApiKey !== undefined && /[\0-\x1f\x7f]/.test(configuredApiKey)) {
