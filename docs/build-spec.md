@@ -1,12 +1,12 @@
 # Pi Durable agent build specification
 
-Version 1.2 · 4 October 2026 · Reviewed implementation design
+Version 1.3 · 4 October 2026 · Responsive UI and thread steering design
 
 The design review and corrections are recorded in [spec-review.md](spec-review.md).
 
 ## 1 Purpose and main decision
 
-Build a small, self-hosted agent service that turns a change request into a checked pull request. The user controls the service from a mobile web page. Telegram sends alerts and can later provide a second control surface. Models can use local inference servers or approved cloud providers. Code stays on registered SSH hosts.
+Build a small, self-hosted agent service that turns a change request into a checked pull request. The user controls the service from a responsive web app that works on phones, tablets, and desktop screens. Telegram sends alerts and can later provide a second control surface. Models can use local inference servers or approved cloud providers. Code stays on registered SSH hosts.
 
 The service must complete requirements, planning, isolated implementation, tests, independent code review, independent security review, and evidence preparation. The user receives the completed result to check. The user then merges and deploys through the existing repository and release controls. The user should not need to read source code for routine changes.
 
@@ -20,7 +20,7 @@ The design aims to spend about 80% of model use on verification and about 20% on
 - One always-on Linux control host, separate from inference if convenient.
 - GitHub is the first PR provider. Use an adapter so another Git host can be added.
 - SSH endpoints can run Linux or Windows. Each repository declares its required build environment.
-- Vue 3 is the proposed mobile frontend. A small TypeScript backend hosts the API and Pi Durable adapter.
+- Vue 3 is the proposed responsive web frontend. A small TypeScript backend hosts the API and Pi Durable adapter.
 - Existing production credentials and release tools remain outside the worker environment.
 - Routine work can start after the agent resolves requirements. An explicit user confirmation is needed only for material uncertainty or a scope change with material cost or risk.
 
@@ -42,7 +42,7 @@ Start with one control service and one database. Do not add a message broker, a 
 
 | Component | Responsibility |
 |---|---|
-| Mobile web app | Requests, questions, status, evidence, user acceptance |
+| Responsive web app | Requests, questions, status, evidence, user acceptance |
 | TypeScript control service | Authentication, API, workflow policy, notifications, adapters |
 | Pi Durable | Agent conversations, task execution, checkpoints, compaction |
 | Durable documents | Requests, revisions, findings, approvals, operation records |
@@ -54,7 +54,7 @@ Start with one control service and one database. Do not add a message broker, a 
 
 ```mermaid
 flowchart TD
-  W["Mobile web"] --> A["Control service"]
+  W["Responsive web"] --> A["Control service"]
   T["Telegram alerts and optional commands"] <--> A
   A --> D["Pi Durable and workflow policy"]
   D --> S["SQLite and artifact files"]
@@ -92,7 +92,7 @@ The requirements agent asks short questions where the answer changes behaviour. 
 - Explicit exclusions and reasonable assumptions.
 - The likely test and rollback approach.
 
-The mobile page shows the proposed result in plain language. For a clear routine request, it continues automatically and shows “Work started”. For material uncertainty, it shows a small set of choices and waits. A repository policy can require “Confirm requirements” for every request if the owner prefers.
+The web app shows the proposed result in plain language. For a clear routine request, it continues automatically and shows “Work started”. For material uncertainty, it shows a small set of choices and waits. A repository policy can require “Confirm requirements” for every request if the owner prefers.
 
 ### Step 3 Prepare the job
 
@@ -106,7 +106,7 @@ Findings return to the author. The author fixes them or gives a supported respon
 
 ### Step 5 Present the completed result
 
-The user receives a mobile result page with:
+The user receives a responsive result page with:
 
 - What changed, written for an app user.
 - A safe preview where one can be created.
@@ -402,6 +402,14 @@ The runner confirms termination. If a host cannot be reached, show “Cancellati
 
 A browser or Telegram disconnect never cancels work. Reconnect obtains a state snapshot, then resumes the event stream from a cursor. Cancellation and confirmation operate on the same durable job regardless of the surface used.
 
+### Steer a thread
+
+Steering is a separate, durable command, not an ordinary chat message. It includes a request ID, payload hash, and expected command revision. Reject a stale command revision and return the current state without applying the instruction.
+
+For an active job, record the instruction first, then stop admission of new model and tool calls. Let already-admitted operations complete or reconcile them at a safe boundary. The coordinator assesses how the instruction affects requirements, code, and evidence before work resumes. A message that only clarifies existing intent can update the conversation and continue. A change to acceptance behaviour creates a new requirements revision. Ask for confirmation before a material scope, cost, or risk change when project policy requires it.
+
+If a new requirement affects the implementation, preserve the current worktree and branch for assessment, but mark dependent checks and reviews stale. Do not present the prior result as ready. If a PR is ready or in `publishing`, reconcile the Git host and withdraw readiness before starting new author work; keep it draft until the new revision passes the full gate. If the PR is already merged, reject steering on the archived job and offer a linked follow-up job. Steering a paused job records the instruction without resuming it.
+
 ### Threads, archiving, and worktree cleanup
 
 In the UI, “thread” means the user-facing history for one change request and its durable conversations. The picker has Active and Archived views. Archived rows remain searchable by project, title, PR number, branch, and date. Opening one shows its transcript, status reports, final summary, review findings, checks, acceptance record, merge commit, and retained evidence. It does not reconnect the user to a running agent.
@@ -418,23 +426,23 @@ The archived transcript and result summary remain in durable storage. Keep the f
 
 If the user merges a PR while work is unexpectedly active, block new author and publishing operations, then cancel or settle child work. Reconcile any operation admitted before revocation. Record the actual merged revision separately from any later feature-branch commit; never attribute late work to the merged release. If a process cannot be confirmed stopped, keep cleanup pending and alert the user.
 
-## 11 Mobile web and Telegram
+## 11 Responsive web and Telegram
 
-### Mobile web pages
+### Responsive web app
 
 1. **Threads:** Active and Archived views, search, project and PR filters, stage badges, and last update.
 2. **New request:** app selector, text, attachments, optional budget.
-3. **Request detail:** conversation, requirements, current stage, questions, spend, pause and cancel. Show a status report every 10 minutes by default. Let the user change the interval or turn reports off for that job.
+3. **Request detail:** conversation, requirement revisions, current stage, questions, spend, pause, cancel, and steering controls for any non-archived thread. Show a status report every 10 minutes by default. Let the user change the interval or turn reports off for that job.
 4. **Result:** preview, screenshots, evidence, limits, rollback plan, PR link, acceptance and change request.
 5. **Settings:** registered projects, hosts, models, privacy rules, budgets, default report interval, and alerts. The owner can add multiple repositories, assign allowed SSH endpoints and model profiles, test connectivity, and pause or remove a project. Pausing or removing it pauses active jobs and blocks new work while preserving threads, PR links, and evidence.
 
-Use pi-mobile's low-chrome mobile layout as a reference: a compact header, a slide-out thread and project picker, focused work view, and controls near the user's thumb. Keep a visible path back to the thread list. The screenshot below is from the upstream repository's desktop replay test; its text is a fixture, not a proposed Slice transcript:
+Keep one responsive interface and preserve the same thread and project structure at every size. On narrow screens, use pi-mobile's low-chrome layout as a reference: a compact header, a slide-out thread and project picker, focused work view, and controls near the user's thumb. On desktop, keep the project and thread rail visible, give the work area more width, and show optional status and evidence panels beside the conversation. Do not only enlarge the phone layout. Keep a clear path back to the thread list. The screenshot below is from the upstream repository's desktop replay test; its text is a fixture, not a proposed Slice transcript:
 
 ![Pi-mobile desktop replay screenshot used as a visual reference.](images/pi-mobile/desktop-conversation.png)
 
 *The reference is pinned to commit `4cc9b712254d84c90a00373c972c8a417fd26fb9`. Reuse the compact layout and session navigation; Slice's own screens below show the task workflow.*
 
-Use these Slice concept screens as layout references:
+Use these Slice phone concept screens as layout references:
 
 ![Slice mobile interface concepts: thread picker, progress report, and review-ready result. Example data only.](images/slice-mockups/01-threads.png)
 
@@ -448,7 +456,33 @@ Use these Slice concept screens as layout references:
 
 *Result concept. Lead with user-facing behaviour and verified evidence. Keep requesting changes, accepting the result, and opening the PR as separate choices; acceptance does not merge or deploy.*
 
-These concept images use example data. They are product references, not captures of a running Slice app or proof that any check passed. Slice captures real screenshots only from a tested preview at the revision and environment recorded in its evidence manifest.
+### Desktop concepts
+
+The desktop view can expose more workflow detail without turning the user interface into an internal transcript. Keep the change summary and next action easy to see. Put technical activity in an optional tab or panel.
+
+![Slice desktop thread view with a steering composer and status panel. Example data only.](images/slice-mockups/desktop-01-steer.png)
+
+*Thread workspace concept. The user can steer an active thread from a persistent composer. Status and review progress stay visible beside the conversation.*
+
+![Slice desktop execution timeline with stage lanes and an event inspector. Example data only.](images/slice-mockups/desktop-02-timeline.png)
+
+*Activity concept. Use a Gantt-style horizontal view for actual stage and tool durations, show overlapping reviews on separate lanes, and keep a selectable event ledger below it. Offer time, turn, and call views. Show start markers for in-flight work; do not invent end times or durations.*
+
+![Slice desktop review result with evidence, checks, and pull request actions. Example data only.](images/slice-mockups/desktop-03-result.png)
+
+*Result concept. Use the extra width for before-and-after previews, acceptance results, review summaries, limits, rollback information, and separate user actions.*
+
+All Slice concept images use example data. They are product references, not captures of a running Slice app or proof that any check passed. Slice captures real screenshots only from a tested preview at the revision and environment recorded in its evidence manifest.
+
+For activity details, show a durable event ledger with role, stage, timestamp, measured duration, tool name, safe input summary, outcome, usage, and evidence links. Let the user filter and inspect records. Redact secret values and unsafe or unrelated output. Never show private model reasoning or system prompts. Show concise user-facing progress and reviewer findings with their evidence; these are not chain-of-thought. Keep the event ledger usable without the chart and provide keyboard navigation.
+
+The Gantt-style timeline is a view of recorded events, not a plan or a promise about completion time. Distinguish queued, running, completed, failed, cancelled, and uncertain operations. Keep a linear event list for screen readers and narrow screens. This design is inspired by the DeepSeek Harness Trajectory view's event ledger and timing overview; Slice uses its own workflow events and access rules. [S10]
+
+Keep the result usable on an iPhone or iPad without horizontal scrolling. On desktop, use the extra width for project/thread navigation, a main work area, and optional detail panels. Put behaviour and preview evidence first. Put source diffs, redacted tool logs, user dialogue, and review reports behind optional detail controls. Never expose private model reasoning. Show “Not tested” and “Blocked” clearly; do not replace them with a green summary.
+
+Support steering in every non-archived thread. The composer records an auditable user instruction against the current command revision. A steering instruction is not a privileged command and cannot bypass repository policy, review gates, budgets, or release approval. If work is active, stop admitting new model and tool calls until current operations reach a safe boundary and the coordinator assesses the instruction. Classify it as clarification, constraint, or scope change. Update the requirements revision when its meaning changes; ask a question or request confirmation when it adds material scope, cost, or risk. Keep existing work for assessment instead of deleting it automatically.
+
+When steering changes requirements, invalidate affected tests, reviews, acceptance, and readiness evidence. If a PR is ready or publishing, first withdraw or reconcile readiness and return the PR to draft before new authoring work. If the PR has merged, keep the old thread archived and offer to create a linked follow-up job. A steering message on a paused job is recorded but does not resume it. Show the user the impact and current job state after each instruction.
 
 The new-task flow has “Describe a change” and “Start from a GitHub issue” entry points. Issue selection searches only registered repositories and excludes pull requests. The issue view identifies its repository, number, title, state, labels, author, latest update, and relevant comments before the user starts a task.
 
@@ -472,6 +506,7 @@ GET  /api/jobs/:id/events
 GET  /api/jobs/:id/status-reports
 PATCH /api/jobs/:id/status-settings
 POST /api/jobs/:id/messages
+POST /api/jobs/:id/steer
 POST /api/jobs/:id/requirements/answers
 POST /api/jobs/:id/pause
 POST /api/jobs/:id/resume
@@ -618,6 +653,7 @@ Use versioned typed documents for application records. Add migrations before cha
 |---|---|
 | Project | Stable ID, repo identity, allowed hosts, versioned build and test profiles, issue settings, privacy and gate policy, Git identity references, default budgets, active or tombstoned state |
 | Job or thread | ID, owner, project and profile revision, request source and issue snapshot, stage, run/archive/cleanup/release states, command revision, workflow generation, timestamps, budgets, report settings and generation, next report time, linked predecessor |
+| Steering event | Job, owner, request ID, payload hash, command revision, timestamp, impact classification, requirements revision, safe-boundary reconciliation, evidence invalidated |
 | Issue link | Provider, repository ID, issue ID and number, URL, captured update time, linked job IDs |
 | Requirements | Revision, criteria, assumptions, decisions, scope |
 | Workspace | Host, repo, branch, base, paths, lease generation, head, supervised operation IDs, resource manifest, cleanup status and timestamp |
@@ -700,11 +736,11 @@ Pin dependencies. Build the Pi Durable adapter. Use a fake model and tool servic
 
 Exit check: kill the service at known task boundaries, restart it, and recover the correct state without duplicate external actions. Keep synthetic and live results separate. Missing live credentials or endpoints must be reported as not tested, not as a passing live check. Measure recovery rather than assuming it from persistence. Do not connect production repositories yet.
 
-### Phase 1 Deliver mobile requests for registered projects
+### Phase 1 Deliver responsive requests for registered projects
 
 Add single-owner authentication, a project registry for multiple repositories, job creation from a user request or selected GitHub issue, requirements, a state page, event reconnection, pause and cancel. Use two disposable demo repositories on one Linux runner with explicit build profiles. Add the runner journal, supervised operation IDs, fenced leases, and a single author workspace per active repository job. Support only the configured demo toolchains at this stage.
 
-Exit check: a user submits a small change from a phone against each of two registered demo repositories, then starts a task from an issue in one of them. The issue maps to one job with its source link intact. The user answers a necessary question, closes the browser, reconnects, and sees the same job continue. Concurrent jobs in different repositories do not share a workspace or project policy. No user checkout is touched.
+Exit check: a user submits a small change from phone and desktop browsers against two registered demo repositories, then starts a task from an issue in one of them. The issue maps to one job with its source link intact. The user answers a necessary question, steers an active thread, closes the browser, reconnects, and sees the same job continue. Concurrent jobs in different repositories do not share a workspace or project policy. No user checkout is touched.
 
 ### Phase 2 Deliver a checked PR
 
@@ -716,7 +752,7 @@ Exit check: an intentionally faulty author output is blocked, fixed, and reviewe
 
 Add isolated previews, browser scenarios, baseline and after screenshots, documentation records, the result page, a searchable thread picker, archived result views, calibrated status reports with a 10-minute default interval, and a notification outbox. Add Telegram account linking and alerts.
 
-Exit check: the user can assess the result from an iPhone or iPad without opening source files. Closing a preview does not stop the job. Evidence remains accessible after workspace cleanup.
+Exit check: the user can assess the result from an iPhone, iPad, or desktop browser without opening source files. Closing a preview does not stop the job. Evidence remains accessible after workspace cleanup.
 
 ### Phase 4 Add more hosts and release readiness
 
@@ -805,6 +841,15 @@ These checks test system properties and failures. They are not a request to writ
 | Test result omits its declared source or environment digest | Evidence is rejected |
 | Create-request retry arrives after a lost response | Idempotency key and payload hash return the same job |
 | Answer arrives for an old question after requirements changed | Stale answer is rejected without changing the new revision |
+| Steering command uses an old command revision | The service rejects it and returns current thread state without applying the message |
+| User steers a running job while a tool is in flight | Instruction is recorded; no new work starts until admitted operations reach a safe boundary and impact is assessed |
+| Steering changes an acceptance criterion | A new requirements revision is created; affected evidence and reviews become stale |
+| User steers while the PR is publishing or ready | Git host state is reconciled; readiness is withdrawn and the PR returns to draft before new authoring work |
+| User steers a merged archived thread | No work starts on the merged branch; the UI offers a linked follow-up job |
+| User steers a paused job | Instruction is recorded; the job remains paused |
+| Inspect an in-flight activity timeline | Running work shows its start and state without an invented duration; the event ledger remains available |
+| Inspect desktop activity details | Safe summaries and redacted metadata appear; private reasoning, system prompts, and secret values do not |
+| Open the app at phone and desktop widths | Navigation, steering, status, and result actions work; desktop adds detail panels and narrow screens have no horizontal overflow |
 | Required human review is configured | AI checks do not satisfy it |
 | A green summary lacks actual test artifacts | Packet validation fails |
 | Screenshot is from an older commit | Packet validation fails |
@@ -821,7 +866,7 @@ Use seeded code defects to evaluate reviewer profiles: access-control errors, cr
 
 ## 19 Definition of done for version 1
 
-Version 1 is done when a user can submit a scoped app change from a mobile browser and receive a real checked PR, with independent code and security reviews, verification evidence, documentation where needed, and a usable rollback plan. The user can return to active or archived threads in the picker. A confirmed merge archives the thread, preserves its history and final evidence, and removes the local worktree after the runner verifies that no process or lease remains.
+Version 1 is done when a user can submit a scoped app change from a phone or desktop browser and receive a real checked PR, with independent code and security reviews, verification evidence, documentation where needed, and a usable rollback plan. The user can return to active or archived threads in the picker and steer active work safely. A confirmed merge archives the thread, preserves its history and final evidence, and removes the local worktree after the runner verifies that no process or lease remains.
 
 It must survive a control-service restart and a temporary model or SSH outage. It must enforce distinct reviewer model identities, privacy policy, budgets, source provenance, and current-revision approvals. It must not expose production credentials to workers or merge automatically. The owner must be able to pause, cancel, request changes, accept the result, and use the normal merge and deployment controls.
 
@@ -833,7 +878,7 @@ Use the following task as the first coding handoff:
 
 > Implement Phase 0 of the Slice build specification. Read the repository rules and this document first. Keep the Pi Durable dependency behind a typed adapter. Pin compatible package versions and document the tested Node runtime. Use fake external services for recovery tests, then test one configured local model and one approved cloud model. Prove safe replay, uncertain external operations, submission deduplication, cancellation, and resume after process termination. Do not implement Telegram, production deployment, a general plugin system, or multi-host orchestration in this PR. Supply the recovery test results, setup instructions, and known API limits. Stop with a reviewable PR for this phase.
 
-After Phase 0 passes, build the mobile request flow and one SSH runner. Do not try to create the complete platform in one coding session.
+After Phase 0 passes, build the responsive request flow and one SSH runner. Do not try to create the complete platform in one coding session.
 
 ## Sources
 
@@ -848,3 +893,4 @@ The sources below support the current upstream facts. The workflow, policies, bu
 - **S7** GitHub REST API documentation for pull requests, checked 4 October 2026. The merge endpoint accepts fine-grained tokens with Contents write permission. https://docs.github.com/en/rest/pulls/pulls
 - **S8** GitHub available rules for rulesets, checked 4 October 2026. Restrict updates permits only configured bypass actors to update matching refs. https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
 - **S9** `p1rallels/pi-mobile`, web UI for the Pi coding agent. Visual reference: the repository's basic Playwright desktop replay screenshot, pinned to commit `4cc9b712254d84c90a00373c972c8a417fd26fb9`. The published iPhone test image currently shows a Face ID error, so it is not used as a successful mobile-flow example. UI screenshot and mockups are not application test evidence. Screenshot copyright and MIT license notice are retained in `docs/images/pi-mobile/LICENSE`. https://github.com/p1rallels/pi-mobile/tree/4cc9b712254d84c90a00373c972c8a417fd26fb9
+- **S10** DeepSeek Harness `ui-trajectory` README, checked 4 October 2026 and pinned to commit `5badb15009ae1756c3afe0ae0cef1faafc290ccc`. Its Trajectory view describes a turn-aware event ledger and interactive timing overview. The official UI preview also shows duration, turn, and call views. Slice uses these as layout references only; no source code or screenshots are copied. https://github.com/deepseek-ai/deepseek-harness/blob/5badb15009ae1756c3afe0ae0cef1faafc290ccc/packages/client/ui-trajectory/README.md and https://www.deepseek.com/en/harness/
