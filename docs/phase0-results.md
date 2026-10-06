@@ -4,7 +4,8 @@ Status: **synthetic recovery checks pass; the local model check passed; the Open
 
 ## Runtime and pinned packages
 
-- Tested Node.js: `v26.7.0` on Linux x64, and `v24.19.0` in an earlier run of this phase.
+- Latest local verification: 2026-10-06 with Node.js `v24.21.0` on Linux x64 and npm `11.19.0`.
+- Earlier complete verification: Node.js `v26.7.0` on Linux x64 and `v24.19.0` in an earlier run of this phase.
 - Minimum Node.js: `22.19.0`, as required by the pinned Pi Durable package.
 - npm: `11.19.0` (`11.9.0` in the earlier run).
 - `@earendil-works/pi-durable`: `1.0.2`.
@@ -16,7 +17,7 @@ Direct dependencies are pinned exactly. `package-lock.json` pins the complete in
 
 ## Checks run
 
-`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 23 Node tests.
+`npm run check` passes on Node `v24.21.0`: typecheck, build, and all 33 Node tests. The earlier Node `v26.7.0` run passed all 23 tests that existed at that time.
 
 The tests use the Pi AI faux provider, disposable SQLite files, and fake external systems. The process tests send `SIGKILL` to a real Node worker and then reopen its state.
 
@@ -61,7 +62,7 @@ Both are dominated by Node process start-up, not by Slice state replay. These ar
 
 Local model smoke test: **passed** on 2026-10-04.
 
-- Endpoint: `http://ws-p3:8080/v1`, an OpenAI-compatible llama-swap server.
+- Endpoint: an OpenAI-compatible local llama-swap server; the private address is redacted.
 - Model: `qwen27b`, the server's alias for `Qwen3.8-27B-UD-Q5_K_XL`, reported as Qwen3.8 27B Q5.
 - Result: `{"status":"passed","provider":"slice-local","model":"qwen27b","stopReason":"stop"}`.
 

@@ -1,16 +1,20 @@
 # Phase 0 security review
 
-Status: **independent review returned CHANGES REQUESTED**; the findings are now fixed and awaiting re-review. The Phase 0
-gate is not signed off. This record holds both the author's self-review and the independent reviewer's findings.
+Status: **the initial independent review returned CHANGES REQUESTED. A local Codex follow-up on 2026-10-06 rechecked the security fixes and found F1 and F2 resolved. The Phase 0 gate remains open pending the OpenAI cloud smoke test and dependency review.**
 
-The repository rules state that the author cannot approve its own work. Two roles are recorded separately below.
-Neither is an approval, and the author may not close the independent reviewer's own findings.
+This record preserves the initial findings and the follow-up. The PR author cannot approve their own work; the follow-up was performed in a separate review context.
 
 - Self-review: implementer, 2026-10-04. Evidence gathered by the author.
-- Independent review: separate reviewer context, 2026-10-04, over `apps/server/src` and `git diff main...HEAD` at
+- Initial independent review: separate reviewer context, 2026-10-04, over `apps/server/src` and `git diff main...HEAD` at
   `51482ee`. Reviewed read-only; no file, dependency, or git state was changed by the reviewer.
 
-## Verdict
+## Follow-up review (2026-10-06)
+
+Reviewed the current PR head `f5b4b49` locally, including the server, state handling, model adapter, operation journal, and recovery tests. The F1 journal-map fix and F2 locale-independent hashing fix are present; their regression tests passed. `npm run check` passed on Node `v24.21.0` with all 33 tests. No new P0 or P1 code finding was identified in the reviewed paths.
+
+The structured external review service was not run because automatic approval review rejected sending the private code bundle to that destination. This follow-up stayed local and did not transmit source. It rechecked the reported fixes; the cloud smoke test and dependency review remain outstanding.
+
+## Initial verdict
 
 `CHANGES REQUESTED`. No P1. The reviewer found no SQL injection, no committed credentials, no command execution, no
 non-loopback listener, and no path from model output or repository content into a command, path, host, or SQL string.
@@ -19,14 +23,11 @@ One finding retracts a claim in the self-review below: the at-most-once dispatch
 
 ## Findings and their current state
 
-Each finding below was fixed by the implementer after the review. None is independently re-verified yet, and the
-implementer may not sign off the reviewer's own findings.
+The implementer marked the findings below fixed after the initial review. The follow-up review independently rechecked F1 and F2; the remaining P3 items were not re-reviewed in this follow-up.
 
 ### F1 — P2 — At-most-once external dispatch is still broken
 
-**Fixed.** The empty-map cleanup is removed, so the shared set lives for the life of the process and a journal built
-after a settle still sees work in flight. A regression test builds the second journal after an operation settles and
-while another is in flight; it fails on the previous code and passes now.
+**Fixed and independently rechecked on 2026-10-06.** The empty-map cleanup is removed, so the shared set lives for the life of the process and a journal built after a settle still sees work in flight. The late-journal regression test passes in the current PR check.
 
 `apps/server/src/workflow/external-operation-journal.ts:96`
 
@@ -45,9 +46,7 @@ still live. The `SIGKILL` test asserts the fake remote's idempotency, not Slice'
 
 ### F2 — P2 — `payload_hash` depends on the host locale
 
-**Fixed.** Keys sort in UTF-16 code-unit order, which no collation table changes. A test hashes a fixed multi-key
-payload under four locales in subprocesses and compares; it fails on the previous code and passes now. Payload nesting
-is also bounded at 64 levels rather than overflowing the stack.
+**Fixed and independently rechecked on 2026-10-06.** Keys sort in UTF-16 code-unit order, independent of locale. The multi-locale hash test passes, and payload nesting is capped at 64 levels.
 
 `apps/server/src/state/application-state.ts:20`
 
@@ -203,7 +202,7 @@ unmodified.
 3. ~~Fix F3 through F6.~~ Done.
 4. ~~Fix F7 through F12 and the F14 items.~~ Done except retention policy and a non-C0 guard, both recorded above.
 5. ~~Correct the self-review rows the reviewer refuted.~~ Done in this record and in the results document.
-6. **Re-run the independent review over the fixes.** In progress.
+6. ~~Re-run the independent review over F1 and F2.~~ The local follow-up verified both fixes; a structured external review was not run, as noted above.
 7. Build the OpenAI cloud login, run the cloud smoke test, and record it.
 8. Sign off only when the reviewer and the owner both agree, and when the cloud check is no longer "not tested".
 
@@ -212,7 +211,6 @@ journal, no dependency review of the pinned `@earendil-works` packages, and powe
 
 ## Still required before the gate closes
 
-- An independent reviewer signs off. The author cannot approve this record or close F1 and F2.
-- The OpenAI cloud smoke test is **not tested**; it needs an approved cloud model and a credential.
+- The OpenAI cloud smoke test remains **not tested**; it requires an approved model profile and credential.
 - A dependency review of the three pinned `@earendil-works` packages, which are experimental and unreviewed here.
 - Power-loss and host-failure durability is documented as unproven, with `synchronous=NORMAL` in WAL mode.
