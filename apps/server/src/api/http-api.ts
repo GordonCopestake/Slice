@@ -97,7 +97,7 @@ export class SliceApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     const method = request.method ?? "GET";
     try {
-      if (url.pathname in WEB_FILES && method === "GET") {
+      if (method === "GET" && Object.hasOwn(WEB_FILES, url.pathname)) {
         this.#serveWeb(response, url.pathname);
         return;
       }
@@ -131,7 +131,12 @@ export class SliceApi {
   }
 
   #serveWeb(response: ServerResponse, pathname: string): void {
-    const entry = WEB_FILES[pathname]!;
+    const entry = Object.hasOwn(WEB_FILES, pathname) ? WEB_FILES[pathname] : undefined;
+    if (entry === undefined) {
+      // A name that exists only on Object's prototype is not a route.
+      json(response, 404, { error: "not_found" });
+      return;
+    }
     try {
       const body = readFileSync(join(this.#deps.webDirectory, entry.file));
       response.writeHead(200, { "content-type": entry.type, "cache-control": "no-store", "x-content-type-options": "nosniff" });
@@ -475,10 +480,12 @@ function issueFromBody(value: JsonValue | undefined, registeredRepoSlug: string)
   const issue = value as Record<string, unknown>;
   if (typeof issue.repoSlug !== "string" || typeof issue.url !== "string" || typeof issue.title !== "string") throw new TypeError("issue requires repoSlug, url, and title");
   if (issue.repoSlug !== registeredRepoSlug) throw new TypeError("issue links must name the project's registered repository");
+  if (issue.title.length > 300 || issue.url.length > 500 || typeof issue.updatedAt !== "string" || issue.updatedAt.length > 40) {
+    throw new TypeError("issue title, url, and updatedAt exceed the allowed sizes");
+  }
   if (typeof issue.number !== "number" || typeof issue.id !== "number" || !Number.isSafeInteger(issue.number) || !Number.isSafeInteger(issue.id)) {
     throw new TypeError("issue number and id must be integers");
   }
-  if (typeof issue.updatedAt !== "string") throw new TypeError("issue updatedAt must be a string");
   return {
     provider: "github",
     repoSlug: issue.repoSlug,

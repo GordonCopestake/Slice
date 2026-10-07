@@ -20,6 +20,8 @@ function spawnCollect(command: string, args: string[], stdinJson: string, timeou
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
+    // A child that dies before the write lands must not turn that write into an unhandled error.
+    child.stdin.on("error", () => { /* surfaced through the exit code below */ });
     child.on("error", (error) => {
       clearTimeout(timer);
       rejectSpawn(error);

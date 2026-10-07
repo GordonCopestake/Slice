@@ -206,6 +206,23 @@ test("cleanup refuses paths that do not match the manifest and removes only the 
   } finally { f.cleanup(); }
 });
 
+test("cleanup refuses while an operation is uncertain, even on a later attempt", async () => {
+  const f = newFixture([]);
+  try {
+    writeFileSync(join(f.root, ".runner.json"), JSON.stringify({ allowedSources: [f.source] }));
+    await f.call({ op: "prepare_job", jobId: "job-9", source: f.source, branch: "slice/job-9/x", leaseGeneration: 1 });
+    await f.call({ op: "run_check", jobId: "job-9", operationId: "job-9:check:slow", leaseGeneration: 1, checkId: "slow", command: "node slow.js" });
+    await waitUntil(async () => (await f.call({ op: "get_process_status", jobId: "job-9", operationId: "job-9:check:slow" })).status === "running");
+    rmSync(join(f.root, ".journal", "pids", "job-9:check:slow"), { force: true });
+    await f.call({ op: "reconcile", jobId: "job-9" });
+    const refused = await f.call({ op: "cleanup_job", jobId: "job-9" });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.error, "processes_not_confirmed_stopped");
+    const stillRefused = await f.call({ op: "cleanup_job", jobId: "job-9" });
+    assert.equal(stillRefused.ok, false, "uncertainty keeps cleanup pending until reconciliation resolves it");
+  } finally { f.cleanup(); }
+});
+
 test("the journal reattaches a completed remote check instead of running it twice", async () => {
   const f = newFixture([]);
   try {

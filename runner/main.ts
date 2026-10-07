@@ -82,8 +82,7 @@ class Journal {
     if (requested === row.generation) return { allowed: true };
     if (requested < row.generation) return { allowed: false, reason: "lease_revoked" };
     // A replacement lease is only granted after the previous generation's work is settled.
-    const running = this.#db.prepare("SELECT COUNT(*) AS n FROM operations WHERE job_id = ? AND status = 'running'").get(jobId) as { n: number };
-    if (Number(running.n) > 0) return { allowed: false, reason: "reconcile_required" };
+    if (this.unsettledFor(jobId) > 0) return { allowed: false, reason: "reconcile_required" };
     this.#db.prepare("UPDATE leases SET generation = ? WHERE job_id = ?").run(requested, jobId);
     return { allowed: true };
   }
@@ -110,7 +109,13 @@ class Journal {
   }
 
   runningFor(jobId: string): { operation_id: string; op: string }[] {
-    return this.#db.prepare("SELECT operation_id, op FROM operations WHERE job_id = ? AND status = 'running'").all(jobId) as never;
+    return this.#db.prepare("SELECT operation_id, op FROM operations WHERE job_id = ? AND status IN ('running', 'uncertain')").all(jobId) as never;
+  }
+
+  /** Operations whose outcome is still running or uncertain: cleanup must wait for confirmation. */
+  unsettledFor(jobId: string): number {
+    const row = this.#db.prepare("SELECT COUNT(*) AS n FROM operations WHERE job_id = ? AND status IN ('running', 'uncertain')").get(jobId) as { n: number };
+    return Number(row.n);
   }
 
   removeJob(jobId: string): void {
@@ -288,6 +293,7 @@ function handleCancel(journal: Journal, request: Extract<Request, { op: "cancel_
 
 function handleReconcile(journal: Journal, request: Extract<Request, { op: "reconcile" }>): Response {
   assertId(request.jobId, "jobId");
+  // Reconciliation re-resolves uncertain rows too: an exit file that appears later settles them.
   const results = journal.runningFor(request.jobId).map((row) => {
     const resolved = resolveRunning(journal, row.operation_id);
     if (resolved.status !== "running") journal.setStatus(row.operation_id, resolved.status as "succeeded" | "failed" | "uncertain", resolved.exitCode);
@@ -318,10 +324,10 @@ function handleCleanup(journal: Journal, root: string, request: Extract<Request,
   const marker = jobMarker(jobDir);
   if (marker === undefined || marker.jobId !== request.jobId) return fail("manifest_mismatch");
   const running = journal.runningFor(request.jobId);
-  if (running.length > 0) {
-    const unsettled = running.map((row) => resolveRunning(journal, row.operation_id).status);
-    if (unsettled.some((status) => status === "running")) return fail("processes_still_running");
-  }
+  for (const row of running) resolveRunning(journal, row.operation_id);
+  // Deletion needs confirmed stop. 'uncertain' means the outcome is unknown, which is not confirmation;
+  // the job stays cleanup-pending until reconciliation resolves every operation.
+  if (journal.unsettledFor(request.jobId) > 0) return fail("processes_not_confirmed_stopped");
   // The worktree first, then the disposable repository; the journal rows go last.
   git(["-C", join(jobDir, "repo"), "worktree", "remove", "--force", join(jobDir, "author")]);
   rmSync(realJob, { recursive: true, force: true });
