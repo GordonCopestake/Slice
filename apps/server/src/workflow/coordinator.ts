@@ -1,6 +1,7 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, type ConversationId, type EntryId } from "@earendil-works/pi-durable";
 import { PiDurableAdapter } from "../adapters/pi-durable/pi-durable-adapter.js";
+import type { RunnerGateway } from "../adapters/ssh-runner/runner-adapter.js";
 import type { IssueSnapshot, JobRecord, WorkflowStore } from "../records/workflow-store.js";
 
 /** The requirements role's only output contract. Anything else is a failed task, never a pass. */
@@ -67,11 +68,13 @@ export class JobCoordinator {
   readonly #adapter: PiDurableAdapter;
   readonly #workflows: WorkflowStore;
   readonly #profile: ModelProfile | null;
+  readonly #runner: RunnerGateway | null;
 
-  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null) {
+  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null, runner: RunnerGateway | null = null) {
     this.#adapter = adapter;
     this.#workflows = workflows;
     this.#profile = profile;
+    this.#runner = runner;
   }
 
   get requirementsConfigured(): boolean {
@@ -117,7 +120,7 @@ export class JobCoordinator {
       return this.#workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked") ?? this.#workflows.getJob(job.jobId)!;
     }
     const text = await this.#answerText(conversationId(threadId), settled.answer);
-    return this.#applyOutput(job.jobId, text);
+    return await this.#applyOutput(job.jobId, text);
   }
 
   async #answerText(threadId: ConversationId, answerId: EntryId): Promise<string> {
@@ -130,7 +133,7 @@ export class JobCoordinator {
     return message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
   }
 
-  #applyOutput(jobId: string, text: string): JobRecord {
+  async #applyOutput(jobId: string, text: string): Promise<JobRecord> {
     const output = parseRequirementsOutput(text);
     if (output === null) {
       this.#workflows.appendEvent(jobId, "requirements_output_rejected", { reason: "output did not match the requirements schema" });
@@ -143,7 +146,65 @@ export class JobCoordinator {
     }
     this.#workflows.appendEvent(jobId, "requirements_ready", { summary: output.summary, criteria: output.criteria });
     this.#workflows.setStage(jobId, "planning");
-    return this.#workflows.setRunState(jobId, ["running", "waiting_user"], "running") ?? this.#workflows.getJob(jobId)!;
+    const settled = this.#workflows.setRunState(jobId, ["running", "waiting_user"], "running") ?? this.#workflows.getJob(jobId)!;
+    // Requirements settled: prepare the isolated workspace and run the project's checks.
+    await this.#advanceWorkspace(settled);
+    return this.#workflows.getJob(jobId)!;
+  }
+
+  /**
+   * Planning and workspace preparation: one disposable repository and one author worktree per job,
+   * on the project's registered host, under a generation-1 lease. The user's own checkout is never touched.
+   */
+  async #advanceWorkspace(job: JobRecord): Promise<void> {
+    const jobId = job.jobId;
+    if (this.#runner === null) {
+      this.#workflows.appendEvent(jobId, "blocked", { reason: "no runner is configured for this service" });
+      this.#workflows.setRunState(jobId, ["running"], "blocked");
+      return;
+    }
+    try {
+      const project = this.#workflows.getProject(job.projectId);
+      if (project === undefined) throw new Error("the job's project is no longer registered");
+      const host = this.#workflows.getHost(project.hostId);
+      if (host === undefined) throw new Error(`project host ${project.hostId} is not registered`);
+      let workspace = this.#workflows.getWorkspace(jobId);
+      if (workspace === undefined) {
+        const prepared = await this.#runner.prepareJob({
+          jobId,
+          hostId: host.hostId,
+          source: `https://github.com/${project.repoSlug}.git`,
+          branch: `slice/${jobId}/${job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "change"}`,
+          leaseGeneration: 1,
+        });
+        workspace = this.#workflows.upsertWorkspace({
+          jobId,
+          hostId: host.hostId,
+          repoPath: prepared.repoPath || `/srv/slice/jobs/${jobId}/repo`,
+          worktreePath: prepared.worktreePath || `/srv/slice/jobs/${jobId}/author`,
+          branch: `slice/${jobId}/${job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "change"}`,
+          baseCommit: prepared.baseCommit,
+          leaseGeneration: 1,
+        });
+        this.#workflows.appendEvent(jobId, "workspace_ready", { hostId: host.hostId, baseCommit: prepared.baseCommit, branch: workspace.branch, reused: prepared.reused });
+      }
+      let allPassed = true;
+      for (const check of project.buildProfile.checks) {
+        const result = await this.#runner.runCheck({ jobId, hostId: host.hostId, leaseGeneration: workspace.leaseGeneration, checkId: check.id, command: check.command });
+        this.#workflows.appendEvent(jobId, "check_result", { checkId: check.id, status: result.status, exitCode: result.exitCode });
+        if (result.status !== "succeeded") allPassed = false;
+      }
+      if (!allPassed) {
+        this.#workflows.appendEvent(jobId, "blocked", { reason: "a baseline check failed on the prepared workspace" });
+        this.#workflows.setRunState(jobId, ["running"], "blocked");
+        return;
+      }
+      this.#workflows.setStage(jobId, "implementation");
+      this.#workflows.appendEvent(jobId, "stage", { stage: "implementation" });
+    } catch (error) {
+      this.#workflows.appendEvent(jobId, "blocked", { reason: `workspace preparation failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown"}` });
+      this.#workflows.setRunState(jobId, ["running"], "blocked");
+    }
   }
 
   async answerQuestion(jobId: string, questionId: string, revision: number, answer: string): Promise<{ job: JobRecord; accepted: boolean }> {
@@ -195,6 +256,16 @@ export class JobCoordinator {
     let job = this.#workflows.setRunState(jobId, ["running", "waiting_user", "pause_requested", "paused", "blocked"], "cancel_requested");
     if (job === undefined) throw new Error(`Job ${jobId} cannot be cancelled from ${this.#workflows.getJob(jobId)?.runState ?? "unknown"}`);
     this.#workflows.appendEvent(jobId, "cancel_requested", {});
+    // Remote work is signalled first so it stops while the durable conversation is aborted.
+    const workspace = this.#workflows.getWorkspace(jobId);
+    if (this.#runner !== null && workspace !== undefined) {
+      try {
+        await this.#runner.cancelRunning({ jobId, hostId: workspace.hostId });
+      } catch {
+        // Cancellation pending on host: admission is revoked but remote state stays recorded as unknown.
+        this.#workflows.appendEvent(jobId, "cancel_pending_on_host", { hostId: workspace.hostId });
+      }
+    }
     const threadId = job.threadId;
     if (!threadId.startsWith("thread-")) {
       await this.#adapter.cancel(conversationId(threadId));

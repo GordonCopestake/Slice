@@ -14,6 +14,14 @@ import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-d
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
+import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
+
+const fakeRunner: RunnerGateway = {
+  prepareJob: async () => ({ baseCommit: "0123456789abcdef", repoPath: "/srv/slice/jobs/j/repo", worktreePath: "/srv/slice/jobs/j/author", reused: false }),
+  runCheck: async () => ({ status: "succeeded", exitCode: 0, outputTail: "" }),
+  cancelRunning: async () => {},
+  reconcile: async () => [],
+};
 
 const QUESTION_JSON = '{"kind":"question","questionId":"q1","question":"Which office allocates?","choices":["front","back"]}';
 const READY_JSON = '{"kind":"ready","summary":"Add an allocation screen.","criteria":[{"id":"c1","text":"Office staff can allocate items"}]}';
@@ -38,7 +46,7 @@ async function startStack(): Promise<TestStack> {
   models.setProvider(faux.provider);
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" });
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner);
   const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public") });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
@@ -152,7 +160,7 @@ test("a job is created once per request ID, asks its question, and continues on 
       method: "POST", body: { questionId: question.questionId, revision: question.revision, answer: "front" },
     });
     assert.equal(answered.status, 200);
-    assert.equal(answered.body.job.stage, "planning");
+    assert.equal(answered.body.job.stage, "implementation");
 
     // A late second answer to the same question cannot change the job.
     const late = await stack.call(`/api/jobs/${created.body.job.jobId}/requirements/answers`, {
@@ -257,4 +265,51 @@ test("the event stream sends a snapshot and then the durable ledger from the cur
     assert.ok(seen.some((item) => item.event === "snapshot"), "the reconnecting client receives a state snapshot first");
     assert.ok(seen.some((item) => item.event === "event" && item.data.includes("question_asked")), "the ledger resumes from the cursor");
   } finally { await stack.close(); }
+});
+
+test("an issue maps to one job with its source link, and a second request shows the existing job", async () => {
+  const stack = await startStack();
+  const originalFetch = globalThis.fetch;
+  try {
+    // Stub only the GitHub read: one real issue and one pull request that the picker must exclude.
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (!String(input).includes("api.github.com")) return originalFetch(input as never, init);
+      return new Response(JSON.stringify([
+        { number: 7, id: 700, title: "Goods-ready screen", body: "Let the office allocate items.", html_url: "https://github.com/owner/demo/issues/7", state: "open", labels: [], updated_at: "2026-10-07T10:00:00Z" },
+        { number: 8, id: 800, title: "A pull request", body: "", html_url: "https://github.com/owner/demo/pull/8", state: "open", pull_request: { url: "x" }, updated_at: "2026-10-07T10:00:00Z" },
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+
+    const issues = await stack.call("/api/projects/demo/issues");
+    assert.equal(issues.status, 200);
+    assert.deepEqual(issues.body.issues.map((issue: { number: number }) => issue.number), [7], "pull requests are excluded from the issue picker");
+
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const created = await stack.call("/api/jobs/from-issue", { method: "POST", body: { requestId: "issue-7", projectId: "demo", issueNumber: 7 } });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.existing, false);
+    assert.equal(created.body.job.issue.issueNumber, 7);
+    assert.equal(created.body.job.issue.url, "https://github.com/owner/demo/issues/7", "the source link stays intact on the job");
+
+    // A second request for the same issue shows the existing job instead of starting duplicate work.
+    const duplicate = await stack.call("/api/jobs/from-issue", { method: "POST", body: { requestId: "issue-7-b", projectId: "demo", issueNumber: 7 } });
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.body.existing, true);
+    assert.equal(duplicate.body.job.jobId, created.body.job.jobId);
+
+    // A pull request cannot be selected as an issue task.
+    const asPr = await stack.call("/api/jobs/from-issue", { method: "POST", body: { requestId: "issue-8", projectId: "demo", issueNumber: 8 } });
+    assert.equal(asPr.status, 404);
+    assert.equal(asPr.body.error, "issue_not_found");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await stack.close();
+  }
 });

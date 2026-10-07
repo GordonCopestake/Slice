@@ -6,10 +6,13 @@ import { SliceApi } from "./api/http-api.js";
 import { OwnerAuth } from "./auth/owner-auth.js";
 import { createConfiguredModels } from "./adapters/models/configured-models.js";
 import { PiDurableAdapter } from "./adapters/pi-durable/pi-durable-adapter.js";
+import { RunnerAdapter } from "./adapters/ssh-runner/runner-adapter.js";
+import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/runner-transport.js";
 import { WorkflowStore } from "./records/workflow-store.js";
 import { ApplicationStateStore } from "./state/application-state.js";
 import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
+import { ExternalOperationJournal } from "./workflow/external-operation-journal.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
@@ -57,6 +60,39 @@ function requirementsProfile(environment: NodeJS.ProcessEnv): ModelProfile | nul
   return { provider, modelId };
 }
 
+/**
+ * Runner wiring. `SLICE_RUNNER_MODE=local` runs the bundled runner on this host (single-machine
+ * demo); `ssh` invokes it through pinned-host-key SSH. No mode means no runner: jobs settle their
+ * requirements and then block with a stated reason rather than pretending work started.
+ */
+function buildRunner(workflows: WorkflowStore, state: ApplicationStateStore, stateDirectory: string): RunnerAdapter | null {
+  const mode = process.env.SLICE_RUNNER_MODE;
+  const journal = new ExternalOperationJournal(state.database);
+  if (mode === undefined) return null;
+  if (mode === "local") {
+    const root = process.env.SLICE_RUNNER_ROOT;
+    if (root === undefined || root.trim().length === 0) throw new Error("SLICE_RUNNER_MODE=local requires SLICE_RUNNER_ROOT");
+    const entry = resolve(process.env.SLICE_RUNNER_ENTRY ?? "dist/runner/main.js");
+    return new RunnerAdapter(journal, () => new LocalRunnerTransport(entry, resolve(root)));
+  }
+  if (mode === "ssh") {
+    const remoteEntry = process.env.SLICE_RUNNER_ENTRY ?? "/usr/local/slice/runner/main.js";
+    return new RunnerAdapter(journal, (hostId) => {
+      const host = workflows.getHost(hostId);
+      if (host === undefined) throw new Error(`Host ${hostId} is not registered`);
+      return new SshRunnerTransport({
+        address: host.address,
+        sshUser: host.sshUser,
+        runnerRoot: host.runnerRoot,
+        remoteEntryPath: remoteEntry,
+        knownHostsFile: join(stateDirectory, "known_hosts", hostId),
+        ...(process.env.SLICE_SSH_IDENTITY_FILE === undefined ? {} : { identityFilePath: process.env.SLICE_SSH_IDENTITY_FILE }),
+      });
+    });
+  }
+  throw new Error("SLICE_RUNNER_MODE must be local or ssh");
+}
+
 export async function startSlice(): Promise<void> {
   // Tighten every file this process creates, including the SQLite database and its write-ahead log.
   process.umask(0o077);
@@ -81,7 +117,7 @@ export async function startSlice(): Promise<void> {
       registry: createRegistry(),
     });
     const auth = new OwnerAuth(workflows, process.env);
-    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env));
+    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), buildRunner(workflows, state, stateDirectory));
     const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public") });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();

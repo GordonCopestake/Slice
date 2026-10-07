@@ -9,8 +9,17 @@ import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-d
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
 import { JobCoordinator, parseRequirementsOutput } from "../../apps/server/src/workflow/coordinator.js";
+import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 
 const PROFILE: BuildProfile = { setup: [], checks: [{ id: "test", command: "npm test" }] };
+
+/** A runner that always succeeds, so coordinator tests can watch the full requirements-to-workspace path. */
+const fakeRunner: RunnerGateway = {
+  prepareJob: async () => ({ baseCommit: "0123456789abcdef", repoPath: "/srv/slice/jobs/j/repo", worktreePath: "/srv/slice/jobs/j/author", reused: false }),
+  runCheck: async () => ({ status: "succeeded", exitCode: 0, outputTail: "" }),
+  cancelRunning: async () => {},
+  reconcile: async () => [],
+};
 
 const QUESTION_JSON = '{"kind":"question","questionId":"q1","question":"Which office allocates?","choices":["front","back"]}';
 const READY_JSON = '{"kind":"ready","summary":"Add an allocation screen.","criteria":[{"id":"c1","text":"Office staff can allocate items"}]}';
@@ -38,7 +47,7 @@ async function newHarness(): Promise<Harness> {
     models,
     registry: createRegistry(),
   });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" });
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner);
   return {
     coordinator,
     adapter,
@@ -75,10 +84,12 @@ test("a request that needs an answer waits for the user, then continues on the a
     h.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
     const answered = await h.coordinator.answerQuestion(job.jobId, questions[0]!.questionId, questions[0]!.revision, "front");
     assert.equal(answered.accepted, true);
-    assert.equal(answered.job.stage, "planning");
+    assert.equal(answered.job.stage, "implementation", "settled requirements prepare the workspace and run the checks");
     assert.equal(answered.job.runState, "running");
     const events = h.workflows.eventsAfter(job.jobId, 0);
-    assert.deepEqual(events.map((event) => event.type), ["job_created", "question_asked", "stage", "question_answered", "requirements_ready"]);
+    assert.deepEqual(events.map((event) => event.type), [
+      "job_created", "question_asked", "stage", "question_answered", "requirements_ready", "workspace_ready", "check_result", "stage",
+    ]);
   } finally { await h.close(); }
 });
 
