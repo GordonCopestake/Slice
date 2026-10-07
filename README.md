@@ -4,7 +4,7 @@ Slice is a small, self-hosted agent service. Its goal is to turn a plain-languag
 
 ## Current state
 
-Phase 0 is in progress. This repository has a compiled TypeScript service, a typed Pi Durable adapter, a single-owner SQLite store, durable request deduplication, and crash-recovery tests. The HTTP service currently exposes only `GET /healthz`. It does not yet accept change requests or connect to GitHub repositories, SSH runners, Telegram, or deployment systems.
+Phase 0 is complete: the independent review passed and the owner signed off the gate on 2026-10-07. This repository has a compiled TypeScript service, a typed Pi Durable adapter, a single-owner SQLite store, durable request deduplication, crash-recovery tests, a ChatGPT Plus/Pro model route with owner-only credential storage, and recorded live model checks. The HTTP service currently exposes only `GET /healthz`. It does not yet accept change requests or connect to GitHub repositories, SSH runners, Telegram, or deployment systems.
 
 See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), [Phase 0 results](docs/phase0-results.md), and the [Phase 0 security review](docs/phase0-security-review.md).
 
@@ -47,5 +47,15 @@ export OPENAI_API_KEY=your-key
 export SLICE_OPENAI_MODEL_ID=your-model-id
 npm run smoke:openai
 ```
+
+For a ChatGPT Plus/Pro subscription instead of API billing, sign in once with the device-code flow (tokens are stored owner-only in the state directory and never printed), then run the check:
+
+```sh
+npm run auth:openai
+export SLICE_PLUS_PRO=1   # optional: SLICE_PLUS_PRO_MODEL_ID, SLICE_PLUS_PRO_REASONING_EFFORT
+npm run smoke:pluspro
+```
+
+`smoke:pluspro` reports `not_tested` and exits non-zero when the profile is off or no credential is stored; it never reports a pass without a live call.
 
 Do not commit credentials. The tests in `npm run check` use only fake providers and fake external services.

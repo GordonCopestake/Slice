@@ -5,6 +5,7 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { createConfiguredModels } from "./adapters/models/configured-models.js";
 import { PiDurableAdapter } from "./adapters/pi-durable/pi-durable-adapter.js";
 import { ApplicationStateStore } from "./state/application-state.js";
+import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
@@ -59,7 +60,7 @@ export async function startSlice(): Promise<void> {
     adapter = await PiDurableAdapter.open({
       durableDatabasePath: databasePath,
       state,
-      models: createConfiguredModels(process.env),
+      models: createConfiguredModels(process.env, { credentials: new FileCredentialStore(stateDirectory) }),
       registry: createRegistry(),
     });
     server = createServer((request, response) => {

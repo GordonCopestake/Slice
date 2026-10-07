@@ -13,7 +13,9 @@
     "check": "npm run typecheck && npm test",
     "start": "node dist/apps/server/src/main.js",
     "smoke:local": "npm run build && node dist/apps/server/src/diagnostics/model-smoke.js local",
-    "smoke:openai": "npm run build && node dist/apps/server/src/diagnostics/model-smoke.js openai"
+    "smoke:openai": "npm run build && node dist/apps/server/src/diagnostics/model-smoke.js openai",
+    "smoke:pluspro": "npm run build && node dist/apps/server/src/diagnostics/plus-pro-smoke.js",
+    "auth:openai": "npm run build && node dist/apps/server/src/diagnostics/openai-login.js"
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.2",
