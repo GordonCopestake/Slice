@@ -324,7 +324,10 @@ function handleCleanup(journal: Journal, root: string, request: Extract<Request,
   const marker = jobMarker(jobDir);
   if (marker === undefined || marker.jobId !== request.jobId) return fail("manifest_mismatch");
   const running = journal.runningFor(request.jobId);
-  for (const row of running) resolveRunning(journal, row.operation_id);
+  for (const row of running) {
+    const resolved = resolveRunning(journal, row.operation_id);
+    if (resolved.status !== "running") journal.setStatus(row.operation_id, resolved.status as "succeeded" | "failed" | "uncertain", resolved.exitCode);
+  }
   // Deletion needs confirmed stop. 'uncertain' means the outcome is unknown, which is not confirmation;
   // the job stays cleanup-pending until reconciliation resolves every operation.
   if (journal.unsettledFor(request.jobId) > 0) return fail("processes_not_confirmed_stopped");

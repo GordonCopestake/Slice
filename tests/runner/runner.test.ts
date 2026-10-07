@@ -220,6 +220,8 @@ test("cleanup refuses while an operation is uncertain, even on a later attempt",
     assert.equal(refused.error, "processes_not_confirmed_stopped");
     const stillRefused = await f.call({ op: "cleanup_job", jobId: "job-9" });
     assert.equal(stillRefused.ok, false, "uncertainty keeps cleanup pending until reconciliation resolves it");
+    // Once the check finishes, its exit file settles the uncertainty and cleanup is allowed.
+    await waitUntil(async () => (await f.call({ op: "cleanup_job", jobId: "job-9" })).ok === true, 8_000);
   } finally { f.cleanup(); }
 });
 
