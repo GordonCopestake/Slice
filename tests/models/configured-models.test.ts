@@ -3,9 +3,15 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { once } from "node:events";
 import { AddressInfo } from "node:net";
 import { test } from "node:test";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   createConfiguredModels,
+  DEFAULT_PLUS_PRO_MODEL_ID,
   KEYLESS_PLACEHOLDER_API_KEY,
+  PLUS_PRO_PROVIDER,
+  plusProEnabled,
+  plusProModelId,
+  plusProReasoningEffort,
 } from "../../apps/server/src/adapters/models/configured-models.js";
 
 /** The pinned client calls the streaming completions API, so the fake endpoint answers with SSE chunks. */
@@ -143,4 +149,55 @@ test("local model configuration rejects unsafe values", () => {
     () => createConfiguredModels({ SLICE_LOCAL_BASE_URL: "http://127.0.0.1:1/v1", SLICE_LOCAL_MODEL_ID: "m", SLICE_LOCAL_OUTPUT_TOKENS: "900000", SLICE_LOCAL_CONTEXT_TOKENS: "1000" }),
     /must not exceed SLICE_LOCAL_CONTEXT_TOKENS/,
   );
+});
+
+test("the Plus/Pro profile is off unless the owner asks for it", () => {
+  assert.equal(plusProEnabled({}), false);
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO: "1" }), true);
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO: "true" }), true);
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO: "0" }), false);
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO: "false" }), false);
+  // Naming a Plus/Pro model is itself the request for the profile.
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO_MODEL_ID: DEFAULT_PLUS_PRO_MODEL_ID }), true);
+  // An explicit refusal wins over a stray model id.
+  assert.equal(plusProEnabled({ SLICE_PLUS_PRO: "0", SLICE_PLUS_PRO_MODEL_ID: DEFAULT_PLUS_PRO_MODEL_ID }), false);
+  assert.equal(plusProModelId({}), DEFAULT_PLUS_PRO_MODEL_ID);
+});
+
+test("Plus/Pro reasoning effort defaults to the model maximum and rejects unknown levels", () => {
+  assert.equal(plusProReasoningEffort({}), "max");
+  for (const level of ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+    assert.equal(plusProReasoningEffort({ SLICE_PLUS_PRO_REASONING_EFFORT: level }), level);
+  }
+  assert.throws(
+    () => plusProReasoningEffort({ SLICE_PLUS_PRO_REASONING_EFFORT: "unbounded" }),
+    /must be one of none, minimal, low, medium, high, xhigh, max/,
+  );
+});
+
+test("the Plus/Pro profile configures the pinned ChatGPT catalog only when a credential store is present", () => {
+  assert.throws(
+    () => createConfiguredModels({ SLICE_PLUS_PRO: "1" }),
+    /needs the state directory so the stored credential can be read/,
+  );
+  const models = createConfiguredModels(
+    { SLICE_PLUS_PRO: "1" },
+    { credentials: new InMemoryCredentialStore() },
+  );
+  const model = models.getModel(PLUS_PRO_PROVIDER, DEFAULT_PLUS_PRO_MODEL_ID);
+  assert.ok(model, "the default Plus/Pro model must exist in the pinned catalog");
+  assert.equal(model.api, "openai-codex-responses");
+  assert.throws(
+    () => createConfiguredModels(
+      { SLICE_PLUS_PRO: "1", SLICE_PLUS_PRO_MODEL_ID: "not-a-real-model" },
+      { credentials: new InMemoryCredentialStore() },
+    ),
+    /is not in the pinned Pi AI ChatGPT Plus\/Pro catalog/,
+  );
+  // Disabled profiles never touch the credential store or the catalog.
+  const withoutProfile = createConfiguredModels(
+    { SLICE_PLUS_PRO: "0" },
+    { credentials: new InMemoryCredentialStore() },
+  );
+  assert.equal(withoutProfile.getModel(PLUS_PRO_PROVIDER, DEFAULT_PLUS_PRO_MODEL_ID), undefined);
 });
