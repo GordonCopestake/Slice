@@ -2,11 +2,15 @@ import { createServer } from "node:http";
 import { lstatSync, mkdirSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { createRegistry } from "@earendil-works/pi-durable";
+import { SliceApi } from "./api/http-api.js";
+import { OwnerAuth } from "./auth/owner-auth.js";
 import { createConfiguredModels } from "./adapters/models/configured-models.js";
 import { PiDurableAdapter } from "./adapters/pi-durable/pi-durable-adapter.js";
+import { WorkflowStore } from "./records/workflow-store.js";
 import { ApplicationStateStore } from "./state/application-state.js";
 import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
+import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
 const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -43,6 +47,16 @@ function assertPrivateStateDirectory(directory: string): void {
   }
 }
 
+function requirementsProfile(environment: NodeJS.ProcessEnv): ModelProfile | null {
+  const provider = environment.SLICE_REQUIREMENTS_PROVIDER;
+  const modelId = environment.SLICE_REQUIREMENTS_MODEL_ID;
+  if ((provider === undefined) !== (modelId === undefined)) {
+    throw new Error("Set both SLICE_REQUIREMENTS_PROVIDER and SLICE_REQUIREMENTS_MODEL_ID, or neither");
+  }
+  if (provider === undefined || modelId === undefined) return null;
+  return { provider, modelId };
+}
+
 export async function startSlice(): Promise<void> {
   // Tighten every file this process creates, including the SQLite database and its write-ahead log.
   process.umask(0o077);
@@ -53,16 +67,26 @@ export async function startSlice(): Promise<void> {
   let state: ApplicationStateStore | undefined;
   let adapter: PiDurableAdapter | undefined;
   let server: ReturnType<typeof createServer> | undefined;
+  let workflows: WorkflowStore | undefined;
+  let retentionTimer: NodeJS.Timeout | undefined;
 
   try {
     const databasePath = join(stateDirectory, "state.sqlite");
     state = ApplicationStateStore.open(databasePath);
+    workflows = WorkflowStore.open(state.database);
     adapter = await PiDurableAdapter.open({
       durableDatabasePath: databasePath,
       state,
       models: createConfiguredModels(process.env, { credentials: new FileCredentialStore(stateDirectory) }),
       registry: createRegistry(),
     });
+    const auth = new OwnerAuth(workflows, process.env);
+    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env));
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public") });
+    // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
+    workflows.pruneExpired();
+    retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
+    retentionTimer.unref();
     server = createServer((request, response) => {
       const host = request.headers.host?.replace(/:\d+$/, "") ?? "";
       if (!ALLOWED_HOSTS.has(host)) {
@@ -70,13 +94,13 @@ export async function startSlice(): Promise<void> {
         response.end(JSON.stringify({ error: "unknown_host" }));
         return;
       }
-      if (request.method === "GET" && request.url === "/healthz") {
+      const pathname = (request.url ?? "/").split("?")[0] ?? "/";
+      if (request.method === "GET" && pathname === "/healthz") {
         response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-        response.end(JSON.stringify({ service: "slice", status: "ready" }));
+        response.end(JSON.stringify({ service: "slice", status: "ready", auth: auth.enabled ? "configured" : "not_configured" }));
         return;
       }
-      response.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      response.end(JSON.stringify({ error: "not_found" }));
+      void api.handle(request, response);
     });
     const port = configuredPort(process.env.SLICE_PORT);
     await new Promise<void>((resolveListen, rejectListen) => {
@@ -88,7 +112,7 @@ export async function startSlice(): Promise<void> {
     server.on("error", (error: Error) => {
       process.stderr.write(`Slice server error: ${error.message}\n`);
     });
-    process.stdout.write(`Slice Phase 0 service listening on 127.0.0.1:${port}\n`);
+    process.stdout.write(`Slice Phase 1 service listening on 127.0.0.1:${port}\n`);
 
     await new Promise<void>((resolveStop) => {
       const stop = (): void => resolveStop();
@@ -96,6 +120,7 @@ export async function startSlice(): Promise<void> {
       process.once("SIGTERM", stop);
     });
   } finally {
+    if (retentionTimer !== undefined) clearInterval(retentionTimer);
     await shutdown(server, adapter, state, lock);
   }
 }
