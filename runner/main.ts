@@ -165,12 +165,12 @@ function jobMarker(jobDir: string): { jobId: string; branch: string; baseCommit:
 function handlePrepare(journal: Journal, root: string, request: Extract<Request, { op: "prepare_job" }>): Response {
   assertId(request.jobId, "jobId");
   if (!BRANCH_PATTERN.test(request.branch)) return fail("invalid_branch");
-  const lease = journal.lease(request.jobId, request.leaseGeneration);
-  if (!lease.allowed) return fail(lease.reason ?? "lease_denied");
-
   const config = readConfig(root);
   if (!config.allowedSources.some((prefix) => request.source.startsWith(prefix))) return fail("source_not_allowed");
-  if (/[<>$`&|;(){}\\\n\r]/.test(request.source)) return fail("source_invalid");
+  // A leading dash would be read by git as an option, and metacharacters have no place in a source.
+  if (request.source.startsWith("-") || /[<>$`&|;(){}\\\n\r]/.test(request.source)) return fail("source_invalid");
+  const lease = journal.lease(request.jobId, request.leaseGeneration);
+  if (!lease.allowed) return fail(lease.reason ?? "lease_denied");
 
   const jobDir = join(root, request.jobId);
   const repoPath = join(jobDir, "repo");
@@ -254,16 +254,15 @@ function handleStatus(journal: Journal, request: Extract<Request, { op: "get_pro
   assertId(request.operationId, "operationId");
   const row = journal.get(request.operationId);
   if (row === undefined) return fail("operation_not_found");
+  const tailOf = (): string =>
+    existsSync(journal.outFile(request.operationId)) ? readFileSync(journal.outFile(request.operationId), "utf8").slice(-4_000) : "";
   if (row.status !== "running") {
-    return { ok: true, status: row.status, exitCode: row.exit_code ?? null };
+    return { ok: true, status: row.status, exitCode: row.exit_code ?? null, outputTail: tailOf() };
   }
   const resolved = resolveRunning(journal, request.operationId);
   if (resolved.status === "running") return { ok: true, status: "running", exitCode: null };
   journal.setStatus(request.operationId, resolved.status as "succeeded" | "failed" | "uncertain", resolved.exitCode);
-  const tail = existsSync(journal.outFile(request.operationId))
-    ? readFileSync(journal.outFile(request.operationId), "utf8").slice(-4_000)
-    : "";
-  return { ok: true, status: resolved.status, exitCode: resolved.exitCode ?? null, outputTail: tail };
+  return { ok: true, status: resolved.status, exitCode: resolved.exitCode ?? null, outputTail: tailOf() };
 }
 
 function handleCancel(journal: Journal, request: Extract<Request, { op: "cancel_process" }>): Response {
@@ -394,7 +393,18 @@ async function main(): Promise<void> {
   }
   const journal = new Journal(join(root, ".journal"));
   const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += (chunk as Buffer).length;
+    // A runner request is a small typed record; anything enormous is refused rather than buffered.
+    if (size > 1_048_576) {
+      process.stdout.write(`${JSON.stringify(fail("request_too_large"))}\n`);
+      process.exitCode = 2;
+      journal.close();
+      return;
+    }
+    chunks.push(chunk as Buffer);
+  }
   let request: Request;
   try {
     request = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Request;

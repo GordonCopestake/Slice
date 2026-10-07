@@ -64,6 +64,14 @@ export function parseRequirementsOutput(text: string): RequirementsOutput | null
 
 export type ModelProfile = { provider: string; modelId: string };
 
+/** A transition or command that conflicts with the job's current durable state. */
+export class JobStateConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JobStateConflictError";
+  }
+}
+
 export class JobCoordinator {
   readonly #adapter: PiDurableAdapter;
   readonly #workflows: WorkflowStore;
@@ -169,20 +177,23 @@ export class JobCoordinator {
       const host = this.#workflows.getHost(project.hostId);
       if (host === undefined) throw new Error(`project host ${project.hostId} is not registered`);
       let workspace = this.#workflows.getWorkspace(jobId);
+      // Git ref components may not begin with a dash, so the short title is trimmed of edge dashes.
+      const shortTitle = job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "change";
+      const branch = `slice/${jobId}/${shortTitle}`;
       if (workspace === undefined) {
         const prepared = await this.#runner.prepareJob({
           jobId,
           hostId: host.hostId,
           source: `https://github.com/${project.repoSlug}.git`,
-          branch: `slice/${jobId}/${job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "change"}`,
+          branch,
           leaseGeneration: 1,
         });
         workspace = this.#workflows.upsertWorkspace({
           jobId,
           hostId: host.hostId,
-          repoPath: prepared.repoPath || `/srv/slice/jobs/${jobId}/repo`,
-          worktreePath: prepared.worktreePath || `/srv/slice/jobs/${jobId}/author`,
-          branch: `slice/${jobId}/${job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "change"}`,
+          repoPath: prepared.repoPath || `${host.runnerRoot}/${jobId}/repo`,
+          worktreePath: prepared.worktreePath || `${host.runnerRoot}/${jobId}/author`,
+          branch,
           baseCommit: prepared.baseCommit,
           leaseGeneration: 1,
         });
@@ -210,7 +221,8 @@ export class JobCoordinator {
   async answerQuestion(jobId: string, questionId: string, revision: number, answer: string): Promise<{ job: JobRecord; accepted: boolean }> {
     const job = this.#workflows.getJob(jobId);
     if (job === undefined) throw new Error(`Job ${jobId} is not known`);
-    if (job.runState === "paused") {
+    if (job.runState === "paused" || job.runState === "blocked") {
+      // A paused or blocked job records nothing new from an answer; the owner resumes or unblocks first.
       return { job, accepted: false };
     }
     const answered = this.#workflows.answerQuestion(jobId, questionId, revision, answer);
@@ -222,8 +234,8 @@ export class JobCoordinator {
     const result = this.#workflows.recordSteering(jobId, { requestId, payloadHash, expectedCommandRevision, instruction });
     if (!result.recorded) return { job: result.job, recorded: false };
     const job = this.#workflows.getJob(jobId)!;
-    if (job.runState === "paused" || job.runState === "cancelled" || job.runState === "cancel_requested") {
-      // Recorded, but a paused or finished job does not resume or take new work from steering.
+    if (job.runState === "paused" || job.runState === "blocked" || job.runState === "cancelled" || job.runState === "cancel_requested") {
+      // Recorded, but a paused, blocked, or finished job does not resume or take new work from steering.
       return { job, recorded: true };
     }
     this.#workflows.staleOpenQuestions(jobId);
@@ -233,7 +245,7 @@ export class JobCoordinator {
 
   pause(jobId: string): JobRecord {
     let job = this.#workflows.setRunState(jobId, ["running", "waiting_user"], "pause_requested");
-    if (job === undefined) throw new Error(`Job ${jobId} cannot be paused from ${this.#workflows.getJob(jobId)?.runState ?? "unknown"}`);
+    if (job === undefined) throw new JobStateConflictError(`Job ${jobId} cannot be paused from ${this.#workflows.getJob(jobId)?.runState ?? "unknown"}`);
     this.#workflows.appendEvent(jobId, "pause_requested", {});
     // Phase 1 has no long-running local model work beyond the admitted submission; the admitted work
     // has already settled by the time this route returns, so the pause boundary is reached at once.
@@ -245,7 +257,7 @@ export class JobCoordinator {
   resume(jobId: string): JobRecord {
     const job = this.#workflows.getJob(jobId);
     if (job === undefined) throw new Error(`Job ${jobId} is not known`);
-    if (job.runState !== "paused") throw new Error(`Job ${jobId} is ${job.runState}, not paused`);
+    if (job.runState !== "paused") throw new JobStateConflictError(`Job ${jobId} is ${job.runState}, not paused`);
     const open = this.#workflows.openQuestions(jobId).length > 0;
     const resumed = this.#workflows.setRunState(jobId, ["paused"], open ? "waiting_user" : "running")!;
     this.#workflows.appendEvent(jobId, "resumed", { runState: resumed.runState });
@@ -254,7 +266,7 @@ export class JobCoordinator {
 
   async cancel(jobId: string): Promise<JobRecord> {
     let job = this.#workflows.setRunState(jobId, ["running", "waiting_user", "pause_requested", "paused", "blocked"], "cancel_requested");
-    if (job === undefined) throw new Error(`Job ${jobId} cannot be cancelled from ${this.#workflows.getJob(jobId)?.runState ?? "unknown"}`);
+    if (job === undefined) throw new JobStateConflictError(`Job ${jobId} cannot be cancelled from ${this.#workflows.getJob(jobId)?.runState ?? "unknown"}`);
     this.#workflows.appendEvent(jobId, "cancel_requested", {});
     // Remote work is signalled first so it stops while the durable conversation is aborted.
     const workspace = this.#workflows.getWorkspace(jobId);

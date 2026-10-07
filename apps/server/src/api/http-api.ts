@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { OwnerAuth } from "../auth/owner-auth.js";
 import { hashJson, IdempotencyConflictError, type JsonValue } from "../state/application-state.js";
 import type { IssueSnapshot, WorkflowStore } from "../records/workflow-store.js";
-import { JobCoordinator } from "../workflow/coordinator.js";
+import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
 import { listGithubIssues, type GithubIssue } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -77,6 +77,8 @@ class LoginGuard {
   }
 }
 
+class GithubReadError extends Error {}
+
 const WEB_FILES: Record<string, { file: string; type: string }> = {
   "/": { file: "index.html", type: "text/html; charset=utf-8" },
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
@@ -113,6 +115,14 @@ export class SliceApi {
         json(response, 409, { error: "idempotency_conflict", message: "This request ID was already used with different input" });
         return;
       }
+      if (error instanceof GithubReadError) {
+        json(response, 502, { error: "github_read_failed", message: error.message });
+        return;
+      }
+      if (error instanceof JobStateConflictError) {
+        json(response, 409, { error: "job_state_conflict", message: error.message });
+        return;
+      }
       const status = error instanceof SyntaxError || error instanceof TypeError || error instanceof RangeError ? 400 : 500;
       const message = error instanceof Error ? error.message : "internal error";
       // Never echo request bodies or secrets; type errors carry field names, not values.
@@ -128,6 +138,15 @@ export class SliceApi {
       response.end(body);
     } catch {
       json(response, 404, { error: "web_asset_missing" });
+    }
+  }
+
+  /** A GitHub read failure is a gateway problem, never an internal-error mystery and never a silent empty list. */
+  async #github<T>(read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      throw new GithubReadError(error instanceof Error ? error.message.slice(0, 120) : "unknown");
     }
   }
 
@@ -250,7 +269,7 @@ export class SliceApi {
         json(response, 404, { error: "project_not_found" });
         return;
       }
-      const issues = await listGithubIssues(project.repoSlug);
+      const issues = await this.#github(() => listGithubIssues(project.repoSlug));
       json(response, 200, { issues });
       return;
     }
@@ -266,6 +285,10 @@ export class SliceApi {
       const project = this.#deps.workflows.getProject(projectId);
       if (project === undefined) {
         json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (project.status !== "active") {
+        json(response, 409, { error: "project_not_active", message: `Project ${projectId} is ${project.status}; new work is stopped` });
         return;
       }
       const title = requiredString(body, "title", 200);
@@ -295,7 +318,7 @@ export class SliceApi {
         json(response, 200, { job: publicJob(existing), existing: true });
         return;
       }
-      const issues = await listGithubIssues(project.repoSlug);
+      const issues = await this.#github(() => listGithubIssues(project.repoSlug));
       const selected = issues.find((issue) => issue.number === issueNumber);
       if (selected === undefined) {
         json(response, 404, { error: "issue_not_found" });
@@ -312,7 +335,8 @@ export class SliceApi {
       };
       const requestText = `Start from GitHub issue #${selected.number}: ${selected.title}\n\n${selected.body}`;
       const payloadHash = hashJson({ projectId, issue: snapshot, request: requestText });
-      const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title: selected.title, requestText, issue: snapshot });
+      // A GitHub title is untrusted and can outgrow the job title limit; it is trimmed, not rejected.
+      const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title: selected.title.slice(0, 200) || `Issue #${selected.number}`, requestText, issue: snapshot });
       json(response, 201, { job: publicJob(job), existing: false });
       return;
     }
@@ -419,8 +443,12 @@ export class SliceApi {
     const closed = new Promise<void>((resolveClose) => {
       request.on("close", () => resolveClose());
     });
+    let closedFlag = false;
+    void closed.then(() => {
+      closedFlag = true;
+    });
     let lastPing = Date.now();
-    while (!response.writableEnded) {
+    while (!response.writableEnded && !closedFlag) {
       for (const event of this.#deps.workflows.eventsAfter(jobId, cursor)) {
         cursor = event.seq;
         send("event", event);
@@ -430,8 +458,9 @@ export class SliceApi {
         response.write(": ping\n\n");
       }
       await Promise.race([new Promise<void>((resolveTick) => setTimeout(resolveTick, 400)), closed]);
-      if (request.destroyed) break;
+      if (request.destroyed || closedFlag) break;
     }
+    response.end();
   }
 }
 

@@ -198,20 +198,46 @@ async function jobView(jobId) {
 
   for (const question of body.questions) {
     const answer = question.choices.length > 0 ? el("select", {}, ...question.choices.map((choice) => el("option", { value: choice }, choice))) : el("input", { placeholder: "Your answer" });
+    const answerError = el("p", { class: "error" });
     questions.append(el("div", { class: "card" },
       el("strong", {}, question.question),
       el("div", { class: "row" }, answer,
         el("button", { class: "primary", onclick: async () => {
-          await api(`/api/jobs/${jobId}/requirements/answers`, { method: "POST", body: JSON.stringify({ questionId: question.questionId, revision: question.revision, answer: answer.value }) });
-          await render();
+          try {
+            const result = await api(`/api/jobs/${jobId}/requirements/answers`, { method: "POST", body: JSON.stringify({ questionId: question.questionId, revision: question.revision, answer: answer.value }) });
+            if (result.status === 409) {
+              answerError.textContent = "That answer is stale — the question was already answered or superseded.";
+              return;
+            }
+            await render();
+          } catch (cause) {
+            answerError.textContent = String(cause.message);
+          }
         } }, "Answer")),
+      answerError,
     ));
   }
 
-  const actions = el("div", { class: "row" },
-    el("button", { onclick: async () => { await api(`/api/jobs/${jobId}/pause`, { method: "POST", body: "{}" }); await render(); } }, "Pause"),
-    el("button", { onclick: async () => { await api(`/api/jobs/${jobId}/resume`, { method: "POST", body: "{}" }); await render(); } }, "Resume"),
-    el("button", { onclick: async () => { await api(`/api/jobs/${jobId}/cancel`, { method: "POST", body: "{}" }); await render(); } }, "Cancel"),
+  const actionError = el("p", { class: "error" });
+  const act = async (path: string): Promise<void> => {
+    try {
+      const result = await api(`/api/jobs/${jobId}/${path}`, { method: "POST", body: "{}" });
+      if (result.status === 409) {
+        actionError.textContent = result.body.message ?? "That action conflicts with the job's current state.";
+        return;
+      }
+      await render();
+    } catch (cause) {
+      actionError.textContent = String(cause.message);
+    }
+  };
+  const actions = el("div", {},
+    el("div", { class: "row" },
+      el("button", { onclick: () => void act("pause") }, "Pause"),
+      el("button", { onclick: () => void act("resume") }, "Resume"),
+      el("button", { onclick: () => void act("cancel") }, "Cancel"),
+    ),
+    actionError,
   );
 
   const stream = new EventSource(`/api/jobs/${jobId}/events`, { withCredentials: true });
@@ -230,19 +256,24 @@ async function jobView(jobId) {
     el("div", { class: "card" }, el("h3", {}, job.title), status,
       job.issue ? el("p", { class: "muted" }, `from issue ${job.issue.repoSlug}#${job.issue.issueNumber} (${job.issue.url})`) : null),
     questions,
-    el("form", { class: "card", onsubmit: async (event) => {
-      event.preventDefault();
-      const result = await api(`/api/jobs/${jobId}/steer`, { method: "POST", body: JSON.stringify({
-        requestId: newRequestId(), instruction: instruction.value, expectedCommandRevision: job.commandRevision,
-      }) });
-      if (result.status === 409) {
-        el("p", { class: "error" }, "Stale command revision — the thread state is shown instead.");
-      }
-      await render();
-    } },
-      el("label", {}, "Steer this thread"),
-      instruction,
-      el("p", {}, el("button", { class: "primary", type: "submit" }, "Send instruction"))),
+    (() => {
+      const steerForm = el("form", { class: "card", onsubmit: async (event) => {
+        event.preventDefault();
+        const result = await api(`/api/jobs/${jobId}/steer`, { method: "POST", body: JSON.stringify({
+          requestId: newRequestId(), instruction: instruction.value, expectedCommandRevision: job.commandRevision,
+        }) });
+        if (result.status === 409) {
+          // A stale revision is refused without applying anything; show why and keep the current view.
+          steerForm.append(el("p", { class: "error" }, "Stale command revision — the thread state is shown instead; nothing was applied."));
+          return;
+        }
+        await render();
+      } },
+        el("label", {}, "Steer this thread"),
+        instruction,
+        el("p", {}, el("button", { class: "primary", type: "submit" }, "Send instruction")));
+      return steerForm;
+    })(),
     actions,
     el("div", { class: "card" }, el("h3", {}, "Thread activity"), events),
   );

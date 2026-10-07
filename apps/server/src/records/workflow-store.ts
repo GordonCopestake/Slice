@@ -556,7 +556,8 @@ export class WorkflowStore {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       this.#insertEvent(jobId, "question_asked", { questionId: question.questionId, question: question.question, choices: question.choices }, now);
-      this.#database.prepare("UPDATE slice_jobs SET run_state = 'waiting_user', updated_at = ? WHERE job_id = ?").run(now, jobId);
+      // Only a running job moves to waiting_user; a blocked job stays blocked with its reason intact.
+      this.#database.prepare("UPDATE slice_jobs SET run_state = 'waiting_user', updated_at = ? WHERE job_id = ? AND run_state = 'running'").run(now, jobId);
       this.#database.exec("COMMIT");
     } catch (error) {
       this.#database.exec("ROLLBACK");
@@ -820,6 +821,8 @@ export class WorkflowStore {
        WHERE updated_at < ? AND status IN ('succeeded', 'failed')
          AND rowid NOT IN (SELECT rowid FROM slice_runner_operations ORDER BY updated_at DESC LIMIT ?)`,
     ).run(cutoff, floorRows).changes;
+    // Expired sessions are dead weight the moment they pass their expiry.
+    this.#database.prepare("DELETE FROM slice_sessions WHERE expires_at < ?").run(Date.now());
     return { submissions: Number(submissions), operations: Number(operations) };
   }
 
