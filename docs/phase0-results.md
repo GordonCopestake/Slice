@@ -1,6 +1,8 @@
 # Phase 0 runtime results
 
-Status: **synthetic recovery checks pass; the local model check passed; the OpenAI cloud check is not tested**.
+Status: **synthetic recovery checks pass; the local model check passed; the cloud model check passed on the
+ChatGPT Plus/Pro subscription route** (`openai-codex`, `gpt-6-luna`, 2026-10-07). The plain OpenAI API-billing
+profile (`SLICE_OPENAI_MODEL_ID` with `OPENAI_API_KEY`) remains **not tested**; no API-billing credential was configured.
 
 ## Runtime and pinned packages
 
@@ -17,7 +19,7 @@ Direct dependencies are pinned exactly. `package-lock.json` pins the complete in
 
 ## Checks run
 
-`npm run check` passes on Node `v24.21.0`: typecheck, build, and all 33 Node tests. The earlier Node `v26.7.0` run passed all 23 tests that existed at that time.
+`npm run check` passes on Node `v26.7.0`: typecheck, build, and all 46 Node tests (2026-10-07). Earlier runs: Node `v24.21.0` with all 33 tests (2026-10-06), and Node `v26.7.0` with the 23 tests that existed at that time.
 
 The tests use the Pi AI faux provider, disposable SQLite files, and fake external systems. The process tests send `SIGKILL` to a real Node worker and then reopen its state.
 
@@ -49,12 +51,12 @@ These cover the task, document, event, compaction, and cancellation APIs named i
 
 ## Recovery measurement
 
-The exit check asks for a measurement rather than an assumption from persistence. The `SIGKILL` tests time the resume worker from spawn to its recovered result and fail if recovery exceeds 10 seconds. On Node `v26.7.0`, Linux x64, three consecutive runs:
+The exit check asks for a measurement rather than an assumption from persistence. The `SIGKILL` tests time the resume worker from spawn to its recovered result and fail if recovery exceeds 10 seconds. On Node `v26.7.0`, Linux x64, re-measured 2026-10-07 at commit `37bc291`, three consecutive runs:
 
 | Recovery path | Measured |
 | --- | --- |
-| Replay-safe tool after `SIGKILL` | 269-335 ms |
-| External operation reconciled after `SIGKILL` | 46-47 ms |
+| Replay-safe tool after `SIGKILL` | 308-333 ms |
+| External operation reconciled after `SIGKILL` | 52-58 ms |
 
 Both are dominated by Node process start-up, not by Slice state replay. These are synthetic local runs on one host; they are not a service-level objective for a deployed service.
 
@@ -68,13 +70,29 @@ Local model smoke test: **passed** on 2026-10-04.
 
 The endpoint requires an API key and answers `401` without one, so `SLICE_LOCAL_API_KEY` was set for the run. The key was passed in the process environment only and is not committed. The response was a streamed chat completion and the model returned the exact requested string.
 
-OpenAI smoke test: **not tested**. No approved cloud model profile and API credential were configured for this run.
+OpenAI cloud check: **passed** on 2026-10-07 on the ChatGPT Plus/Pro subscription route the owner selected.
+
+- Route: `npm run auth:openai` (device-code OAuth sign-in owned by the pinned `openai-codex` client), then
+  `npm run smoke:pluspro`.
+- Provider and model: `openai-codex` / `gpt-6-luna`, reasoning effort `max` (the profile default). Subscription
+  billing, not API billing; no `OPENAI_API_KEY` was used.
+- Result: `{"status":"passed","provider":"openai-codex","model":"gpt-6-luna","stopReason":"stop","reasoningEffort":"max"}`.
+- The OAuth tokens are stored by `FileCredentialStore` in `credentials.json` inside the state directory, created
+  `0600` and replaced by atomic rename. No token was printed, logged, or committed. The sign-in sends a stable
+  per-installation id from `installation-id` in the same directory.
+- The smoke test reports `not_tested` with a reason, and exits non-zero, when the profile is not enabled or no
+  credential is stored; it cannot report a pass without a live call.
+
+The API-billing OpenAI profile (`SLICE_OPENAI_MODEL_ID` with `OPENAI_API_KEY`) is **not tested**: no API-billing
+credential was configured for this run.
 
 Run the checks after configuring the service environment:
 
 ```sh
 npm run smoke:local
 npm run smoke:openai
+npm run auth:openai   # one interactive sign-in for the Plus/Pro route
+npm run smoke:pluspro
 ```
 
 Each command sends a short text prompt and reports the provider and model ID. These smoke tests do not prove tool-call, streaming, cancellation, structured-output, image, long-context, or privacy-policy compatibility. Those checks remain required before a profile can serve a production role.
@@ -101,11 +119,21 @@ Notes on the endpoint, for whoever selects a model:
 - The external operation journal's in-flight deduplication is per process, keyed by resolved database file. It stops two connections in one process from dispatching the same operation twice. It cannot deduplicate two OS processes; the single-owner lock is what prevents that.
 - SQLite WAL with `synchronous=NORMAL` supports process-crash recovery, but the newest commits can be lost after power or host failure. This is not a backup strategy.
 - Pi Durable replays a tool only when it is marked safe. Mark a tool safe only when replay cannot duplicate its effect. Other interrupted work needs a durable operation record and remote reconciliation. An unknown remote result remains blocked.
+- Credentials for the Plus/Pro route live in `credentials.json` in the state directory (`0600`, atomic rename
+  replacement, serialized per-provider writes in one process). There is no cross-process credential lock; the
+  single-owner lock is what keeps one service process per state directory. `npm run auth:openai` is the only
+  sign-in path and never reads or prints a token.
 - A local provider uses Pi AI's OpenAI-compatible completions API. Compatibility must be checked per endpoint; a successful text response is only a smoke test.
 - This phase has no authenticated user API, browser UI, GitHub or SSH connection, Telegram integration, repository worktree, PR workflow, release, or deployment support.
 
-## Outstanding for the phase gate
+## Phase gate: CLOSED
 
-- The OpenAI cloud smoke test is still **not tested**. It needs an approved cloud model profile and a credential, so the phase exit check cannot be signed off until it runs.
-- An independent security review returned **CHANGES REQUESTED** with two P2 findings open, including one that retracts this phase's at-most-once dispatch claim. The findings, the self-review rows they refute, and the ordered fix list are in [the Phase 0 security review](phase0-security-review.md). The author cannot close the reviewer's own findings.
-- The author implemented this work and cannot approve it.
+The independent review passed and the owner signed off the Phase 0 gate on 2026-10-07, covering the security-fix
+re-review and the Plus/Pro credential code added after the initial review (`FileCredentialStore`, `installationId`,
+the sign-in and smoke diagnostics, and the `SLICE_PLUS_PRO` profile). The findings, the self-review rows the initial
+review refuted, and the ordered fix list remain recorded in [the Phase 0 security review](phase0-security-review.md).
+
+The author implemented this work and did not approve it. Known gaps carried into Phase 1, so they are not mistaken
+for closed: no retention policy for the request index or the operation journal (deferred to Phase 1), power-loss
+durability unproven, and the pinned `@earendil-works` packages remain experimental — any upgrade requires rerunning
+the recovery suite and the provider checks.

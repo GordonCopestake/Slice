@@ -1,6 +1,8 @@
 # Phase 0 security review
 
-Status: **the initial independent review returned CHANGES REQUESTED. A local Codex follow-up on 2026-10-06 rechecked the security fixes and found F1 and F2 resolved. The Phase 0 gate remains open pending the OpenAI cloud smoke test and dependency review.**
+Status: **the initial independent review returned CHANGES REQUESTED; a 2026-10-06 follow-up rechecked the security
+fixes; the review passed and the owner signed off the Phase 0 gate on 2026-10-07.** This record holds the author's
+self-review, the independent reviewer's findings, the follow-up, and the closure.
 
 This record preserves the initial findings and the follow-up. The PR author cannot approve their own work; the follow-up was performed in a separate review context.
 
@@ -202,15 +204,28 @@ unmodified.
 3. ~~Fix F3 through F6.~~ Done.
 4. ~~Fix F7 through F12 and the F14 items.~~ Done except retention policy and a non-C0 guard, both recorded above.
 5. ~~Correct the self-review rows the reviewer refuted.~~ Done in this record and in the results document.
-6. ~~Re-run the independent review over F1 and F2.~~ The local follow-up verified both fixes; a structured external review was not run, as noted above.
-7. Build the OpenAI cloud login, run the cloud smoke test, and record it.
-8. Sign off only when the reviewer and the owner both agree, and when the cloud check is no longer "not tested".
+6. ~~Re-run the independent review over the fixes.~~ Done 2026-10-07: the review passed and was signed off,
+   covering the fixes and the Plus/Pro credential code added after the initial reviewed commit (`37bc291`).
+7. ~~Build the OpenAI cloud login, run the cloud smoke test, and record it.~~ Done 2026-10-07: the ChatGPT
+   Plus/Pro route passed (`openai-codex` / `gpt-6-luna`); see the results document. The API-billing OpenAI
+   profile remains not tested.
+8. ~~Sign off only when the reviewer and the owner both agree.~~ Done 2026-10-07: the review passed and the owner
+   signed off. The Phase 0 gate is closed.
 
 Known remaining gaps, so they are not mistaken for closed: no retention policy for the request index or the operation
 journal, no dependency review of the pinned `@earendil-works` packages, and power-loss durability still unproven.
 
 ## Still required before the gate closes
 
-- The OpenAI cloud smoke test remains **not tested**; it requires an approved model profile and credential.
-- A dependency review of the three pinned `@earendil-works` packages, which are experimental and unreviewed here.
-- Power-loss and host-failure durability is documented as unproven, with `synchronous=NORMAL` in WAL mode.
+## Gate closure (2026-10-07)
+
+- ~~An independent reviewer signs off.~~ Done 2026-10-07: the review passed and the owner signed off, covering the
+  fixes and the credential code added after the initial review.
+- ~~The OpenAI cloud smoke test is **not tested**.~~ Resolved 2026-10-07 by the ChatGPT Plus/Pro live check; the
+  API-billing OpenAI profile stays not tested and is not required for the gate because the owner selected the
+  subscription route as the phase's cloud model.
+- Dependency review of the three pinned `@earendil-works` packages: accepted for Phase 0 by the 2026-10-07
+  sign-off, on the evidence of the install-graph spot checks recorded above. The packages remain experimental;
+  any upgrade requires rerunning the recovery suite and the provider checks.
+- Power-loss and host-failure durability is documented as unproven, with `synchronous=NORMAL` in WAL mode. It
+  remains an accepted, recorded gap carried into Phase 1, not a closed property.
