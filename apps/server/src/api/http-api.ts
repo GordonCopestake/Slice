@@ -5,7 +5,7 @@ import { OwnerAuth } from "../auth/owner-auth.js";
 import { hashJson, IdempotencyConflictError, type JsonValue } from "../state/application-state.js";
 import type { IssueSnapshot, WorkflowStore } from "../records/workflow-store.js";
 import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
-import { listGithubIssues, type GithubIssue } from "../adapters/github/github-issues.js";
+import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
   auth: OwnerAuth;
@@ -432,6 +432,8 @@ export class SliceApi {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
+    // A stream that dies mid-write must not surface an unhandled socket error.
+    response.on("error", () => { /* the loop exits through the close handler */ });
     const send = (event: string, data: unknown): void => {
       response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
@@ -497,7 +499,7 @@ function issueFromBody(value: JsonValue | undefined, registeredRepoSlug: string)
   };
 }
 
-/** Strip anything the browser has no reason to see; the request text stays because the owner wrote it. */
+/** The browser-facing job shape: workflow state, never internal references or credentials. */
 function publicJob(job: { projectId: string; jobId: string; title: string; stage: string; runState: string; commandRevision: number; generation: number; requirementsRevision: number; profileRevision: number; issue: IssueSnapshot | null; reportsEnabled: boolean; reportIntervalMinutes: number; createdAt: number; updatedAt: number }): Record<string, unknown> {
   return {
     jobId: job.jobId,

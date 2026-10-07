@@ -51,10 +51,17 @@ async function render() {
     return;
   }
   $("#nav").hidden = false;
-  if (state.view === "jobs") main.append(await jobsView());
-  else if (state.view === "new") main.append(newJobView());
-  else if (state.view === "projects") main.append(await projectsView());
-  else if (state.view === "job") main.append(await jobView(state.jobId));
+  try {
+    if (state.view === "jobs") main.append(await jobsView());
+    else if (state.view === "new") main.append(newJobView());
+    else if (state.view === "projects") main.append(await projectsView());
+    else if (state.view === "job") main.append(await jobView(state.jobId));
+  } catch (cause) {
+    // A failed read (expired session, network) shows a reason and a way back, not a blank page.
+    main.append(el("div", { class: "card" },
+      el("p", { class: "error" }, `Could not load this view: ${String(cause.message)}`),
+      el("button", { onclick: async () => { await fetch("/api/session/end", { method: "POST", credentials: "same-origin", headers: { "x-csrf-token": state.csrf } }); state.csrf = null; await render(); } }, "Sign in again")));
+  }
 }
 
 function loginView() {
