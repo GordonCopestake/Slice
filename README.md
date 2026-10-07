@@ -4,7 +4,7 @@ Slice is a small, self-hosted agent service. Its goal is to turn a plain-languag
 
 ## Current state
 
-Phase 0 is complete and signed off (2026-10-07). Phase 1 is implemented and synthetically verified (81 tests): single-owner authentication, a project and host registry, jobs created from a request or a GitHub issue, the requirements question-and-answer exchange, a responsive state page with reconnecting event streams, pause/resume/cancel, steering with command revisions, and an SSH runner with a journal, supervised operations, and fenced leases. The Phase 1 live exit check (two demo repositories on a real runner, phone and desktop browsers) has not been run; see [Phase 1 results](docs/phase1-results.md). The service does not yet create branches or pull requests (Phase 2), and there is no Telegram integration.
+Phase 0 is complete and signed off (2026-10-07). Phase 1 is implemented and synthetically verified (82 tests): single-owner authentication, a project and host registry, jobs created from a request or a GitHub issue, the requirements question-and-answer exchange, a responsive state page with reconnecting event streams, pause/resume/cancel, steering with command revisions, and an SSH runner with a journal, supervised operations, and fenced leases. The Phase 1 live exit check (two demo repositories on a real runner, phone and desktop browsers) has not been run; see [Phase 1 results](docs/phase1-results.md). The service does not yet create branches or pull requests (Phase 2), and there is no Telegram integration.
 
 See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), [Phase 0 results](docs/phase0-results.md), and the [Phase 0 security review](docs/phase0-security-review.md).
 

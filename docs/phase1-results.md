@@ -1,6 +1,6 @@
 # Phase 1 results: responsive requests for registered projects
 
-Status: **synthetic checks pass (81 Node tests). The live exit check is not tested** — it needs two
+Status: **synthetic checks pass (82 Node tests). The live exit check is not tested** — it needs two
 disposable demo repositories, one Linux runner host, and a browser trial, none of which existed for
 this run. Synthetic and live results are kept separate below.
 
@@ -39,7 +39,7 @@ this run. Synthetic and live results are kept separate below.
 
 ## Checks run
 
-`npm run check` passes: typecheck, build, and all 81 Node tests. The runner tests execute the real
+`npm run check` passes: typecheck, build, and all 82 Node tests. The runner tests execute the real
 runner binary against a real git fixture repository. The API tests drive the real HTTP surface,
 including the SSE stream. Model work uses the Pi AI faux provider.
 
