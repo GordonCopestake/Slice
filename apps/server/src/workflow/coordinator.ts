@@ -113,8 +113,9 @@ export class JobCoordinator {
     const placement = this.#workflows.chooseHost(project);
     if ("reason" in placement) throw new Error(placement.detail);
     const host = placement.host;
-    // The probe needs a prepared workspace to run in; a throwaway probe job keeps real jobs untouched.
-    const probeJobId = `probe-${projectId}`;
+    // The probe needs a prepared workspace to run in; a throwaway probe workspace keeps real jobs
+    // untouched, and each verification gets its own so a cleaned workspace is never assumed to exist.
+    const probeJobId = this.#workflows.nextMaintenanceJobId("probe", projectId);
     let tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[];
     try {
       await this.#runner.prepareJob({
@@ -134,7 +135,8 @@ export class JobCoordinator {
       // The probe workspace is disposable; a failed cleanup is recorded by the runner's own state.
       try {
         await this.#runner.cleanupJob({ jobId: probeJobId, hostId: host.hostId });
-      } catch { /* probe workspaces are reclaimed by the runner's retention */ }
+        this.#workflows.releaseWorkspace(probeJobId);
+      } catch { /* probe workspaces are reclaimed by the recovery sweep */ }
     }
   }
 

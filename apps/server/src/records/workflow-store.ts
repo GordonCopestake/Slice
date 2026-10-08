@@ -465,20 +465,41 @@ export class WorkflowStore {
     return { ready: true };
   }
 
+  /** Worker workspaces Slice created for its own maintenance (rehearsals, toolchain probes). */
+  maintenanceWorkspaces(kind: "staging" | "probe"): WorkspaceRecord[] {
+    const rows = this.#database.prepare("SELECT * FROM slice_workspaces WHERE job_id LIKE ? AND released = 0 ORDER BY job_id").all(`${kind}-%`) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      jobId: String(row.job_id),
+      hostId: String(row.host_id),
+      repoPath: String(row.repo_path),
+      worktreePath: String(row.worktree_path),
+      branch: String(row.branch),
+      baseCommit: String(row.base_commit),
+      leaseGeneration: Number(row.lease_generation),
+      released: Number(row.released ?? 0) !== 0,
+      updatedAt: Number(row.updated_at),
+    }));
+  }
+
+  /**
+   * The next maintenance job id for a project. Each run needs its own workspace: reusing an id would
+   * collide with the journal's settled prepare row once the earlier workspace had been cleaned.
+   */
+  nextMaintenanceJobId(kind: "staging" | "probe", projectId: string): string {
+    assertId("projectId", projectId);
+    const prefix = `${kind}-${projectId}-`;
+    const rows = this.#database.prepare("SELECT job_id FROM slice_workspaces WHERE job_id LIKE ?").all(`${prefix}%`) as { job_id: string }[];
+    let highest = 0;
+    for (const row of rows) {
+      const match = /-a(\d+)$/.exec(row.job_id);
+      if (match?.[1] !== undefined) highest = Math.max(highest, Number(match[1]));
+    }
+    return `${prefix}a${highest + 1}`;
+  }
+
   /** Staging workspaces Slice created for rehearsals that have not been reclaimed yet. */
   stagingWorkspaces(): WorkspaceRecord[] {
-    return (this.#database.prepare("SELECT * FROM slice_workspaces WHERE job_id LIKE 'staging-%' AND released = 0 ORDER BY job_id").all() as Record<string, unknown>[])
-      .map((row) => ({
-        jobId: String(row.job_id),
-        hostId: String(row.host_id),
-        repoPath: String(row.repo_path),
-        worktreePath: String(row.worktree_path),
-        branch: String(row.branch),
-        baseCommit: String(row.base_commit),
-        leaseGeneration: Number(row.lease_generation),
-        released: Number(row.released ?? 0) !== 0,
-        updatedAt: Number(row.updated_at),
-      }));
+    return this.maintenanceWorkspaces("staging");
   }
 
   /** Jobs currently occupying a host. The job being placed is excluded: its own workspace must not

@@ -216,7 +216,7 @@ test("verifyToolchain records what the worker reported and cleans up its probe w
     assert.equal(result.tools[0]!.exitCode, 127);
     const project = workflows.getProject("gated")!;
     assert.equal(workflows.toolchainReady(project, "runner-a").ready, false);
-    assert.deepEqual(cleaned, ["probe-gated"], "the probe workspace is reclaimed");
+    assert.deepEqual(cleaned, ["probe-gated-a1"], "the probe workspace is reclaimed");
     await assert.rejects(() => coordinator.verifyToolchain("missing"), /project_not_found/);
   } finally {
     await adapter.close();

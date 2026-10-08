@@ -657,3 +657,24 @@ test("editing a project's probes invalidates its attestation instead of leaving 
     assert.equal(hostile.status, 400);
   } finally { await stack.close(); }
 });
+
+test("a second toolchain check re-prepares its own workspace instead of trusting a cleaned one", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    const first = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.passed, true);
+    // The first check cleaned its workspace away; the second must prepare a fresh one, not assume
+    // the earlier journal row still describes a live workspace.
+    const second = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(second.status, 200, second.body.message ?? "");
+    assert.equal(second.body.passed, true);
+  } finally { await stack.close(); }
+});

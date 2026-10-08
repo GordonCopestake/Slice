@@ -189,7 +189,9 @@ export class ReleaseService {
     } finally {
       try {
         await this.#deps.runner.cleanupJob({ jobId: stagingJobId, hostId: host.hostId });
-      } catch { /* staging workspaces are reclaimed on the next attempt */ }
+        // The slot is handed back only after the deletion is confirmed.
+        this.#deps.workflows.releaseWorkspace(stagingJobId);
+      } catch { /* staging workspaces are reclaimed by the recovery sweep */ }
     }
   }
 
@@ -213,30 +215,33 @@ export class ReleaseService {
     return artifactId;
   }
 
-  /** Projects with staging workspaces left behind by an outage or an interrupted rehearsal. */
+  /** Projects with maintenance workspaces (rehearsal or probe) left behind by an outage. */
   stagingProjects(): string[] {
     const projects = new Set<string>();
-    for (const workspace of this.#deps.workflows.stagingWorkspaces()) {
-      const projectId = this.#projectOfStaging(workspace.jobId);
+    for (const workspace of [...this.#deps.workflows.stagingWorkspaces(), ...this.#deps.workflows.maintenanceWorkspaces("probe")]) {
+      const projectId = this.#projectOfMaintenance(workspace.jobId);
       if (projectId !== null) projects.add(projectId);
     }
     return [...projects];
   }
 
-  #projectOfStaging(jobId: string): string | null {
-    if (!jobId.startsWith("staging-")) return null;
-    const stripped = jobId.slice("staging-".length).replace(/-a\d+$/, "");
-    return stripped.length > 0 ? stripped : null;
+  #projectOfMaintenance(jobId: string): string | null {
+    for (const kind of ["staging", "probe"] as const) {
+      if (!jobId.startsWith(`${kind}-`)) continue;
+      const stripped = jobId.slice(kind.length + 1).replace(/-a\d+$/, "");
+      if (stripped.length > 0) return stripped;
+    }
+    return null;
   }
 
   /**
-   * Retry cleanup for staging workspaces left behind by an outage. Staging work is Slice's own, so
+   * Retry cleanup for maintenance workspaces left behind by an outage. This work is Slice's own, so
    * reclaiming it is safe; the retained artifacts live outside the workspace.
    */
   async reclaimStaging(projectId: string): Promise<boolean> {
     let reclaimed = false;
-    for (const workspace of this.#deps.workflows.stagingWorkspaces()) {
-      if (this.#projectOfStaging(workspace.jobId) !== projectId) continue;
+    for (const workspace of [...this.#deps.workflows.stagingWorkspaces(), ...this.#deps.workflows.maintenanceWorkspaces("probe")]) {
+      if (this.#projectOfMaintenance(workspace.jobId) !== projectId) continue;
       try {
         await this.#deps.runner.cleanupJob({ jobId: workspace.jobId, hostId: workspace.hostId });
         this.#deps.workflows.releaseWorkspace(workspace.jobId);
