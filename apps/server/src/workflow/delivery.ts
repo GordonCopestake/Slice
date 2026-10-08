@@ -7,12 +7,14 @@ import type { BranchPublisher } from "../adapters/git/branch-publisher.js";
 import type { GitHost, StatusContext } from "../adapters/github/git-host.js";
 import type { DeliveryStore, FindingInput, ReviewRole } from "../records/delivery-store.js";
 import { verificationKey } from "../records/delivery-store.js";
+import { databaseSensitive, type ReleaseStore } from "../records/release-store.js";
 import type { DeliveryRecord } from "../records/delivery-store.js";
 import type { JobRecord, WorkflowStore } from "../records/workflow-store.js";
 import type { ExternalOperationJournal } from "./external-operation-journal.js";
 import type { PiDurableAdapter } from "../adapters/pi-durable/pi-durable-adapter.js";
 import { createRoleConversation, extractJsonObject, runRoleTurn } from "./role-conversation.js";
 import type { RoleProfiles } from "./role-config.js";
+import { modelPolicyViolation, type ModelPolicy } from "./model-policy.js";
 
 export const POLICY_VERSION = "slice-phase2-v1";
 export const MAX_ROUNDS = 4;
@@ -131,9 +133,11 @@ export type DeliveryDeps = {
   delivery: DeliveryStore;
   runner: RunnerGateway;
   gitHost: GitHost;
+  releases: ReleaseStore;
   publisher: BranchPublisher;
   journal: ExternalOperationJournal;
   profiles: RoleProfiles;
+  policy: ModelPolicy;
   artifactsDir: string;
   maxRounds?: number;
 };
@@ -169,6 +173,9 @@ export class DeliveryLoop {
       this.#deps.workflows.appendEvent(job.jobId, "late_input_refused", { reason: "the thread is archived" });
       return;
     }
+    // Every delivery role is checked against the project's model and privacy rules before any model
+    // sees the patch. A project that forbids cloud models is blocked, never quietly downgraded.
+    if (this.#modelPolicyViolation(job) !== null) return;
     const delivery = this.#deps.delivery.ensureDelivery(job.jobId, baseCommit);
     for (const result of baseline) {
       this.#deps.delivery.recordCheckResult({
@@ -212,6 +219,34 @@ export class DeliveryLoop {
   }
 
   /** Advance the state machine until the job quiesces (waiting, blocked, ready, or finished). */
+  /**
+   * Check the three delivery roles against the project's current model and privacy rules. Returns a
+   * stated reason, or null when every role is allowed. Rules are checked against the resolved
+   * profile, never against a prompt.
+   */
+  #modelPolicyViolation(job: JobRecord): string | null {
+    const project = this.#deps.workflows.getProject(job.projectId);
+    if (project === undefined) return null;
+    for (const [role, profile] of [
+      ["author", this.#deps.profiles.author],
+      ["code-review", this.#deps.profiles.codeReview],
+      ["security-review", this.#deps.profiles.securityReview],
+    ] as const) {
+      const violation = modelPolicyViolation(project, role, profile, this.#deps.policy);
+      if (violation !== null) {
+        this.#deps.workflows.appendEvent(job.jobId, "blocked", { reason: "model_policy", detail: violation });
+        this.#deps.workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked");
+        return violation;
+      }
+    }
+    return null;
+  }
+
+  /** Archived threads whose workspace deletion has not completed - the recovery sweep's input. */
+  unfinishedCleanups(): DeliveryRecord[] {
+    return this.#deps.delivery.listUnfinishedCleanups();
+  }
+
   async advance(jobId: string): Promise<void> {
     // Four repair rounds can each run author, checks, review, and gate; the cap must exceed a full
     // worst-case delivery so the loop never stops mid-work.
@@ -221,6 +256,9 @@ export class DeliveryLoop {
       if (job === undefined || delivery === undefined) return;
       if (delivery.archiveState === "archived" || delivery.stage === "ready") return;
       if (job.runState === "cancelled" || job.runState === "cancel_requested" || job.runState === "paused" || job.runState === "pause_requested" || job.runState === "waiting_user") return;
+      // Project model and privacy rules are re-checked on every step, so a rule changed after the
+      // workspace was prepared cannot let a later role conversation run.
+      if (this.#modelPolicyViolation(job) !== null) return;
       const before = `${delivery.stage}:${delivery.round}:${delivery.headCommit}`;
       switch (delivery.stage) {
         case "authoring": await this.#authorRound(job, delivery); break;
@@ -470,6 +508,30 @@ export class DeliveryLoop {
 
   // ----------------------------------------------------------------- gate
 
+  /** The file paths the authored patch touches, read from the recorded patch artifact. */
+  #changedFiles(jobId: string, delivery: { jobId: string; round: number; baseCommit: string; headCommit: string }): string[] {
+    const patch = this.#deps.delivery.getArtifact(jobId, `patch-r${delivery.round}`);
+    if (patch === undefined) return [];
+    let text: string;
+    try {
+      text = this.#readArtifact(jobId, patch.id);
+    } catch {
+      return [];
+    }
+    const files = new Set<string>();
+    for (const line of text.split("\n")) {
+      // A diff names each file twice on the header line (a/X b/Y) and once on each side marker.
+      const header = /^diff --git a\/(\S+) b\/(\S+)$/.exec(line);
+      if (header !== null) {
+        for (const value of [header[1], header[2]]) if (value !== undefined && value !== "/dev/null") files.add(value);
+        continue;
+      }
+      const side = /^[-+]{3} (\S+)$/.exec(line);
+      if (side?.[1] !== undefined && side[1] !== "/dev/null") files.add(side[1].replace(/^a\/|^b\//, ""));
+    }
+    return [...files];
+  }
+
   async #evaluateGate(job: JobRecord, delivery: { jobId: string; round: number; baseCommit: string; headCommit: string }): Promise<void> {
     const jobId = job.jobId;
     const project = this.#deps.workflows.getProject(job.projectId);
@@ -504,12 +566,36 @@ export class DeliveryLoop {
     const blocking = this.#deps.delivery.openBlockingFindings(jobId);
     if (blocking.length > 0) reasons.push(`${blocking.length} unresolved critical/high/medium finding(s)`);
 
+    // A change that touches database paths cannot claim easy rollback on assertion. The gate demands
+    // evidence: a passing rollback rehearsal that restored the release it would roll back to.
+    const dbSensitive = databaseSensitive(this.#changedFiles(jobId, delivery));
+    let rollback: { required: boolean; satisfied: boolean; paths: string[]; releaseId: string | null; rehearsalId: string | null };
+    if (dbSensitive.length === 0) {
+      rollback = { required: false, satisfied: true, paths: [], releaseId: null, rehearsalId: null };
+    } else {
+      const prior = this.#deps.releases.rollbackTarget(project.projectId);
+      // The most recent rehearsal of that release is the evidence, not the best one ever recorded:
+      // a later failure is real signal and must not be outranked by an older pass.
+      const latest = this.#deps.releases.listRehearsals(project.projectId).find((entry) => entry.releaseId === prior?.releaseId);
+      const rehearsal = latest !== undefined && latest.outcome === "passed" && latest.evidenceArtifactId !== null ? latest : undefined;
+      rollback = {
+        required: true,
+        satisfied: rehearsal !== undefined,
+        paths: dbSensitive.slice(0, 10),
+        releaseId: prior?.releaseId ?? null,
+        rehearsalId: rehearsal?.rehearsalId ?? null,
+      };
+      if (prior === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and there is no recorded release to roll back to, so rollback compatibility cannot be evidenced`);
+      else if (rehearsal === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and the latest rollback rehearsal for ${prior.releaseId} is ${latest?.outcome ?? "missing"}, not a pass`);
+    }
+
     const gateRecord = {
       key,
       policyVersion: POLICY_VERSION,
       round: delivery.round,
       checks,
       reviews,
+      rollbackCompatibility: rollback,
       openBlockingFindings: blocking.map((finding) => finding.id),
       reasons,
       evaluatedAt: Date.now(),
@@ -525,7 +611,8 @@ export class DeliveryLoop {
       return;
     }
     // A repair round is scheduled only for failures the author can act on, judged from the
-    // structured gate inputs, not from reason text. At the round limit the job blocks.
+    // structured gate inputs, not from reason text. Missing rollback evidence is an owner action, not
+    // something the author can write its way out of. At the round limit the job blocks.
     const fixable = delivery.round < this.#maxRounds
       && (blocking.length > 0 || reviews.some((review) => review.verdict !== "pass") || checks.some((check) => !check.passed));
     if (fixable) {
@@ -560,6 +647,9 @@ export class DeliveryLoop {
         await this.#deps.journal.run(`${jobId}:push:${head}`, { op: "push", jobId, head, remoteUrl, branch: workspace.branch }, {
           execute: async () => {
             const bundle = await this.#deps.runner.exportCommit({ jobId, hostId: workspace.hostId, commit: head });
+            // The bundle is retained as evidence, not just shipped: it is what a rollback rehearsal
+            // restores a release from after the workspace is long gone.
+            this.#writeBinaryArtifact(jobId, `bundle-${head.slice(0, 12)}`, "bundle", bundle, head);
             await this.#deps.publisher.publish({ jobId, bundle, remoteUrl, branch: workspace.branch, expectedCommit: head, expectedRemoteHead: currentRemote });
             return { pushed: head };
           },
@@ -705,6 +795,19 @@ export class DeliveryLoop {
       // The thread is history: the run state completes so pause/cancel/steer cannot act on it.
       this.#deps.workflows.setRunState(jobId, ["running", "waiting_user", "blocked"], "completed");
       this.#deps.workflows.appendEvent(jobId, "merge_observed", { prNumber: pr.number, mergedRevision: pr.mergedRevision });
+      // The merge is a release: recorded with the retained bundle that can restore it.
+      const bundle = this.#deps.delivery.listArtifacts(jobId).find((artifact) => artifact.kind === "bundle");
+      const release = this.#deps.releases.recordRelease({
+        projectId: job.projectId,
+        jobId,
+        commitSha: pr.mergedRevision,
+        branch: this.#deps.workflows.getWorkspace(jobId)?.branch ?? project.defaultBranch,
+        prNumber: pr.number,
+        hostId: this.#deps.workflows.getWorkspace(jobId)?.hostId ?? project.hostId,
+        artifactId: bundle?.id ?? null,
+        artifactDigest: bundle?.digest ?? null,
+      });
+      this.#deps.workflows.appendEvent(jobId, "release_recorded", { releaseId: release.releaseId, commitSha: release.commitSha, restorable: release.artifactId !== null });
       await this.#exportPacket(jobId);
       await this.#cleanup(jobId);
       return "merged";
@@ -857,6 +960,8 @@ export class DeliveryLoop {
       } catch { /* the runner's own stop check still guards deletion */ }
       await this.#deps.runner.cleanupJob({ jobId, hostId: workspace.hostId });
       this.#deps.delivery.setCleanupState(jobId, "cleaned");
+      // The host only becomes free for new work once deletion is confirmed.
+      this.#deps.workflows.releaseWorkspace(jobId);
       this.#deps.workflows.appendEvent(jobId, "workspace_cleaned", { hostId: workspace.hostId });
     } catch (error) {
       // An offline or refusing host leaves cleanup pending; the archived thread and evidence stay intact.

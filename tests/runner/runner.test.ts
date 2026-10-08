@@ -480,3 +480,37 @@ test("a preview that died is reconciled before a new phase plans a fresh operati
     assert.equal(stopped.ok, true);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("toolchain probes report what the host actually answered, and refuse unsafe commands", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-runner-toolchain-"));
+  const root = join(directory, "runner-root");
+  mkdirSync(root, { mode: 0o700 });
+  const source = makeSourceRepo(directory);
+  writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [source] }));
+  const transport = new LocalRunnerTransport(RUNNER_ENTRY, root);
+  const call = async (payload: Record<string, unknown>): Promise<Record<string, unknown>> => await transport.request(payload as JsonValue) as Record<string, unknown>;
+  try {
+    const prepared = await call({ op: "prepare_job", jobId: "job-40", source, branch: "slice/job-40/toolchain", leaseGeneration: 1 });
+    assert.equal(prepared.ok, true);
+
+    const probed = await call({ op: "probe_toolchain", jobId: "job-40", tools: [
+      { id: "node", command: "node --version" },
+      { id: "missing", command: "definitely-not-installed --version" },
+    ] });
+    assert.equal(probed.ok, true);
+    const tools = probed.tools as { id: string; exitCode: number | null; version: string | null }[];
+    assert.equal(tools.length, 2);
+    assert.equal(tools[0]!.exitCode, 0);
+    assert.match(String(tools[0]!.version), /^v\d+\./, "the real version is recorded");
+    assert.notEqual(tools[1]!.exitCode, 0, "a tool that is not there does not pass");
+    assert.equal(tools[1]!.version, null);
+    assert.equal(probed.allPassed, false, "one failing tool means the host is not verified");
+
+    // Shell metacharacters never reach the host, whatever the tool id claims.
+    const hostile = await call({ op: "probe_toolchain", jobId: "job-40", tools: [{ id: "evil", command: "node --version && calc.exe" }] });
+    assert.equal(hostile.ok, false);
+    assert.match(String(hostile.error), /command_not_allowed/);
+    const empty = await call({ op: "probe_toolchain", jobId: "job-40", tools: [] });
+    assert.equal(empty.ok, false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

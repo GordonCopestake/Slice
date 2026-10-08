@@ -49,6 +49,8 @@ type Request =
   | { op: "preview_status"; jobId: string }
   | { op: "capture_screenshot"; jobId: string; scenarioId: string; route: string; commit: string; width: number; height: number }
   | { op: "stop_preview"; jobId: string }
+  | { op: "probe_toolchain"; jobId: string; tools: { id: string; command: string }[] }
+  | { op: "restore_bundle"; jobId: string; operationId: string; leaseGeneration: number; bundleBase64: string; expectedCommit: string }
   | { op: "cleanup_job"; jobId: string };
 
 type Response =
@@ -644,6 +646,79 @@ function handleStopPreview(journal: Journal, root: string, request: Extract<Requ
   return { ok: true, status: "stopped" };
 }
 
+/**
+ * Restore a retained release bundle into this job's workspace. The bundle arrives from Slice's own
+ * artifact store, is fetched into the job's repository, and the worktree is reset to exactly the
+ * expected commit. Nothing is cloned from a caller-supplied URL and nothing is merged.
+ */
+function handleRestoreBundle(journal: Journal, root: string, request: Extract<Request, { op: "restore_bundle" }>): Response {
+  assertId(request.jobId, "jobId");
+  assertId(request.operationId, "operationId");
+  if (!COMMIT_PATTERN.test(request.expectedCommit)) return fail("commit_invalid");
+  const jobDir = join(root, request.jobId);
+  const marker = jobMarker(jobDir);
+  if (marker === undefined || marker.jobId !== request.jobId) return fail("manifest_mismatch");
+  const lease = journal.lease(request.jobId, request.leaseGeneration);
+  if (!lease.allowed) return fail(lease.reason ?? "lease_denied");
+  const bytes = Buffer.from(request.bundleBase64, "base64");
+  if (bytes.length === 0 || bytes.length > MAX_BUNDLE_BYTES) return fail("bundle_size_invalid");
+  // A bundle is written to a private path and verified before git ever reads it.
+  const bundlePath = join(jobDir, "restore", `${request.operationId.replace(/[^A-Za-z0-9._-]/g, "_")}.bundle`);
+  mkdirSync(join(jobDir, "restore"), { recursive: true, mode: 0o700 });
+  writeFileSync(bundlePath, bytes, { mode: 0o600 });
+  // bundle verify needs a repository to check the bundle's prerequisites against.
+  const verify = git(["-C", join(jobDir, "repo"), "bundle", "verify", bundlePath]);
+  if (!verify.ok) return fail(`bundle_verify_failed: ${verify.output}`);
+  const fetch = git(["-C", join(jobDir, "repo"), "fetch", "--no-tags", bundlePath, "refs/heads/*:refs/heads/*"]);
+  if (!fetch.ok) return fail(`bundle_fetch_failed: ${fetch.output}`);
+  const found = git(["-C", join(jobDir, "repo"), "cat-file", "-e", `${request.expectedCommit}^{commit}`]);
+  if (!found.ok) return fail("expected_commit_not_in_bundle");
+  const worktreePath = join(jobDir, "author");
+  const checkout = git(["-C", worktreePath, "checkout", "--force", request.expectedCommit]);
+  if (!checkout.ok) return fail(`restore_checkout_failed: ${checkout.output}`);
+  const reset = git(["-C", worktreePath, "reset", "--hard", request.expectedCommit]);
+  if (!reset.ok) return fail(`restore_reset_failed: ${reset.output}`);
+  const clean = git(["-C", worktreePath, "clean", "-fd"]);
+  if (!clean.ok) return fail(`restore_clean_failed: ${clean.output}`);
+  const head = git(["-C", worktreePath, "rev-parse", "HEAD"]);
+  if (!head.ok || head.output !== request.expectedCommit) return fail("restore_head_mismatch");
+  try {
+    rmSync(bundlePath, { force: true });
+  } catch { /* the bundle copy is disposable */ }
+  journal.setStatus(request.operationId, "succeeded", 0);
+  return { ok: true, head: head.output, clean: true };
+}
+
+/**
+ * Run the project's declared tool probes on this host and report what actually answered. The
+ * commands are plain argv from registered project configuration, validated by the same pattern as
+ * every other operation; nothing here comes from a model.
+ */
+function handleProbeToolchain(root: string, request: Extract<Request, { op: "probe_toolchain" }>): Response {
+  assertId(request.jobId, "jobId");
+  const marker = jobMarker(join(root, request.jobId));
+  if (marker === undefined || marker.jobId !== request.jobId) return fail("manifest_mismatch");
+  if (request.tools.length === 0 || request.tools.length > 16) return fail("tool_count_invalid");
+  const worktreePath = join(root, request.jobId, "author");
+  const results: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] = [];
+  for (const tool of request.tools) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(tool.id)) return fail("tool_id_invalid");
+    if (!COMMAND_PATTERN.test(tool.command)) return fail(`command_not_allowed: ${tool.id}`);
+    const [program, ...args] = tool.command.split(/\s+/);
+    const result = spawnSync(program ?? "", args, { cwd: worktreePath, encoding: "utf8", timeout: 30_000, env: { PATH: process.env.PATH ?? "" }, shell: false });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    const exitCode = typeof result.status === "number" ? result.status : null;
+    results.push({
+      id: tool.id,
+      command: tool.command,
+      exitCode,
+      version: exitCode === 0 ? (output.split(/\r?\n/)[0] ?? "").slice(0, 120) : null,
+      outputTail: output.slice(-500),
+    });
+  }
+  return { ok: true, tools: results, allPassed: results.every((tool) => tool.exitCode === 0 && tool.version !== null && tool.version.length > 0) };
+}
+
 function runSupervisor(argv: string[]): void {
   // --supervise <journalDir> <worktree> <operationId> <timeoutMs> <command...>
   const [journalDir, worktree, operationId, timeoutRaw, ...command] = argv;
@@ -778,6 +853,12 @@ async function main(): Promise<void> {
         break;
       case "stop_preview":
         response = handleStopPreview(journal, root, request);
+        break;
+      case "probe_toolchain":
+        response = handleProbeToolchain(root, request);
+        break;
+      case "restore_bundle":
+        response = handleRestoreBundle(journal, root, request);
         break;
       case "cleanup_job":
         response = handleCleanup(journal, root, request);

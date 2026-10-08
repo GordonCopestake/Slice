@@ -7,7 +7,7 @@ import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-work
 import { createRegistry } from "@earendil-works/pi-durable";
 import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-durable-adapter.js";
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
-import { WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
+import { toolchainDigest, WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
 import { JobCoordinator, parseRequirementsOutput } from "../../apps/server/src/workflow/coordinator.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner as buildFakeRunner } from "../support/fake-runner.js";
@@ -155,4 +155,72 @@ test("steering with a stale command revision is refused without applying the ins
     assert.equal(applied.job.requirementsRevision, 2, "steering starts a new requirements revision");
     assert.equal(h.workflows.getJob(job.jobId)?.commandRevision, 2);
   } finally { await h.close(); }
+});
+
+test("a project with a declared toolchain blocks until the worker is actually attested", async () => {
+  const h = await newHarness();
+  try {
+    h.workflows.createProject({
+      projectId: "gated", repoSlug: "owner/gated", defaultBranch: "main", hostId: "runner-a", buildProfile: PROFILE,
+      toolchain: [{ id: "node", command: "node --version" }],
+    });
+    h.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const job = await h.coordinator.createJob({ requestId: "req-1", payloadHash: "h1", projectId: "gated", title: "Gated", requestText: "Do it", issue: null });
+    assert.equal(job.runState, "blocked");
+    const events = h.workflows.eventsAfter(job.jobId, 0);
+    assert.ok(events.some((event) => event.type === "blocked" && JSON.stringify(event.payload).includes("toolchain_unverified")), "the job states why it is waiting");
+    assert.equal(h.workflows.getWorkspace(job.jobId), undefined, "no workspace is prepared on an unverified worker");
+
+    // Attesting the worker lets the same job proceed; nothing else about it changes.
+    const project = h.workflows.getProject("gated")!;
+    h.workflows.recordAttestation({ hostId: "runner-a", projectId: "gated", profileRevision: project.revision, toolchainDigest: toolchainDigest(project.toolchain), passed: true, tools: [
+      { id: "node", command: "node --version", exitCode: 0, version: "v22.19.0", outputTail: "" },
+    ] });
+    const resumed = await h.coordinator.retryBlocked(job.jobId);
+    assert.equal(resumed.stage, "implementation");
+    assert.notEqual(h.workflows.getWorkspace(job.jobId), undefined);
+  } finally { await h.close(); }
+});
+
+test("a project with no declared toolchain needs no attestation", async () => {
+  const h = await newHarness();
+  try {
+    h.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const job = await h.coordinator.createJob({ requestId: "req-1", payloadHash: "h1", projectId: "demo", title: "Plain", requestText: "Do it", issue: null });
+    assert.equal(job.stage, "implementation");
+  } finally { await h.close(); }
+});
+
+test("verifyToolchain records what the worker reported and cleans up its probe workspace", async () => {
+  const cleaned: string[] = [];
+  const directory = mkdtempSync(join(tmpdir(), "slice-coordinator-probe-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const workflows = WorkflowStore.open(state.database);
+  workflows.registerHost({ hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" });
+  workflows.createProject({
+    projectId: "gated", repoSlug: "owner/gated", defaultBranch: "main", hostId: "runner-a", buildProfile: PROFILE,
+    toolchain: [{ id: "node", command: "node --version" }],
+  });
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
+  const runner = buildFakeRunner({ probeToolchain: async (input) => ({
+    allPassed: false,
+    tools: input.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: 127, version: null, outputTail: "command not found" })),
+  }), cleanupJob: async (input) => { cleaned.push(input.jobId); } });
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, runner);
+  try {
+    const result = await coordinator.verifyToolchain("gated");
+    assert.equal(result.passed, false, "a worker that does not answer does not pass");
+    assert.equal(result.tools[0]!.exitCode, 127);
+    const project = workflows.getProject("gated")!;
+    assert.equal(workflows.toolchainReady(project, "runner-a").ready, false);
+    assert.deepEqual(cleaned, ["probe-gated-a1"], "the probe workspace is reclaimed");
+    await assert.rejects(() => coordinator.verifyToolchain("missing"), /project_not_found/);
+  } finally {
+    await adapter.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -37,7 +37,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore; runner?: RunnerGateway; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -46,7 +46,7 @@ async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?:
   models.setProvider(faux.provider);
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner());
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, options.runner ?? fakeRunner());
   const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }), ...(options.makeNotifications === undefined ? {} : { notifications: options.makeNotifications(workflows, state) }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
@@ -530,4 +530,186 @@ test("evidence artifacts download safely, expire honestly, and never resolve a U
     state.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("a project cannot be activated until its declared toolchain passes on a usable host", async () => {
+  const probed: string[] = [];
+  const stack = await startStack({ runner: fakeRunner({ probeToolchain: async (input) => {
+    probed.push(input.hostId);
+    return { allPassed: true, tools: input.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: 0, version: "v22.19.0", outputTail: "" })) };
+  } }) });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    const created = await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    assert.equal(created.status, 201);
+
+    // Before any probe has run, activation is refused with the reason, not a silent no.
+    const tooEarly = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "paused" } });
+    assert.equal(tooEarly.status, 200);
+    const blocked = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.body.error, "toolchain_unverified");
+
+    const check = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(check.status, 200);
+    assert.equal(check.body.passed, true);
+    assert.equal(check.body.hostId, "win-a");
+    assert.match(check.body.tools[0].version, /^v22/);
+    assert.deepEqual(probed, ["win-a"]);
+
+    const activated = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
+    assert.equal(activated.status, 200, "the attested project can be activated");
+
+    // Pausing and resuming is not a toolchain change; the evidence survives it.
+    const paused = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "paused" } });
+    assert.equal(paused.status, 200);
+    const reactivated = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
+    assert.equal(reactivated.status, 200, "a status change does not demand a fresh probe");
+  } finally { await stack.close(); }
+});
+
+test("a toolchain check that the host cannot answer is reported, not hidden", async () => {
+  const stack = await startStack({ runner: fakeRunner({ probeToolchain: async (input) => ({
+    allPassed: false,
+    tools: input.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: 127, version: null, outputTail: "command not found" })),
+  }) }) });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    const check = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(check.status, 200);
+    assert.equal(check.body.passed, false);
+    assert.equal(check.body.tools[0].exitCode, 127);
+    assert.equal(check.body.tools[0].version, null);
+    const activation = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
+    assert.equal(activation.status, 409);
+
+    const noToolchain = await stack.call("/api/projects/nope/toolchain-check", { method: "POST" });
+    assert.equal(noToolchain.status, 404);
+  } finally { await stack.close(); }
+});
+
+test("a blocked job retries after the owner fixes the environment", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "gated", repoSlug: "owner/gated", defaultBranch: "main", hostId: "runner-a",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const job = await stack.call("/api/jobs", { method: "POST", body: { requestId: "g1", projectId: "gated", title: "Gated", request: "Do it" } });
+    assert.equal(job.status, 201);
+    const jobId = job.body.job.jobId;
+    assert.equal((await stack.call(`/api/jobs/${jobId}`)).body.job.runState, "blocked");
+
+    // Retrying without fixing anything blocks again, with the same stated reason.
+    const again = await stack.call(`/api/jobs/${jobId}/retry`, { method: "POST" });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.job.runState, "blocked");
+
+    const resumeAttempt = await stack.call(`/api/jobs/${jobId}/resume`, { method: "POST" });
+    assert.equal(resumeAttempt.status, 409, "resume is for paused jobs, not blocked ones");
+
+    // The owner verifies the worker through the same route a real deployment uses, then retries.
+    const check = await stack.call("/api/projects/gated/toolchain-check", { method: "POST" });
+    assert.equal(check.status, 200);
+    assert.equal(check.body.passed, true);
+    const retried = await stack.call(`/api/jobs/${jobId}/retry`, { method: "POST" });
+    assert.equal(retried.status, 200);
+    assert.equal(retried.body.job.runState, "running");
+    assert.equal(retried.body.job.stage, "implementation");
+  } finally { await stack.close(); }
+});
+
+test("editing a project's probes invalidates its attestation instead of leaving a stale pass", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    assert.equal((await stack.call("/api/projects/win/toolchain-check", { method: "POST" })).body.passed, true);
+    assert.equal((await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } })).status, 200);
+
+    const edited = await stack.call("/api/projects/win/toolchain", { method: "POST", body: { toolchain: [{ id: "node", command: "node --version" }, { id: "git", command: "git --version" }] } });
+    assert.equal(edited.status, 200);
+    assert.equal(edited.body.attested.ready, false, "the new probe set is not attested");
+    assert.match(edited.body.attested.reason, /different set of probes/);
+
+    // A hostile edit is refused outright, not stored and not silently dropped.
+    const hostile = await stack.call("/api/projects/win/toolchain", { method: "POST", body: { toolchain: [{ id: "evil", command: "git --version && calc.exe" }] } });
+    assert.equal(hostile.status, 400);
+  } finally { await stack.close(); }
+});
+
+test("a second toolchain check re-prepares its own workspace instead of trusting a cleaned one", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    const first = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.passed, true);
+    // The first check cleaned its workspace away; the second must prepare a fresh one, not assume
+    // the earlier journal row still describes a live workspace.
+    const second = await stack.call("/api/projects/win/toolchain-check", { method: "POST" });
+    assert.equal(second.status, 200, second.body.message ?? "");
+    assert.equal(second.body.passed, true);
+  } finally { await stack.close(); }
+});
+
+test("host pools and host enablement are reachable through the API the web shell uses", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    for (const hostId of ["pool-a", "pool-b"]) {
+      const registered = await stack.call("/api/hosts", { method: "POST", body: { hostId, address: `${hostId}.internal`, os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+      assert.equal(registered.status, 201, JSON.stringify(registered.body));
+    }
+    assert.deepEqual((await stack.call("/api/host-pools")).body.pools, []);
+
+    const created = await stack.call("/api/host-pools", { method: "POST", body: { poolId: "primary", hosts: ["pool-a", "pool-b"] } });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.deepEqual(created.body.pool.hosts, ["pool-a", "pool-b"]);
+    assert.deepEqual((await stack.call("/api/host-pools")).body.pools.map((pool: { poolId: string }) => pool.poolId), ["primary"]);
+
+    // A pool may not name a host the owner never registered: placement would then claim a worker
+    // that does not exist.
+    const hostile = await stack.call("/api/host-pools", { method: "POST", body: { poolId: "ghosts", hosts: ["not-registered"] } });
+    assert.equal(hostile.status, 400, JSON.stringify(hostile.body));
+
+    const disabled = await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: false } });
+    assert.equal(disabled.status, 200, JSON.stringify(disabled.body));
+    assert.equal(disabled.body.host.enabled, false);
+    assert.equal((await stack.call("/api/hosts")).body.hosts.find((host: { hostId: string }) => host.hostId === "pool-a").enabled, false);
+
+    const reEnabled = await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: true } });
+    assert.equal(reEnabled.body.host.enabled, true);
+
+    const missing = await stack.call("/api/hosts/nope/enabled", { method: "POST", body: { enabled: false } });
+    assert.equal(missing.status, 404, "a typo must not look like a successful change");
+    assert.equal((await stack.call("/api/hosts/nope/enabled", { method: "POST", body: {} })).status, 404, "an unknown host is 404 whatever the body says");
+    assert.equal((await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: "no" } })).status, 400, "a known host rejects a non-boolean");
+  } finally { await stack.close(); }
 });

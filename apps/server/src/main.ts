@@ -12,6 +12,7 @@ import { RunnerAdapter } from "./adapters/ssh-runner/runner-adapter.js";
 import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/runner-transport.js";
 import { WorkflowStore } from "./records/workflow-store.js";
 import { DeliveryStore } from "./records/delivery-store.js";
+import { ReleaseStore } from "./records/release-store.js";
 import { StatusStore } from "./records/status-store.js";
 import { NotificationStore } from "./records/notification-store.js";
 import { NotificationService } from "./workflow/notifications.js";
@@ -21,12 +22,20 @@ import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
 import { ExternalOperationJournal } from "./workflow/external-operation-journal.js";
 import { DeliveryLoop } from "./workflow/delivery.js";
+import { ReleaseService } from "./workflow/releases.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
 import { StatusReports } from "./workflow/status-reports.js";
 import { roleProfiles } from "./workflow/role-config.js";
+import { modelPolicy } from "./workflow/model-policy.js";
 
-/** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
-const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+/**
+ * Only these Host header values are served, so a rebound DNS name cannot reach the listener. The
+ * default is loopback only; serving another interface (a tailnet address, for example) requires the
+ * owner to name both the bind address and the host values that may reach it.
+ */
+const DEFAULT_ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+// A Host header is either a plain hostname/IP or a bracketed IPv6 literal, exactly as a client sends it.
+const HOST_PATTERN = /^(?:[A-Za-z0-9._-]{1,253}|\[[0-9A-Fa-f:.]{1,45}\])$/;
 
 /** A shutdown must release the owner lock, so it never waits on a peer longer than this. */
 const SHUTDOWN_BUDGET_MS = 5_000;
@@ -35,6 +44,29 @@ function configuredPort(value: string | undefined): number {
   const port = Number(value ?? "3000");
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("SLICE_PORT must be between 1 and 65535");
   return port;
+}
+
+/**
+ * Where the listener binds. Loopback by default: an owner who wants the service reachable from
+ * another machine names the address explicitly, and the Host allowlist has to name it too.
+ */
+function configuredBindAddress(value: string | undefined): string {
+  const address = value ?? "127.0.0.1";
+  // Bind addresses are raw (no brackets): an IPv4 literal, or an IPv6 literal Node can listen on.
+  if (!/^(\d{1,3}\.){3}\d{1,3}$|^[0-9A-Fa-f:.]{1,45}$/.test(address)) throw new Error("SLICE_BIND_ADDRESS must be an IP address");
+  return address;
+}
+
+function configuredAllowedHosts(value: string | undefined): Set<string> {
+  const hosts = (value ?? DEFAULT_ALLOWED_HOSTS.join(","))
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (hosts.length === 0) throw new Error("SLICE_ALLOWED_HOSTS must name at least one host");
+  for (const host of hosts) {
+    if (!HOST_PATTERN.test(host)) throw new Error("SLICE_ALLOWED_HOSTS entries must be plain hostnames or IP literals");
+  }
+  return new Set(hosts);
 }
 
 function configuredStateDirectory(): string {
@@ -126,7 +158,9 @@ function buildDelivery(
     gitHost: new GithubClient({ token }),
     publisher: new GitBundlePublisher(stateDirectory),
     journal: new ExternalOperationJournal(state.database),
+    releases: ReleaseStore.open(state.database),
     profiles,
+    policy: modelPolicy(process.env),
     artifactsDir: join(stateDirectory, "artifacts"),
   });
 }
@@ -144,6 +178,7 @@ export async function startSlice(): Promise<void> {
   let workflows: WorkflowStore | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
   let mergePoller: NodeJS.Timeout | undefined;
+  let cleanupTimer: NodeJS.Timeout | undefined;
   let reportTimer: NodeJS.Timeout | undefined;
   let notifyTimer: NodeJS.Timeout | undefined;
 
@@ -160,21 +195,31 @@ export async function startSlice(): Promise<void> {
     const auth = new OwnerAuth(workflows, process.env);
     const runner = buildRunner(workflows, state, stateDirectory);
     const delivery = buildDelivery(adapter, workflows, state, stateDirectory, runner);
-    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery);
+    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery, modelPolicy(process.env));
     const statusStore = StatusStore.open(state.database);
     const notificationStore = NotificationStore.open(state.database);
     const telegramToken = process.env.SLICE_TELEGRAM_BOT_TOKEN;
     const telegramClient = telegramToken !== undefined && telegramToken.trim().length > 0 ? new TelegramClient({ token: telegramToken }) : null;
     const notifications = new NotificationService({ workflows, notifications: notificationStore, status: statusStore, telegram: telegramClient });
     const statusReports = new StatusReports({ workflows, deliveryStore: DeliveryStore.open(state.database), status: statusStore, notify: (jobId, kind, dueAt) => notifications.enqueueReport(jobId, dueAt) });
-    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports, notifications });
+    const releases = runner === null ? null : new ReleaseService({
+      workflows,
+      releases: ReleaseStore.open(state.database),
+      delivery: DeliveryStore.open(state.database),
+      runner,
+      artifactsDir: join(stateDirectory, "artifacts"),
+    });
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports, notifications, releases });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
     retentionTimer.unref();
+    const port = configuredPort(process.env.SLICE_PORT);
+    const bindAddress = configuredBindAddress(process.env.SLICE_BIND_ADDRESS);
+    const allowedHosts = configuredAllowedHosts(process.env.SLICE_ALLOWED_HOSTS);
     server = createServer((request, response) => {
       const host = request.headers.host?.replace(/:\d+$/, "") ?? "";
-      if (!ALLOWED_HOSTS.has(host)) {
+      if (!allowedHosts.has(host)) {
         response.writeHead(421, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         response.end(JSON.stringify({ error: "unknown_host" }));
         return;
@@ -187,17 +232,16 @@ export async function startSlice(): Promise<void> {
       }
       void api.handle(request, response);
     });
-    const port = configuredPort(process.env.SLICE_PORT);
     await new Promise<void>((resolveListen, rejectListen) => {
       server!.once("error", rejectListen);
-      server!.listen(port, "127.0.0.1", () => resolveListen());
+      server!.listen(port, bindAddress, () => resolveListen());
     });
     // Past this point a later server error must not disappear into a listener that already settled.
     server.removeAllListeners("error");
     server.on("error", (error: Error) => {
       process.stderr.write(`Slice server error: ${error.message}\n`);
     });
-    process.stdout.write(`Slice service listening on 127.0.0.1:${port}\n`);
+    process.stdout.write(`Slice service listening on ${bindAddress}:${port}\n`);
 
     // Restart recovery: resume delivery where the recorded stage left off, and re-check merges.
     if (delivery !== null) {
@@ -209,6 +253,15 @@ export async function startSlice(): Promise<void> {
         void pollMerges(delivery, activeWorkflows).catch(() => { /* the next tick retries */ });
       }, 60_000);
       mergePoller.unref();
+    }
+
+    // Cleanup recovery: an archived thread whose workspace deletion failed (offline host, refused
+    // deletion, uncertain operation) is retried on a schedule. Evidence is never touched by this sweep.
+    if (delivery !== null) {
+      cleanupTimer = setInterval(() => {
+        void retryFailedCleanups(delivery, releases).catch(() => { /* the next tick retries */ });
+      }, 300_000);
+      cleanupTimer.unref();
     }
 
     // Periodic status reports: overdue ticks coalesce into one current report per job.
@@ -240,6 +293,7 @@ export async function startSlice(): Promise<void> {
   } finally {
     if (retentionTimer !== undefined) clearInterval(retentionTimer);
     if (mergePoller !== undefined) clearInterval(mergePoller);
+    if (cleanupTimer !== undefined) clearInterval(cleanupTimer);
     if (reportTimer !== undefined) clearInterval(reportTimer);
     if (notifyTimer !== undefined) clearInterval(notifyTimer);
     await shutdown(server, adapter, state, lock);
@@ -264,6 +318,22 @@ async function resumeDelivery(delivery: DeliveryLoop, workflows: WorkflowStore):
 }
 
 /** Periodic reconciliation: check merges for ready jobs and nudge publishing jobs stuck on an outage. */
+/**
+ * Cleanup recovery across host outages. An archived thread whose deletion failed stays retryable:
+ * the sweep re-attempts it on the host the workspace is recorded against. Evidence, the release
+ * record, and the archived thread are never touched here - only the workspace.
+ */
+async function retryFailedCleanups(delivery: DeliveryLoop, releases: ReleaseService | null): Promise<void> {
+  for (const record of delivery.unfinishedCleanups()) {
+    await delivery.retryCleanup(record.jobId);
+  }
+  if (releases !== null) {
+    for (const project of releases.stagingProjects()) {
+      await releases.reclaimStaging(project);
+    }
+  }
+}
+
 async function pollMerges(delivery: DeliveryLoop, workflows: WorkflowStore): Promise<void> {
   for (const record of delivery.activeDeliveries()) {
     const job = workflows.getJob(record.jobId);

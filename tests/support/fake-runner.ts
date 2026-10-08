@@ -13,6 +13,11 @@ export function fakeRunner(overrides: Partial<RunnerGateway> = {}): RunnerGatewa
     previewStatus: async () => ({ status: "absent" }),
     captureScreenshot: async () => Buffer.from("fake-png"),
     stopPreview: async () => {},
+    probeToolchain: async (input) => ({
+      allPassed: true,
+      tools: input.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: 0, version: "probe-1.0.0", outputTail: "" })),
+    }),
+    restoreBundle: async (input) => ({ head: input.expectedCommit }),
     cleanupJob: async () => {},
     cancelRunning: async () => {},
     reconcile: async () => [],

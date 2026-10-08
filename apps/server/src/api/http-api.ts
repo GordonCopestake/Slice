@@ -11,6 +11,7 @@ import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.j
 import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
 import type { StatusReports } from "../workflow/status-reports.js";
 import type { NotificationService } from "../workflow/notifications.js";
+import type { ReleaseService } from "../workflow/releases.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -22,6 +23,7 @@ export type ApiDependencies = {
   delivery?: DeliveryLoop | null;
   status?: StatusReports | null;
   notifications?: NotificationService | null;
+  releases?: ReleaseService | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -54,6 +56,13 @@ function requiredString(body: Record<string, JsonValue>, name: string, maxLength
   const value = body[name];
   if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
     throw new TypeError(`${name} must be a string of 1-${maxLength} characters`);
+  }
+  return value;
+}
+
+function numberInRange(value: JsonValue, name: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < min || value > max) {
+    throw new TypeError(`${name} must be a whole number between ${min} and ${max}`);
   }
   return value;
 }
@@ -265,6 +274,36 @@ export class SliceApi {
       return;
     }
 
+    // A disabled host keeps the work it already holds and takes no new job, so the owner can take a
+    // worker out of rotation without cancelling anything in flight.
+    const hostEnabled = /^\/api\/hosts\/([A-Za-z0-9._-]{1,128})\/enabled$/.exec(path);
+    if (method === "POST" && hostEnabled !== null) {
+      if (this.#deps.workflows.getHost(hostEnabled[1]!) === undefined) {
+        json(response, 404, { error: "host_not_found" });
+        return;
+      }
+      const body = asObject(await readBody(request));
+      if (typeof body.enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+      this.#deps.workflows.setHostEnabled(hostEnabled[1]!, body.enabled);
+      json(response, 200, { host: this.#deps.workflows.getHost(hostEnabled[1]!) });
+      return;
+    }
+
+    if (method === "GET" && path === "/api/host-pools") {
+      json(response, 200, { pools: this.#deps.workflows.listPools() });
+      return;
+    }
+    if (method === "POST" && path === "/api/host-pools") {
+      const body = asObject(await readBody(request));
+      if (!Array.isArray(body.hosts)) throw new TypeError("hosts must be an array of registered host ids");
+      const pool = this.#deps.workflows.registerPool({
+        poolId: requiredId(body, "poolId"),
+        hosts: body.hosts.map((item) => { if (typeof item !== "string") throw new TypeError("hosts entries must be strings"); return item; }),
+      });
+      json(response, 201, { pool });
+      return;
+    }
+
     if (method === "GET" && path === "/api/projects") {
       json(response, 200, { projects: this.#deps.workflows.listProjects(false) });
       return;
@@ -279,6 +318,23 @@ export class SliceApi {
         repoSlug: requiredString(body, "repoSlug", 202),
         defaultBranch: requiredString(body, "defaultBranch", 100),
         hostId: requiredId(body, "hostId"),
+        ...(typeof body.poolId === "string" ? { poolId: body.poolId } : {}),
+        ...(body.requiredOs === "linux" || body.requiredOs === "windows" ? { requiredOs: body.requiredOs } : {}),
+        ...(body.modelRules === undefined || body.modelRules === null ? {} : (() => {
+          if (typeof body.modelRules !== "object" || Array.isArray(body.modelRules)) throw new TypeError("modelRules must be an object");
+          const rules = body.modelRules as Record<string, JsonValue>;
+          const list = (value: JsonValue | undefined, field: string): string[] => {
+            if (value === undefined || value === null) return [];
+            if (!Array.isArray(value)) throw new TypeError(`${field} must be an array of names`);
+            return value.map((item) => { if (typeof item !== "string") throw new TypeError(`${field} entries must be strings`); return item; });
+          };
+          return { modelRules: {
+            allowedProviders: list(rules.allowedProviders, "allowedProviders"),
+            allowedModelIds: list(rules.allowedModelIds, "allowedModelIds"),
+            allowCloud: rules.allowCloud === undefined ? true : rules.allowCloud === true,
+            localOnlyRoles: list(rules.localOnlyRoles, "localOnlyRoles"),
+          } };
+        })()),
         buildProfile: {
           setup: Array.isArray(profile.setup) ? profile.setup.map((item) => { if (typeof item !== "string") throw new TypeError("setup commands must be strings"); return item; }) : [],
           checks: Array.isArray(profile.checks)
@@ -289,6 +345,13 @@ export class SliceApi {
               })
             : [],
         },
+        ...(Array.isArray(body.toolchain)
+          ? { toolchain: body.toolchain.map((item) => {
+              if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("toolchain entries must be objects");
+              const tool = item as Record<string, unknown>;
+              return { id: String(tool.id ?? ""), command: String(tool.command ?? "") };
+            }) }
+          : {}),
         ...(typeof body.gitRemoteUrl === "string" ? { gitRemoteUrl: body.gitRemoteUrl } : {}),
         ...(body.preview === undefined || body.preview === null ? {} : (() => {
           if (typeof body.preview !== "object" || Array.isArray(body.preview)) throw new TypeError("preview must be an object");
@@ -307,11 +370,146 @@ export class SliceApi {
       return;
     }
 
+    const releaseRestore = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/releases\/([A-Za-z0-9._:-]{1,128})\/restore-staging$/.exec(path);
+    if (method === "POST" && releaseRestore !== null) {
+      if (this.#deps.releases === undefined || this.#deps.releases === null) {
+        json(response, 409, { error: "releases_not_configured", message: "Release rehearsal needs a configured runner" });
+        return;
+      }
+      type RestoreResult = Awaited<ReturnType<ReleaseService["restoreStaging"]>>;
+      let result: RestoreResult;
+      try {
+        result = await this.#deps.releases.restoreStaging(releaseRestore[1]!, releaseRestore[2]!);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 200) : "unknown";
+        if (reason === "rehearsal_in_progress") {
+          json(response, 409, { error: "rehearsal_in_progress", message: "A rehearsal for this project is already running on its worker" });
+          return;
+        }
+        json(response, reason === "project_not_found" || reason === "release_not_found" ? 404 : 502, { error: "rehearsal_failed", message: reason });
+        return;
+      }
+      json(response, 200, { rehearsal: result.rehearsal, release: result.release, checks: result.checks });
+      return;
+    }
+
+    const projectReleases = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/(releases|rollback-rehearsals)$/.exec(path);
+    if (method === "GET" && projectReleases !== null) {
+      const projectId = projectReleases[1]!;
+      if (this.#deps.workflows.getProject(projectId) === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (this.#deps.releases === undefined || this.#deps.releases === null) {
+        json(response, 200, { releases: [], rehearsals: [], configured: false });
+        return;
+      }
+      if (projectReleases[2] === "releases") {
+        const releases = this.#deps.releases.listReleases(projectId);
+        const restorable = new Set(this.#deps.releases.restorableReleases(projectId).map((release) => release.releaseId));
+        json(response, 200, { releases: releases.map((release) => ({ ...release, restorable: restorable.has(release.releaseId) })) });
+        return;
+      }
+      json(response, 200, { rehearsals: this.#deps.releases.listRehearsals(projectId) });
+      return;
+    }
+
+    const modelRulesEdit = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/model-rules$/.exec(path);
+    if (method === "POST" && modelRulesEdit !== null) {
+      const body = asObject(await readBody(request));
+      const project = this.#deps.workflows.getProject(modelRulesEdit[1]!);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (body.modelRules === null || typeof body.modelRules !== "object" || Array.isArray(body.modelRules)) throw new TypeError("modelRules must be an object");
+      const rules = body.modelRules as Record<string, JsonValue>;
+      const list = (value: JsonValue | undefined, field: string): string[] => {
+        if (value === undefined || value === null) return [];
+        if (!Array.isArray(value)) throw new TypeError(`${field} must be an array of names`);
+        return value.map((item) => { if (typeof item !== "string") throw new TypeError(`${field} entries must be strings`); return item; });
+      };
+      const updated = this.#deps.workflows.setProjectModelRules(modelRulesEdit[1]!, {
+        allowedProviders: list(rules.allowedProviders, "allowedProviders"),
+        allowedModelIds: list(rules.allowedModelIds, "allowedModelIds"),
+        allowCloud: rules.allowCloud === undefined ? true : rules.allowCloud === true,
+        localOnlyRoles: list(rules.localOnlyRoles, "localOnlyRoles"),
+      });
+      json(response, 200, { project: updated });
+      return;
+    }
+
+    const toolchainEdit = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/toolchain$/.exec(path);
+    if (method === "POST" && toolchainEdit !== null) {
+      const body = asObject(await readBody(request));
+      if (!Array.isArray(body.toolchain)) throw new TypeError("toolchain must be an array of { id, command } probes");
+      const project = this.#deps.workflows.getProject(toolchainEdit[1]!);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      const updated = this.#deps.workflows.setProjectToolchain(toolchainEdit[1]!, body.toolchain.map((item) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("toolchain entries must be objects");
+        const tool = item as Record<string, unknown>;
+        return { id: String(tool.id ?? ""), command: String(tool.command ?? "") };
+      }));
+      // The new probe set is not attested yet, and the response says so rather than leaving a stale
+      // green badge in the UI.
+      json(response, 200, { project: updated, attested: this.#deps.workflows.toolchainReady(updated, project.hostId) });
+      return;
+    }
+
+    const toolchainCheck = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/toolchain-check$/.exec(path);
+    if (method === "POST" && toolchainCheck !== null) {
+      const projectId = toolchainCheck[1]!;
+      const project = this.#deps.workflows.getProject(projectId);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (project.toolchain.length === 0) {
+        json(response, 409, { error: "no_toolchain_declared", message: "The project declares no toolchain to verify" });
+        return;
+      }
+      type ToolchainResult = { hostId: string; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] };
+      let result: ToolchainResult;
+      try {
+        result = await this.#deps.coordinator.verifyToolchain(projectId);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 300) : "unknown";
+        json(response, 502, { error: "toolchain_check_failed", message: reason });
+        return;
+      }
+      const attestation = this.#deps.workflows.getAttestation(result.hostId, projectId);
+      json(response, 200, {
+        hostId: result.hostId,
+        passed: result.passed,
+        tools: result.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: tool.exitCode, version: tool.version })),
+        attestedForRevision: attestation?.profileRevision ?? null,
+        projectRevision: project.revision,
+      });
+      return;
+    }
+
     const projectStatus = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/status$/.exec(path);
     if (method === "POST" && projectStatus !== null) {
       const body = asObject(await readBody(request));
       const status = body.status;
       if (status !== "active" && status !== "paused" && status !== "removed") throw new TypeError("status must be active, paused, or removed");
+      // A project whose worker toolchain is not attested cannot be activated.
+      if (status === "active") {
+        const candidate = this.#deps.workflows.getProject(projectStatus[1]!);
+        if (candidate !== undefined && candidate.toolchain.length > 0) {
+          const hosts = candidate.poolId === null
+            ? [candidate.hostId]
+            : this.#deps.workflows.getPool(candidate.poolId)?.hosts ?? [];
+          const ready = hosts.some((hostId) => this.#deps.workflows.toolchainReady(candidate, hostId).ready);
+          if (!ready) {
+            json(response, 409, { error: "toolchain_unverified", message: `No host for ${candidate.projectId} has passed its declared toolchain checks for the current profile revision` });
+            return;
+          }
+        }
+      }
       const project = this.#deps.workflows.setProjectStatus(projectStatus[1]!, status);
       if (project === undefined) {
         json(response, 404, { error: "project_not_found" });
@@ -507,6 +705,10 @@ export class SliceApi {
       }
       if (method === "POST" && rest === "/resume") {
         json(response, 200, { job: publicJob(this.#deps.coordinator.resume(jobId)) });
+        return;
+      }
+      if (method === "POST" && rest === "/retry") {
+        json(response, 200, { job: publicJob(await this.#deps.coordinator.retryBlocked(jobId)) });
         return;
       }
       if (method === "POST" && rest === "/cancel") {
