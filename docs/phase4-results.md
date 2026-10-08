@@ -108,6 +108,15 @@ Tests use faux models, a real git fixture, a real runner process, a real local p
 git host, and a fake Telegram transport. **Nothing in this phase has been run against a real Windows
 host, a real second Linux host, or a real staging environment.**
 
+## Owner decision: Windows is deferred
+
+The owner shelved Windows support. Nothing further will be built for it, and no Windows host will be
+provisioned for the exit check. What that leaves on `main` is stated plainly: the Windows-specific
+behaviour in this phase (drive-path worker roots, required toolchain declarations, per-host
+attestation, OS-aware placement) is **implemented and synthetically tested but has never run against
+a real Windows worker**. It is not a verified capability. A project that requires Windows stays
+disabled until an enforced sandbox and real toolchain probes pass on a real host.
+
 ## Limits and honest gaps
 
 - **No Windows runner has been executed.** The Windows path is validated at the registry, placement,
