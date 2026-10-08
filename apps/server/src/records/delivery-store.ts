@@ -473,7 +473,11 @@ export class DeliveryStore {
         input.scope.slice(0, 2_000), JSON.stringify(input.findings), now);
     const reviewId = Number(info.lastInsertRowid);
     for (const finding of input.findings) {
-      this.#upsertFinding(input.jobId, reviewId, input.role, finding, now);
+      // Finding IDs are model-supplied text; two roles could pick the same ID. Namespacing by role
+      // keeps a security finding from being swallowed by a code-review finding of the same name.
+      // A resolution re-uses the namespaced id shown in the review context, so it is not doubled.
+      const namespaced = finding.id.startsWith(`${input.role}:`) ? finding.id : `${input.role}:${finding.id}`;
+      this.#upsertFinding(input.jobId, reviewId, input.role, { ...finding, id: namespaced }, now);
     }
     return {
       id: reviewId,
@@ -504,7 +508,7 @@ export class DeliveryStore {
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(finding.id, jobId, reviewId, role, finding.severity, finding.category.slice(0, 200), finding.file.slice(0, 300),
           finding.claim.slice(0, 4_000), finding.impact.slice(0, 2_000), finding.correction.slice(0, 2_000), finding.verification.slice(0, 2_000),
-          finding.status === "open" ? "open" : "open", now, now);
+          "open", now, now);
       // A first report may also carry the reviewer's own resolution of an earlier finding.
       if (finding.status !== "open") {
         this.#database.prepare("UPDATE slice_findings SET status = ?, resolved_by = ?, updated_at = ? WHERE job_id = ? AND finding_id = ?")

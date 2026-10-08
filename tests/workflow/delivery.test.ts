@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createModels, fauxAssistantMessage, fauxProvider, type FauxResponseStep } from "@earendil-works/pi-ai";
 import { createRegistry } from "@earendil-works/pi-durable";
@@ -511,6 +512,28 @@ test("author and review contracts reject everything outside their shapes", () =>
   assert.equal(parseAuthorOutput('{"kind":"approve","summary":"x","patch":"diff --git a/x b/x"}'), null);
   assert.equal(parseReviewOutput('{"verdict":"approve","scope":"x","findings":[]}'), null, "unknown verdicts are rejected");
   assert.equal(parseReviewOutput('{"verdict":"pass","scope":"x","findings":[{"id":"f1","severity":"blocking","category":"c","file":"f","claim":"c","impact":"i","correction":"c","verification":"v","status":"open"}]}'), null, "unknown severities are rejected");
+});
+
+test("two roles reporting the same finding id keep both findings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "slice-store-"));
+  const database = new DatabaseSync(join(dir, "store.sqlite"));
+  try {
+    const store = DeliveryStore.open(database);
+    store.ensureDelivery("job-ns", "abc1234");
+    const base = { jobId: "job-ns", headCommit: "abc1234", requirementsRevision: 1, profileRevision: 1, repoSlug: "o/r", baseCommit: "abc1234", policyVersion: "p" };
+    const finding = (severity: "low" | "critical") => ({ id: "F1", severity, category: "c", file: "f", claim: "a", impact: "i", correction: "x", verification: "v", status: "open" as const });
+    store.recordReviewReport({ ...base, role: "code-review", verdict: "pass", provider: "p1", modelId: "m1", scope: "s", findings: [finding("low")] });
+    store.recordReviewReport({ ...base, role: "security-review", verdict: "changes_required", provider: "p2", modelId: "m2", scope: "s", findings: [finding("critical")] });
+    // A later report resolves using the namespaced id shown in its context; the id is not doubled.
+    store.recordReviewReport({ ...base, role: "code-review", verdict: "pass", provider: "p1", modelId: "m1", scope: "s", findings: [{ ...finding("low"), id: "code-review:F1", status: "verified_fixed" as const }] });
+    const findings = store.listFindings("job-ns");
+    assert.equal(findings.length, 2, "a name collision must not swallow the security finding");
+    assert.equal(findings.find((f) => f.id === "code-review:F1")?.status, "verified_fixed");
+    assert.equal(store.openBlockingFindings("job-ns").length, 1);
+  } finally {
+    database.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("role configuration refuses reviewers that are not distinct from the author", () => {
