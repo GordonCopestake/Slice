@@ -259,11 +259,13 @@ async function jobView(jobId) {
     if (["paused", "resumed", "cancelled", "requirements_ready", "question_asked", "question_answered", "blocked"].includes(event.type)) void render();
   });
 
+  const reports = await buildReportsPanel(jobId);
   const deliveryPanel = await buildDeliveryPanel(jobId);
 
   return el("section", {},
     el("div", { class: "card" }, el("h3", {}, job.title), status,
       job.issue ? el("p", { class: "muted" }, `from issue ${job.issue.repoSlug}#${job.issue.issueNumber} (${job.issue.url})`) : null),
+    reports,
     questions,
     deliveryPanel,
     (() => {
@@ -287,6 +289,73 @@ async function jobView(jobId) {
     actions,
     el("div", { class: "card" }, el("h3", {}, "Thread activity"), events),
   );
+}
+
+/**
+ * Status report panel: the latest durable report, its history, and the owner's interval settings.
+ * The content is built by deterministic code on the server; the browser only renders approved fields.
+ */
+async function buildReportsPanel(jobId) {
+  let result;
+  try {
+    result = await api(`/api/jobs/${jobId}/status-reports`);
+  } catch {
+    return null;
+  }
+  if (result.status !== 200 || !result.body.plan) return null;
+  const { plan, reports } = result.body;
+  const latest = reports[0];
+  const minutes = (seconds) => `${Math.max(0, Math.round(seconds / 60))} min`;
+
+  const settingsForm = el("form", { class: "row", onsubmit: async (event) => {
+    event.preventDefault();
+    const outcome = await api(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: JSON.stringify({
+      enabled: enabledCheck.checked, intervalMinutes: Number(intervalInput.value),
+    }) });
+    if (outcome.status === 400) {
+      settingsError.textContent = outcome.body.message ?? "Report intervals must be between 1 and 60 minutes.";
+      return;
+    }
+    await render();
+  } });
+  const enabledCheck = el("input", { type: "checkbox", checked: plan.enabled });
+  const intervalInput = el("input", { type: "number", min: "1", max: "60", value: String(plan.intervalMinutes) });
+  const settingsError = el("p", { class: "error" });
+  settingsForm.append(
+    el("label", { class: "row" }, enabledCheck, " periodic reports"),
+    el("label", {}, "interval (minutes)"), intervalInput,
+    el("button", { class: "primary", type: "submit" }, "Save"),
+    settingsError,
+  );
+
+  const card = el("div", { class: "card" },
+    el("h3", {}, "Status reports"),
+    el("div", { class: "row" },
+      badge(latest ? "available" : "pending"),
+      el("span", { class: "muted" }, plan.final ? "periodic reports finished" : plan.nextReportAt ? `next report ${new Date(plan.nextReportAt).toLocaleString()}` : "periodic reports off"));
+  if (latest !== undefined) {
+    const report = latest.report;
+    card.append(
+      el("p", {}, report.state ? `${report.state.runState} · ${report.state.stage}${report.state.round === null ? "" : ` · round ${report.state.round}`}` : ""),
+      report.completedSince && report.completedSince.length > 0
+        ? el("div", {}, el("strong", {}, "Since the last report:"), el("ul", {}, ...report.completedSince.map((line) => el("li", {}, line))))
+        : el("p", { class: "muted" }, "nothing completed since the previous report"),
+      el("p", {}, `In progress: ${report.inProgress ?? ""}`),
+      report.blockers && report.blockers.length > 0 ? el("ul", {}, ...report.blockers.map((line) => el("li", { class: "error" }, line))) : null,
+      report.time ? el("p", { class: "muted" }, `elapsed ${minutes(report.time.elapsedSeconds)} · active ${minutes(report.time.activeSeconds)} · last signal ${minutes(report.time.heartbeatAgeSeconds)} ago`) : null,
+      report.eta ? el("p", {}, report.eta.note ?? "") : null,
+      latest.final ? el("p", {}, "Final report — periodic reporting has stopped for this thread.") : null,
+    );
+  } else {
+    card.append(el("p", { class: "muted" }, "the first report is due at the scheduled time"));
+  }
+  card.append(settingsForm);
+  if (reports.length > 1) {
+    card.append(el("details", {},
+      el("summary", {}, `earlier reports (${reports.length - 1})`),
+      el("ul", { class: "events" }, ...reports.slice(1).map((entry) => el("li", {}, el("time", {}, new Date(entry.dueAt).toLocaleString()), entry.final ? " final report" : ` generation ${entry.generation}`))));
+  }
+  return card;
 }
 
 /**

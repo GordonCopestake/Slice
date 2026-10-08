@@ -12,12 +12,14 @@ import { RunnerAdapter } from "./adapters/ssh-runner/runner-adapter.js";
 import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/runner-transport.js";
 import { WorkflowStore } from "./records/workflow-store.js";
 import { DeliveryStore } from "./records/delivery-store.js";
+import { StatusStore } from "./records/status-store.js";
 import { ApplicationStateStore } from "./state/application-state.js";
 import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
 import { ExternalOperationJournal } from "./workflow/external-operation-journal.js";
 import { DeliveryLoop } from "./workflow/delivery.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
+import { StatusReports } from "./workflow/status-reports.js";
 import { roleProfiles } from "./workflow/role-config.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
@@ -139,6 +141,7 @@ export async function startSlice(): Promise<void> {
   let workflows: WorkflowStore | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
   let mergePoller: NodeJS.Timeout | undefined;
+  let reportTimer: NodeJS.Timeout | undefined;
 
   try {
     const databasePath = join(stateDirectory, "state.sqlite");
@@ -154,7 +157,8 @@ export async function startSlice(): Promise<void> {
     const runner = buildRunner(workflows, state, stateDirectory);
     const delivery = buildDelivery(adapter, workflows, state, stateDirectory, runner);
     const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery);
-    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery });
+    const statusReports = new StatusReports({ workflows, deliveryStore: DeliveryStore.open(state.database), status: StatusStore.open(state.database) });
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
@@ -198,6 +202,14 @@ export async function startSlice(): Promise<void> {
       mergePoller.unref();
     }
 
+    // Periodic status reports: overdue ticks coalesce into one current report per job.
+    reportTimer = setInterval(() => {
+      try {
+        statusReports.tick(Date.now());
+      } catch { /* the next tick retries */ }
+    }, 30_000);
+    reportTimer.unref();
+
     await new Promise<void>((resolveStop) => {
       const stop = (): void => resolveStop();
       process.once("SIGINT", stop);
@@ -206,6 +218,7 @@ export async function startSlice(): Promise<void> {
   } finally {
     if (retentionTimer !== undefined) clearInterval(retentionTimer);
     if (mergePoller !== undefined) clearInterval(mergePoller);
+    if (reportTimer !== undefined) clearInterval(reportTimer);
     await shutdown(server, adapter, state, lock);
   }
 }

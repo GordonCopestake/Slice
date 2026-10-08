@@ -8,6 +8,7 @@ import type { DeliveryStore } from "../records/delivery-store.js";
 import { verificationKey } from "../records/delivery-store.js";
 import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
 import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
+import type { StatusReports } from "../workflow/status-reports.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -17,6 +18,7 @@ export type ApiDependencies = {
   webDirectory: string;
   deliveryStore?: DeliveryStore;
   delivery?: DeliveryLoop | null;
+  status?: StatusReports | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -308,6 +310,7 @@ export class SliceApi {
       const issue = issueFromBody(body.issue, project.repoSlug);
       const payloadHash = hashJson({ projectId, title, request: requestText, issue: body.issue ?? null });
       const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title, requestText, issue });
+      this.#deps.status?.onJobCreated(job);
       json(response, 201, { job: publicJob(job) });
       return;
     }
@@ -348,6 +351,7 @@ export class SliceApi {
       const payloadHash = hashJson({ projectId, issue: snapshot, request: requestText });
       // A GitHub title is untrusted and can outgrow the job title limit; it is trimmed, not rejected.
       const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title: selected.title.slice(0, 200) || `Issue #${selected.number}`, requestText, issue: snapshot });
+      this.#deps.status?.onJobCreated(job);
       json(response, 201, { job: publicJob(job), existing: false });
       return;
     }
@@ -383,7 +387,10 @@ export class SliceApi {
         return;
       }
       if (method === "POST" && rest === "/cancel") {
-        json(response, 200, { job: publicJob(await this.#deps.coordinator.cancel(jobId)) });
+        const job = await this.#deps.coordinator.cancel(jobId);
+        // A cancelled job records one final status and stops its periodic reports.
+        this.#deps.status?.finalize(jobId, "the job was cancelled; no further periodic reports will be sent");
+        json(response, 200, { job: publicJob(job) });
         return;
       }
       if (method === "POST" && rest === "/steer") {
@@ -399,8 +406,46 @@ export class SliceApi {
         if (typeof expected !== "number" || !Number.isSafeInteger(expected)) throw new TypeError("expectedCommandRevision must be an integer");
         const payloadHash = hashJson({ jobId, instruction, expectedCommandRevision: expected });
         const result = await this.#deps.coordinator.steer(jobId, requestId, payloadHash, expected, instruction);
+        if (result.recorded) this.#deps.status?.onSteering(jobId);
         // A stale command revision returns the current state without applying the instruction.
         json(response, result.recorded ? 200 : 409, { job: publicJob(result.job), recorded: result.recorded });
+        return;
+      }
+      if (method === "GET" && rest === "/status-reports") {
+        if (this.#deps.status === undefined || this.#deps.status === null) {
+          json(response, 404, { error: "reports_not_configured" });
+          return;
+        }
+        const plan = this.#deps.workflows.getJob(jobId) === undefined ? undefined : this.#deps.status.planFor(jobId);
+        if (plan === undefined) {
+          json(response, 404, { error: "job_not_found" });
+          return;
+        }
+        json(response, 200, { plan, reports: this.#deps.status.reportsFor(jobId) });
+        return;
+      }
+      if (method === "POST" && rest === "/report-settings") {
+        if (this.#deps.status === undefined || this.#deps.status === null) {
+          json(response, 404, { error: "reports_not_configured" });
+          return;
+        }
+        const body = asObject(await readBody(request));
+        const enabled = body.enabled;
+        const intervalMinutes = body.intervalMinutes;
+        if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+        if (typeof intervalMinutes !== "number" || !Number.isSafeInteger(intervalMinutes)) throw new TypeError("intervalMinutes must be an integer");
+        if (intervalMinutes < 1 || intervalMinutes > 60) {
+          // Rejected without changing the saved interval, per the verification table.
+          json(response, 400, { error: "interval_out_of_range", message: "Report intervals must be between 1 and 60 minutes; the saved interval is unchanged" });
+          return;
+        }
+        const job = this.#deps.workflows.setReportSettings(jobId, enabled, intervalMinutes);
+        if (job === undefined) {
+          json(response, 404, { error: "job_not_found" });
+          return;
+        }
+        const plan = this.#deps.status.settingsChanged(jobId, enabled, intervalMinutes);
+        json(response, 200, { job: publicJob(job), plan });
         return;
       }
       if (method === "POST" && rest === "/requirements/answers") {

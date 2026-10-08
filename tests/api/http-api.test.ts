@@ -15,6 +15,8 @@ import { ApplicationStateStore } from "../../apps/server/src/state/application-s
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
+import { StatusReports } from "../../apps/server/src/workflow/status-reports.js";
+import { StatusStore } from "../../apps/server/src/records/status-store.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner } from "../support/fake-runner.js";
 
@@ -32,7 +34,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(options: { deliveryStore?: DeliveryStore } = {}): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -42,7 +44,7 @@ async function startStack(options: { deliveryStore?: DeliveryStore } = {}): Prom
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
   const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner());
-  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }) });
+  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -305,6 +307,45 @@ test("an issue maps to one job with its source link, and a second request shows 
     assert.equal(asPr.body.error, "issue_not_found");
   } finally {
     globalThis.fetch = originalFetch;
+    await stack.close();
+  }
+});
+
+test("status report settings and history are exposed through the API", async () => {
+  const stack = await startStack({ makeStatus: (workflows, state) => new StatusReports({ workflows, deliveryStore: null, status: StatusStore.open(state.database) }) });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(QUESTION_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "web-r1", projectId: "demo", title: "Reports", request: "Add reporting" } });
+    assert.equal(created.status, 201);
+    const jobId = created.body.job.jobId;
+
+    const initial = await stack.call(`/api/jobs/${jobId}/status-reports`);
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.plan.intervalMinutes, 10);
+    assert.deepEqual(initial.body.reports, [], "no report exists before the first tick");
+
+    // An interval outside 1-60 is rejected and the saved interval is unchanged.
+    const bad = await stack.call(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: { enabled: true, intervalMinutes: 90 } });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error, "interval_out_of_range");
+    const afterBad = await stack.call(`/api/jobs/${jobId}/status-reports`);
+    assert.equal(afterBad.body.plan.intervalMinutes, 10);
+
+    const updated = await stack.call(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: { enabled: true, intervalMinutes: 30 } });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.plan.intervalMinutes, 30);
+    assert.equal(updated.body.job.reportIntervalMinutes, 30, "the job view shows the same setting");
+    assert.equal(updated.body.plan.generation, 2, "a settings change starts a new generation");
+
+    const missing = await stack.call("/api/jobs/no-such-job/status-reports");
+    assert.equal(missing.status, 404);
+  } finally {
     await stack.close();
   }
 });
