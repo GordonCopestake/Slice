@@ -341,6 +341,8 @@ function handleReconcileApply(journal: Journal, root: string, request: Extract<R
   assertId(request.operationId, "operationId");
   const row = journal.get(request.operationId);
   if (row === undefined) return { ok: true, status: "not_started" };
+  // An operation belongs to exactly one job; another job's ID cannot resolve it.
+  if (row.job_id !== request.jobId) return fail("operation_not_for_job");
   if (row.status === "succeeded" || row.status === "failed") return { ok: true, status: row.status };
   const resolved = reconcileApplyChange(root, request.jobId, request.operationId);
   journal.setStatus(request.operationId, resolved.status, resolved.status === "succeeded" ? 0 : 1);

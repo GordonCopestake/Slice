@@ -596,16 +596,6 @@ export class DeliveryStore {
     return row === undefined ? undefined : { verificationKey: String(row.verification_key), acceptedAt: Number(row.accepted_at), stale: Number(row.stale) === 1 };
   }
 
-  /** Acceptance bound to a different verification key is stale, never silently reused. */
-  markAcceptanceStaleIfKeyDiffers(jobId: string, key: string): boolean {
-    assertId("jobId", jobId);
-    const acceptance = this.getAcceptance(jobId);
-    if (acceptance === undefined) return false;
-    if (acceptance.verificationKey === key) return false;
-    this.#database.prepare("UPDATE slice_acceptance SET stale = 1 WHERE job_id = ?").run(jobId);
-    return true;
-  }
-
   /** Steering or withdrawal makes the recorded acceptance stale immediately. */
   markAcceptanceStale(jobId: string): void {
     assertId("jobId", jobId);

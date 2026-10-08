@@ -360,6 +360,11 @@ test("reconcile settles an interrupted apply by the marker commit, and a failed 
     // The same operation ID may now be re-planned, because its failure is recorded.
     const retried = await f.call({ op: "apply_change", jobId: "job-11", operationId: "job-11:commit:r1", leaseGeneration: 1, patch: NEW_FILE_PATCH, commitMessage: "retry", expectedParent: String(prepared.baseCommit) });
     assert.equal(retried.ok, true);
+
+    // Another job cannot resolve this job's operation.
+    const foreign = await f.call({ op: "reconcile_apply", jobId: "job-other", operationId: "job-11:commit:r1" });
+    assert.equal(foreign.ok, false);
+    assert.equal(foreign.error, "operation_not_for_job");
   } finally { f.cleanup(); }
 });
 

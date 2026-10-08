@@ -163,6 +163,12 @@ export class DeliveryLoop {
 
   /** Workspace prepared: start delivery and record the baseline check evidence. */
   async onWorkspaceReady(job: JobRecord, baseCommit: string, baseline: { checkId: string; status: "succeeded" | "failed" | "uncertain"; exitCode: number | null; outputTail: string; command: string; environment: string }[]): Promise<void> {
+    const existing = this.#deps.delivery.getDelivery(job.jobId);
+    if (existing !== undefined && existing.archiveState === "archived") {
+      // Defense in depth: an archived thread is history; late input must not revive its branch.
+      this.#deps.workflows.appendEvent(job.jobId, "late_input_refused", { reason: "the thread is archived" });
+      return;
+    }
     const delivery = this.#deps.delivery.ensureDelivery(job.jobId, baseCommit);
     for (const result of baseline) {
       this.#deps.delivery.recordCheckResult({
@@ -205,7 +211,9 @@ export class DeliveryLoop {
 
   /** Advance the state machine until the job quiesces (waiting, blocked, ready, or finished). */
   async advance(jobId: string): Promise<void> {
-    for (let step = 0; step < 12; step += 1) {
+    // Four repair rounds can each run author, checks, review, and gate; the cap must exceed a full
+    // worst-case delivery so the loop never stops mid-work.
+    for (let step = 0; step < 24; step += 1) {
       const job = this.#deps.workflows.getJob(jobId);
       const delivery = this.#deps.delivery.getDelivery(jobId);
       if (job === undefined || delivery === undefined) return;
@@ -493,9 +501,6 @@ export class DeliveryLoop {
     });
     const blocking = this.#deps.delivery.openBlockingFindings(jobId);
     if (blocking.length > 0) reasons.push(`${blocking.length} unresolved critical/high/medium finding(s)`);
-    // A requirements change since the reviewed revision invalidates the evidence under this key.
-    const keyMatchesHead = delivery.headCommit.length > 0;
-    if (!keyMatchesHead) reasons.push("no head commit is recorded");
 
     const gateRecord = {
       key,
@@ -689,6 +694,8 @@ export class DeliveryLoop {
         return "unknown";
       }
       this.#deps.delivery.recordMerge(jobId, pr.mergedRevision, "verified merge observed from the git host");
+      // The thread is history: the run state completes so pause/cancel/steer cannot act on it.
+      this.#deps.workflows.setRunState(jobId, ["running", "waiting_user", "blocked"], "completed");
       this.#deps.workflows.appendEvent(jobId, "merge_observed", { prNumber: pr.number, mergedRevision: pr.mergedRevision });
       await this.#exportPacket(jobId);
       await this.#cleanup(jobId);

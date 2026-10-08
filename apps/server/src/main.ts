@@ -227,13 +227,16 @@ async function resumeDelivery(delivery: DeliveryLoop, workflows: WorkflowStore):
   }
 }
 
-/** Periodic merge reconciliation for jobs waiting on the owner. */
+/** Periodic reconciliation: check merges for ready jobs and nudge publishing jobs stuck on an outage. */
 async function pollMerges(delivery: DeliveryLoop, workflows: WorkflowStore): Promise<void> {
   for (const record of delivery.activeDeliveries()) {
-    if (record.stage !== "ready" || record.prNumber === null) continue;
     const job = workflows.getJob(record.jobId);
     if (job === undefined || job.runState === "cancelled") continue;
-    await delivery.observeMerge(record.jobId);
+    if (record.stage === "ready" && record.prNumber !== null) {
+      await delivery.observeMerge(record.jobId);
+      continue;
+    }
+    if (record.stage === "publishing" && job.runState === "running") await delivery.advance(record.jobId);
   }
 }
 

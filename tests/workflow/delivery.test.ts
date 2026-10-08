@@ -408,6 +408,7 @@ test("a verified merge archives the job, cleans only its workspace, and keeps ev
     assert.equal(delivery.archiveState, "archived");
     assert.equal(delivery.mergedRevision, mergedRevision);
     assert.equal(delivery.cleanupState, "cleaned");
+    assert.equal(h.workflows.getJob(jobId)!.runState, "completed", "a merged thread is finished, not waiting");
     assert.equal(existsSync(join(h.runnerRoot, jobId)), false, "the job workspace is gone");
     assert.equal(existsSync(join(h.runnerRoot, "job-other")), false);
 
