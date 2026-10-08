@@ -58,6 +58,13 @@ function requiredString(body: Record<string, JsonValue>, name: string, maxLength
   return value;
 }
 
+function numberInRange(value: JsonValue, name: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < min || value > max) {
+    throw new TypeError(`${name} must be a whole number between ${min} and ${max}`);
+  }
+  return value;
+}
+
 function requiredId(body: Record<string, JsonValue>, name: string): string {
   const value = requiredString(body, name, 128);
   if (!ID_PATTERN.test(value)) throw new TypeError(`${name} must be 1-128 letters, numbers, dots, underscores, colons, or hyphens`);
@@ -279,6 +286,23 @@ export class SliceApi {
         repoSlug: requiredString(body, "repoSlug", 202),
         defaultBranch: requiredString(body, "defaultBranch", 100),
         hostId: requiredId(body, "hostId"),
+        ...(typeof body.poolId === "string" ? { poolId: body.poolId } : {}),
+        ...(body.requiredOs === "linux" || body.requiredOs === "windows" ? { requiredOs: body.requiredOs } : {}),
+        ...(body.modelRules === undefined || body.modelRules === null ? {} : (() => {
+          if (typeof body.modelRules !== "object" || Array.isArray(body.modelRules)) throw new TypeError("modelRules must be an object");
+          const rules = body.modelRules as Record<string, JsonValue>;
+          const list = (value: JsonValue | undefined, field: string): string[] => {
+            if (value === undefined || value === null) return [];
+            if (!Array.isArray(value)) throw new TypeError(`${field} must be an array of names`);
+            return value.map((item) => { if (typeof item !== "string") throw new TypeError(`${field} entries must be strings`); return item; });
+          };
+          return { modelRules: {
+            allowedProviders: list(rules.allowedProviders, "allowedProviders"),
+            allowedModelIds: list(rules.allowedModelIds, "allowedModelIds"),
+            allowCloud: rules.allowCloud === undefined ? true : rules.allowCloud === true,
+            localOnlyRoles: list(rules.localOnlyRoles, "localOnlyRoles"),
+          } };
+        })()),
         buildProfile: {
           setup: Array.isArray(profile.setup) ? profile.setup.map((item) => { if (typeof item !== "string") throw new TypeError("setup commands must be strings"); return item; }) : [],
           checks: Array.isArray(profile.checks)

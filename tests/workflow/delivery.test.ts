@@ -185,7 +185,7 @@ type Harness = {
   close: () => Promise<void>;
 };
 
-async function newHarness(options: { preview?: boolean } = {}): Promise<Harness> {
+async function newHarness(options: { preview?: boolean; policy?: { localProviders: string[] } } = {}): Promise<Harness> {
   const directory = mkdtempSync(join(tmpdir(), "slice-delivery-"));
   const source = makeSourceRepo(directory);
   let allowedBrowser: string | undefined;
@@ -253,8 +253,9 @@ async function newHarness(options: { preview?: boolean } = {}): Promise<Harness>
       securityReview: { provider: "faux", modelId: "security-1" },
     },
     artifactsDir,
+    policy: options.policy ?? { localProviders: [] },
   });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "req-1" }, runner, delivery);
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "req-1" }, runner, delivery, options.policy ?? { localProviders: [] });
 
   return {
     coordinator,

@@ -13,6 +13,7 @@ import type { ExternalOperationJournal } from "./external-operation-journal.js";
 import type { PiDurableAdapter } from "../adapters/pi-durable/pi-durable-adapter.js";
 import { createRoleConversation, extractJsonObject, runRoleTurn } from "./role-conversation.js";
 import type { RoleProfiles } from "./role-config.js";
+import { modelPolicyViolation, type ModelPolicy } from "./model-policy.js";
 
 export const POLICY_VERSION = "slice-phase2-v1";
 export const MAX_ROUNDS = 4;
@@ -134,6 +135,7 @@ export type DeliveryDeps = {
   publisher: BranchPublisher;
   journal: ExternalOperationJournal;
   profiles: RoleProfiles;
+  policy: ModelPolicy;
   artifactsDir: string;
   maxRounds?: number;
 };
@@ -168,6 +170,23 @@ export class DeliveryLoop {
       // Defense in depth: an archived thread is history; late input must not revive its branch.
       this.#deps.workflows.appendEvent(job.jobId, "late_input_refused", { reason: "the thread is archived" });
       return;
+    }
+    // Every delivery role is checked against the project's model and privacy rules before any model
+    // sees the patch. A project that forbids cloud models is blocked, never quietly downgraded.
+    const project = this.#deps.workflows.getProject(job.projectId);
+    if (project !== undefined) {
+      for (const [role, profile] of [
+        ["author", this.#deps.profiles.author],
+        ["code-review", this.#deps.profiles.codeReview],
+        ["security-review", this.#deps.profiles.securityReview],
+      ] as const) {
+        const violation = modelPolicyViolation(project, role, profile, this.#deps.policy);
+        if (violation !== null) {
+          this.#deps.workflows.appendEvent(job.jobId, "blocked", { reason: "model_policy", detail: violation });
+          this.#deps.workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked");
+          return;
+        }
+      }
     }
     const delivery = this.#deps.delivery.ensureDelivery(job.jobId, baseCommit);
     for (const result of baseline) {
@@ -857,6 +876,8 @@ export class DeliveryLoop {
       } catch { /* the runner's own stop check still guards deletion */ }
       await this.#deps.runner.cleanupJob({ jobId, hostId: workspace.hostId });
       this.#deps.delivery.setCleanupState(jobId, "cleaned");
+      // The host only becomes free for new work once deletion is confirmed.
+      this.#deps.workflows.releaseWorkspace(jobId);
       this.#deps.workflows.appendEvent(jobId, "workspace_cleaned", { hostId: workspace.hostId });
     } catch (error) {
       // An offline or refusing host leaves cleanup pending; the archived thread and evidence stay intact.

@@ -24,6 +24,7 @@ import { DeliveryLoop } from "./workflow/delivery.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
 import { StatusReports } from "./workflow/status-reports.js";
 import { roleProfiles } from "./workflow/role-config.js";
+import { modelPolicy } from "./workflow/model-policy.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
 const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -127,6 +128,7 @@ function buildDelivery(
     publisher: new GitBundlePublisher(stateDirectory),
     journal: new ExternalOperationJournal(state.database),
     profiles,
+    policy: modelPolicy(process.env),
     artifactsDir: join(stateDirectory, "artifacts"),
   });
 }
@@ -160,7 +162,7 @@ export async function startSlice(): Promise<void> {
     const auth = new OwnerAuth(workflows, process.env);
     const runner = buildRunner(workflows, state, stateDirectory);
     const delivery = buildDelivery(adapter, workflows, state, stateDirectory, runner);
-    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery);
+    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery, modelPolicy(process.env));
     const statusStore = StatusStore.open(state.database);
     const notificationStore = NotificationStore.open(state.database);
     const telegramToken = process.env.SLICE_TELEGRAM_BOT_TOKEN;

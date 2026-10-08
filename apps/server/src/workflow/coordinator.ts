@@ -3,6 +3,7 @@ import { AssistantEntry, type ConversationId, type EntryId } from "@earendil-wor
 import { PiDurableAdapter } from "../adapters/pi-durable/pi-durable-adapter.js";
 import type { RunnerGateway } from "../adapters/ssh-runner/runner-adapter.js";
 import type { IssueSnapshot, JobRecord, WorkflowStore } from "../records/workflow-store.js";
+import { modelPolicyViolation, type ModelPolicy } from "./model-policy.js";
 
 /** The requirements role's only output contract. Anything else is a failed task, never a pass. */
 export type RequirementsOutput =
@@ -84,13 +85,15 @@ export class JobCoordinator {
   readonly #profile: ModelProfile | null;
   readonly #runner: RunnerGateway | null;
   readonly #delivery: DeliveryHooks | null;
+  readonly #policy: ModelPolicy;
 
-  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null, runner: RunnerGateway | null = null, delivery: DeliveryHooks | null = null) {
+  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null, runner: RunnerGateway | null = null, delivery: DeliveryHooks | null = null, policy: ModelPolicy = { localProviders: [] }) {
     this.#adapter = adapter;
     this.#workflows = workflows;
     this.#profile = profile;
     this.#runner = runner;
     this.#delivery = delivery;
+    this.#policy = policy;
   }
 
   get requirementsConfigured(): boolean {
@@ -118,6 +121,15 @@ export class JobCoordinator {
     if (this.#profile === null) {
       this.#workflows.appendEvent(job.jobId, "blocked", { reason: "requirements model profile is not configured" });
       return this.#workflows.setRunState(job.jobId, ["running"], "blocked")!;
+    }
+    // Project model and privacy rules are enforced before any model sees the request.
+    const project = this.#workflows.getProject(job.projectId);
+    if (project !== undefined) {
+      const violation = modelPolicyViolation(project, "requirements", this.#profile, this.#policy);
+      if (violation !== null) {
+        this.#workflows.appendEvent(job.jobId, "blocked", { reason: "model_policy", detail: violation });
+        return this.#workflows.setRunState(job.jobId, ["running"], "blocked")!;
+      }
     }
     let threadId = job.threadId;
     // A crash between the job row and the conversation leaves the placeholder; recover by creating it now.
@@ -182,8 +194,14 @@ export class JobCoordinator {
     try {
       const project = this.#workflows.getProject(job.projectId);
       if (project === undefined) throw new Error("the job's project is no longer registered");
-      const host = this.#workflows.getHost(project.hostId);
-      if (host === undefined) throw new Error(`project host ${project.hostId} is not registered`);
+      // Placement is decided here, not by the model: pool membership, worker OS, and free capacity.
+      const placement = this.#workflows.chooseHost(project, jobId);
+      if ("reason" in placement) {
+        this.#workflows.appendEvent(jobId, "blocked", { reason: placement.reason, detail: placement.detail });
+        this.#workflows.setRunState(jobId, ["running", "waiting_user"], "blocked");
+        return;
+      }
+      const host = placement.host;
       let workspace = this.#workflows.getWorkspace(jobId);
       // Git ref components may not begin with a dash, so the short title is trimmed of edge dashes.
       const shortTitle = job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "change";

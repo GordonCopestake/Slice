@@ -152,7 +152,11 @@ test("workspace records refuse paths and branches outside the allowed shapes", (
     assert.throws(() => store.upsertWorkspace({
       jobId: job.jobId, hostId: "runner-a", repoPath: "/srv/slice/jobs/x; rm -rf /", worktreePath: "/srv/slice/jobs/x/wt",
       branch: "slice/job-1/add-screen", baseCommit: "0123456789abcdef", leaseGeneration: 1,
-    }), /absolute POSIX paths/);
+    }), /absolute worker paths/);
+    assert.throws(() => store.upsertWorkspace({
+      jobId: job.jobId, hostId: "runner-a", repoPath: "D:\\slice\\jobs\\x && calc.exe", worktreePath: "D:/slice/jobs/x/wt",
+      branch: "slice/job-1/add-screen", baseCommit: "0123456789abcdef", leaseGeneration: 1,
+    }), /absolute worker paths/, "a Windows path with shell metacharacters is refused");
     assert.throws(() => store.upsertWorkspace({
       jobId: job.jobId, hostId: "runner-a", repoPath: "/srv/slice/jobs/x", worktreePath: "/srv/slice/jobs/x/wt",
       branch: "main", baseCommit: "0123456789abcdef", leaseGeneration: 1,

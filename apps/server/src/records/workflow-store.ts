@@ -15,7 +15,29 @@ export type HostRecord = {
   os: "linux" | "windows";
   sshUser: string;
   runnerRoot: string;
+  /** How many jobs this host may carry at once. */
+  capacity: number;
+  enabled: boolean;
   createdAt: number;
+};
+
+/** A named group of hosts a project may draw from. */
+export type HostPoolRecord = {
+  poolId: string;
+  hosts: string[];
+  createdAt: number;
+};
+
+/** Per-project model and privacy rules. Model work outside these rules is refused, not silently downgraded. */
+export type ModelRules = {
+  /** Providers allowed for this project's role conversations. Empty means the configured set is allowed. */
+  allowedProviders: string[];
+  /** Model ids allowed for this project's role conversations. Empty means any model of an allowed provider. */
+  allowedModelIds: string[];
+  /** When false, cloud providers are refused for this project. */
+  allowCloud: boolean;
+  /** Roles that must run locally regardless of the cloud setting. */
+  localOnlyRoles: string[];
 };
 
 export type ProjectStatus = "active" | "paused" | "removed";
@@ -33,6 +55,11 @@ export type ProjectRecord = {
   repoSlug: string;
   defaultBranch: string;
   hostId: string;
+  /** When set, the job is placed on a host from this pool instead of hostId. */
+  poolId: string | null;
+  /** Which worker OS this project's build profile needs. */
+  requiredOs: "linux" | "windows";
+  modelRules: ModelRules;
   buildProfile: BuildProfile;
   /** Where the feature branch is pushed; defaults to https://github.com/<slug>.git. */
   gitRemoteUrl: string | null;
@@ -119,6 +146,8 @@ export type WorkspaceRecord = {
   branch: string;
   baseCommit: string;
   leaseGeneration: number;
+  /** True once cleanup has confirmed the worktree is gone and the host is free again. */
+  released: boolean;
   updatedAt: number;
 };
 
@@ -167,6 +196,13 @@ export class WorkflowStore {
           os TEXT NOT NULL CHECK (os IN ('linux', 'windows')),
           ssh_user TEXT NOT NULL,
           runner_root TEXT NOT NULL,
+          capacity INTEGER NOT NULL DEFAULT 1,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS slice_host_pools (
+          pool_id TEXT PRIMARY KEY,
+          hosts_json TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS slice_projects (
@@ -176,6 +212,9 @@ export class WorkflowStore {
           repo_slug TEXT NOT NULL,
           default_branch TEXT NOT NULL,
           host_id TEXT NOT NULL,
+          pool_id TEXT,
+          required_os TEXT NOT NULL DEFAULT 'linux',
+          model_rules_json TEXT,
           build_profile_json TEXT NOT NULL,
           status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'removed')),
           created_at INTEGER NOT NULL,
@@ -254,6 +293,7 @@ export class WorkflowStore {
           branch TEXT NOT NULL,
           base_commit TEXT NOT NULL,
           lease_generation INTEGER NOT NULL,
+          released INTEGER NOT NULL DEFAULT 0,
           updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS slice_runner_operations (
@@ -307,41 +347,106 @@ export class WorkflowStore {
 
   // ---------------------------------------------------------------- hosts
 
-  registerHost(host: Omit<HostRecord, "createdAt">): HostRecord {
+  registerHost(host: { hostId: string; address: string; os: "linux" | "windows"; sshUser: string; runnerRoot: string; capacity?: number; enabled?: boolean }): HostRecord {
     assertId("hostId", host.hostId);
     if (!/^[A-Za-z0-9._-]{1,253}$/.test(host.address)) throw new TypeError("Host addresses must be a hostname or IP literal");
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(host.sshUser)) throw new TypeError("SSH users must be 1-64 letters, numbers, dots, underscores, or hyphens");
-    if (!/^\/[A-Za-z0-9._/-]{1,200}$/.test(host.runnerRoot)) throw new TypeError("Runner roots must be an absolute POSIX path");
+    // A Windows worker's root is a drive path; a Linux worker's is a POSIX absolute path. Neither may
+    // contain shell metacharacters, and neither is ever taken from model output.
+    const rootPattern = host.os === "windows" ? /^[A-Za-z]:[\\/][A-Za-z0-9._\\/-]{0,199}$/ : /^\/[A-Za-z0-9._/-]{1,200}$/;
+    if (!rootPattern.test(host.runnerRoot)) throw new TypeError(`Runner roots must be an absolute ${host.os} path without shell metacharacters`);
     const createdAt = Date.now();
+    const capacity = Math.max(1, Math.min(64, Math.trunc(host.capacity ?? 1)));
+    const enabled = host.enabled ?? true;
     this.#database
-      .prepare(`INSERT INTO slice_hosts (host_id, address, os, ssh_user, runner_root, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(host.hostId, host.address, host.os, host.sshUser, host.runnerRoot, createdAt);
-    return { ...host, createdAt };
+      .prepare(`INSERT INTO slice_hosts (host_id, address, os, ssh_user, runner_root, capacity, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(host.hostId, host.address, host.os, host.sshUser, host.runnerRoot, capacity, enabled ? 1 : 0, createdAt);
+    return { ...host, capacity, enabled, createdAt };
+  }
+
+  setHostEnabled(hostId: string, enabled: boolean): void {
+    assertId("hostId", hostId);
+    this.#database.prepare("UPDATE slice_hosts SET enabled = ? WHERE host_id = ?").run(enabled ? 1 : 0, hostId);
+  }
+
+  /** Hosts that may still take work. A disabled host keeps its existing work but takes no new job. */
+  listUsableHosts(): HostRecord[] {
+    return this.listHosts().filter((host) => host.enabled);
+  }
+
+  registerPool(pool: { poolId: string; hosts: string[] }): HostPoolRecord {
+    assertId("poolId", pool.poolId);
+    if (pool.hosts.length === 0 || pool.hosts.length > 32) throw new TypeError("A host pool needs between 1 and 32 hosts");
+    for (const hostId of pool.hosts) {
+      assertId("hostId", hostId);
+      if (this.getHost(hostId) === undefined) throw new Error(`Pool host ${hostId} is not registered`);
+    }
+    const createdAt = Date.now();
+    this.#database.prepare("INSERT INTO slice_host_pools (pool_id, hosts_json, created_at) VALUES (?, ?, ?)")
+      .run(pool.poolId, JSON.stringify([...new Set(pool.hosts)]), createdAt);
+    return { poolId: pool.poolId, hosts: [...new Set(pool.hosts)], createdAt };
+  }
+
+  getPool(poolId: string): HostPoolRecord | undefined {
+    assertId("poolId", poolId);
+    const row = this.#database.prepare("SELECT * FROM slice_host_pools WHERE pool_id = ?").get(poolId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : { poolId: String(row.pool_id), hosts: parseJson<string[]>(String(row.hosts_json), []), createdAt: Number(row.created_at) };
+  }
+
+  listPools(): HostPoolRecord[] {
+    return (this.#database.prepare("SELECT * FROM slice_host_pools ORDER BY pool_id").all() as Record<string, unknown>[])
+      .map((row) => ({ poolId: String(row.pool_id), hosts: parseJson<string[]>(String(row.hosts_json), []), createdAt: Number(row.created_at) }));
+  }
+
+  /** Jobs currently occupying a host. The job being placed is excluded: its own workspace must not
+   * block its own re-placement when delivery re-runs. */
+  activeHostCount(hostId: string, excludeJobId?: string): number {
+    assertId("hostId", hostId);
+    const row = excludeJobId === undefined
+      ? this.#database.prepare(
+          `SELECT COUNT(*) AS n FROM slice_workspaces w
+           JOIN slice_jobs j ON j.job_id = w.job_id
+           WHERE w.host_id = ? AND w.released = 0 AND j.run_state NOT IN ('cancelled', 'completed')`,
+        ).get(hostId) as { n: number }
+      : this.#database.prepare(
+          `SELECT COUNT(*) AS n FROM slice_workspaces w
+           JOIN slice_jobs j ON j.job_id = w.job_id
+           WHERE w.host_id = ? AND w.released = 0 AND j.run_state NOT IN ('cancelled', 'completed') AND w.job_id <> ?`,
+        ).get(hostId, excludeJobId) as { n: number };
+    return Number(row.n);
+  }
+
+  /**
+   * Pick the worker a project's next job runs on. A pool is searched in registration order and only
+   * hosts that are enabled, match the project's required OS, and have free capacity are considered.
+   * The reason is returned instead of a guess so the job can state why it is waiting.
+   */
+  chooseHost(project: ProjectRecord, forJobId?: string): { host: HostRecord } | { reason: string; detail: string } {
+    const candidates = (project.poolId === null
+      ? [this.getHost(project.hostId)].filter((host): host is HostRecord => host !== undefined)
+      : this.getPool(project.poolId)?.hosts.map((hostId) => this.getHost(hostId)).filter((host): host is HostRecord => host !== undefined) ?? []);
+    if (candidates.length === 0) return { reason: "no_registered_host", detail: `Project ${project.projectId} has no registered host or pool` };
+    const usable = candidates.filter((host) => host.enabled);
+    if (usable.length === 0) return { reason: "host_disabled", detail: `Every host for project ${project.projectId} is disabled` };
+    const matching = usable.filter((host) => host.os === project.requiredOs);
+    if (matching.length === 0) {
+      return { reason: "no_matching_host_os", detail: `Project ${project.projectId} needs a ${project.requiredOs} worker; registered hosts are ${usable.map((host) => `${host.hostId} (${host.os})`).join(", ")}` };
+    }
+    const free = matching.filter((host) => this.activeHostCount(host.hostId, forJobId) < host.capacity);
+    if (free.length === 0) {
+      return { reason: "no_host_capacity", detail: `Every ${project.requiredOs} host for ${project.projectId} is at capacity (${matching.map((host) => `${host.hostId} ${this.activeHostCount(host.hostId, forJobId)}/${host.capacity}`).join(", ")})` };
+    }
+    return { host: free[0]! };
   }
 
   getHost(hostId: string): HostRecord | undefined {
     assertId("hostId", hostId);
     const row = this.#database.prepare("SELECT * FROM slice_hosts WHERE host_id = ?").get(hostId) as Record<string, unknown> | undefined;
-    return row === undefined ? undefined : {
-      hostId: String(row.host_id),
-      address: String(row.address),
-      os: String(row.os) as HostRecord["os"],
-      sshUser: String(row.ssh_user),
-      runnerRoot: String(row.runner_root),
-      createdAt: Number(row.created_at),
-    };
+    return row === undefined ? undefined : toHost(row);
   }
 
   listHosts(): HostRecord[] {
-    return (this.#database.prepare("SELECT * FROM slice_hosts ORDER BY host_id").all() as Record<string, unknown>[])
-      .map((row) => ({
-        hostId: String(row.host_id),
-        address: String(row.address),
-        os: String(row.os) as HostRecord["os"],
-        sshUser: String(row.ssh_user),
-        runnerRoot: String(row.runner_root),
-        createdAt: Number(row.created_at),
-      }));
+    return (this.#database.prepare("SELECT * FROM slice_hosts ORDER BY host_id").all() as Record<string, unknown>[]).map(toHost);
   }
 
   // ------------------------------------------------------------- projects
@@ -351,6 +456,9 @@ export class WorkflowStore {
     repoSlug: string;
     defaultBranch: string;
     hostId: string;
+    poolId?: string | null;
+    requiredOs?: "linux" | "windows";
+    modelRules?: Partial<ModelRules>;
     buildProfile: BuildProfile;
     gitRemoteUrl?: string | null;
     preview?: PreviewConfig | null;
@@ -361,6 +469,9 @@ export class WorkflowStore {
     }
     if (!/^[A-Za-z0-9._/-]{1,100}$/.test(project.defaultBranch)) throw new TypeError("Default branches must be a plain ref name");
     if (this.getHost(project.hostId) === undefined) throw new Error(`Host ${project.hostId} is not registered`);
+    if (project.poolId !== undefined && project.poolId !== null && this.getPool(project.poolId) === undefined) {
+      throw new Error(`Pool ${project.poolId} is not registered`);
+    }
     validateBuildProfile(project.buildProfile);
     if (project.gitRemoteUrl !== undefined && project.gitRemoteUrl !== null) {
       if (!/^(https|file):\/\/[^\s]{1,300}$/.test(project.gitRemoteUrl) || /@/.test(project.gitRemoteUrl)) {
@@ -371,9 +482,12 @@ export class WorkflowStore {
     const now = Date.now();
     this.#database
       .prepare(`INSERT INTO slice_projects
-        (project_id, revision, git_provider, repo_slug, default_branch, host_id, build_profile_json, git_remote_url, preview_json, status, created_at, updated_at)
-        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
-      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId, JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null, project.preview === undefined || project.preview === null ? null : JSON.stringify(project.preview), now, now);
+        (project_id, revision, git_provider, repo_slug, default_branch, host_id, pool_id, required_os, model_rules_json, build_profile_json, git_remote_url, preview_json, status, created_at, updated_at)
+        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId,
+        project.poolId ?? null, project.requiredOs ?? "linux", JSON.stringify(modelRules(project.modelRules)),
+        JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null,
+        project.preview === undefined || project.preview === null ? null : JSON.stringify(project.preview), now, now);
     return this.getProject(project.projectId)!;
   }
 
@@ -728,10 +842,14 @@ export class WorkflowStore {
 
   // ------------------------------------------------------- workspaces
 
-  upsertWorkspace(workspace: Omit<WorkspaceRecord, "updatedAt">): WorkspaceRecord {
+  upsertWorkspace(workspace: Omit<WorkspaceRecord, "updatedAt" | "released">): WorkspaceRecord {
     assertId("jobId", workspace.jobId);
     for (const path of [workspace.repoPath, workspace.worktreePath]) {
-      if (!/^\/[A-Za-z0-9._/-]{1,300}$/.test(path)) throw new TypeError("Workspace paths must be absolute POSIX paths without shell metacharacters");
+      // Paths come from the runner, never from a model. Both worker platforms are accepted; shell
+      // metacharacters are not.
+      if (!/^(\/[A-Za-z0-9._/-]{1,300}|[A-Za-z]:[\\/][A-Za-z0-9._\\/-]{0,299})$/.test(path)) {
+        throw new TypeError("Workspace paths must be absolute worker paths without shell metacharacters");
+      }
     }
     if (!/^slice\/[A-Za-z0-9._-]{1,128}\/[A-Za-z0-9._-]{1,64}$/.test(workspace.branch)) throw new TypeError("Branches must match slice/<job>/<short-title>");
     if (!/^[0-9a-f]{7,40}$/.test(workspace.baseCommit)) throw new TypeError("Base commits must be hex object ids");
@@ -756,8 +874,18 @@ export class WorkflowStore {
       branch: String(row.branch),
       baseCommit: String(row.base_commit),
       leaseGeneration: Number(row.lease_generation),
+      released: Number(row.released ?? 0) !== 0,
       updatedAt: Number(row.updated_at),
     };
+  }
+
+  /**
+   * Mark the workspace as no longer holding its host. Only called after cleanup has confirmed the
+   * worktree is gone, so capacity is never handed back while a workspace still exists.
+   */
+  releaseWorkspace(jobId: string): void {
+    assertId("jobId", jobId);
+    this.#database.prepare("UPDATE slice_workspaces SET released = 1, updated_at = ? WHERE job_id = ?").run(Date.now(), jobId);
   }
 
   // ------------------------------------------------- runner operations
@@ -931,6 +1059,19 @@ function validatePreview(preview: PreviewConfig): void {
   }
 }
 
+function toHost(row: Record<string, unknown>): HostRecord {
+  return {
+    hostId: String(row.host_id),
+    address: String(row.address),
+    os: String(row.os) as HostRecord["os"],
+    sshUser: String(row.ssh_user),
+    runnerRoot: String(row.runner_root),
+    capacity: Number(row.capacity ?? 1),
+    enabled: Number(row.enabled ?? 1) !== 0,
+    createdAt: Number(row.created_at),
+  };
+}
+
 function toProject(row: Record<string, unknown>): ProjectRecord {
   return {
     projectId: String(row.project_id),
@@ -939,12 +1080,32 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     repoSlug: String(row.repo_slug),
     defaultBranch: String(row.default_branch),
     hostId: String(row.host_id),
+    poolId: row.pool_id === null || row.pool_id === undefined ? null : String(row.pool_id),
+    requiredOs: (row.required_os === null || row.required_os === undefined ? "linux" : String(row.required_os)) as ProjectRecord["requiredOs"],
+    modelRules: modelRules(parseJson<Partial<ModelRules>>(String(row.model_rules_json ?? "{}"), {})),
     buildProfile: parseJson<BuildProfile>(String(row.build_profile_json), { setup: [], checks: [] }),
     gitRemoteUrl: row.git_remote_url === null || row.git_remote_url === undefined ? null : String(row.git_remote_url),
     preview: row.preview_json === null || row.preview_json === undefined ? null : parseJson<PreviewConfig | null>(String(row.preview_json), null),
     status: String(row.status) as ProjectStatus,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+  };
+}
+
+/** Model and privacy rules are normalised here so a malformed rule never reaches a role conversation. */
+function modelRules(input: Partial<ModelRules> | undefined): ModelRules {
+  const names = (values: unknown): string[] =>
+    Array.isArray(values)
+      ? values
+          .filter((value): value is string => typeof value === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(value))
+          .slice(0, 32)
+          .map((value) => value.toLowerCase())
+      : [];
+  return {
+    allowedProviders: names(input?.allowedProviders),
+    allowedModelIds: names(input?.allowedModelIds),
+    allowCloud: input?.allowCloud !== false,
+    localOnlyRoles: names(input?.localOnlyRoles),
   };
 }
 
