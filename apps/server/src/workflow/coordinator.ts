@@ -64,6 +64,12 @@ export function parseRequirementsOutput(text: string): RequirementsOutput | null
 
 export type ModelProfile = { provider: string; modelId: string };
 
+/** What the coordinator needs from the Phase 2 delivery loop; absent in Phase 1-only deployments. */
+export interface DeliveryHooks {
+  onWorkspaceReady(job: JobRecord, baseCommit: string, baseline: { checkId: string; status: "succeeded" | "failed" | "uncertain"; exitCode: number | null; outputTail: string; command: string; environment: string }[]): Promise<void>;
+  withdrawReadiness(jobId: string): Promise<void>;
+}
+
 /** A transition or command that conflicts with the job's current durable state. */
 export class JobStateConflictError extends Error {
   constructor(message: string) {
@@ -77,12 +83,14 @@ export class JobCoordinator {
   readonly #workflows: WorkflowStore;
   readonly #profile: ModelProfile | null;
   readonly #runner: RunnerGateway | null;
+  readonly #delivery: DeliveryHooks | null;
 
-  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null, runner: RunnerGateway | null = null) {
+  constructor(adapter: PiDurableAdapter, workflows: WorkflowStore, profile: ModelProfile | null, runner: RunnerGateway | null = null, delivery: DeliveryHooks | null = null) {
     this.#adapter = adapter;
     this.#workflows = workflows;
     this.#profile = profile;
     this.#runner = runner;
+    this.#delivery = delivery;
   }
 
   get requirementsConfigured(): boolean {
@@ -184,7 +192,8 @@ export class JobCoordinator {
         const prepared = await this.#runner.prepareJob({
           jobId,
           hostId: host.hostId,
-          source: `https://github.com/${project.repoSlug}.git`,
+          // The clone source is the project's registered remote, never a model-supplied URL.
+          source: project.gitRemoteUrl ?? `https://github.com/${project.repoSlug}.git`,
           branch,
           leaseGeneration: 1,
         });
@@ -200,9 +209,12 @@ export class JobCoordinator {
         this.#workflows.appendEvent(jobId, "workspace_ready", { hostId: host.hostId, baseCommit: prepared.baseCommit, branch: workspace.branch, reused: prepared.reused });
       }
       let allPassed = true;
+      const baseline: { checkId: string; status: "succeeded" | "failed" | "uncertain"; exitCode: number | null; outputTail: string; command: string; environment: string }[] = [];
       for (const check of project.buildProfile.checks) {
-        const result = await this.#runner.runCheck({ jobId, hostId: host.hostId, leaseGeneration: workspace.leaseGeneration, checkId: check.id, command: check.command });
+        // The revision suffix keeps each requirements revision's baseline evidence distinct.
+        const result = await this.#runner.runCheck({ jobId, hostId: host.hostId, leaseGeneration: workspace.leaseGeneration, checkId: `${check.id}:base:rev${job.requirementsRevision}`, command: check.command });
         this.#workflows.appendEvent(jobId, "check_result", { checkId: check.id, status: result.status, exitCode: result.exitCode });
+        baseline.push({ checkId: check.id, status: result.status, exitCode: result.exitCode, outputTail: result.outputTail, command: check.command, environment: `host:${host.hostId}` });
         if (result.status !== "succeeded") allPassed = false;
       }
       if (!allPassed) {
@@ -212,6 +224,10 @@ export class JobCoordinator {
       }
       this.#workflows.setStage(jobId, "implementation");
       this.#workflows.appendEvent(jobId, "stage", { stage: "implementation" });
+      if (this.#delivery !== null) {
+        // Phase 2: hand the prepared workspace to the delivery loop, carrying the baseline evidence.
+        await this.#delivery.onWorkspaceReady(this.#workflows.getJob(jobId)!, workspace.baseCommit, baseline);
+      }
     } catch (error) {
       this.#workflows.appendEvent(jobId, "blocked", { reason: `workspace preparation failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown"}` });
       this.#workflows.setRunState(jobId, ["running"], "blocked");
@@ -239,6 +255,10 @@ export class JobCoordinator {
       return { job, recorded: true };
     }
     this.#workflows.staleOpenQuestions(jobId);
+    if (this.#delivery !== null) {
+      // Steering after the gate withdraws readiness and returns the PR to draft before any new work.
+      await this.#delivery.withdrawReadiness(jobId);
+    }
     const revised = this.#workflows.getJob(jobId)!;
     return { job: await this.#runRequirements(revised, `Steering instruction: ${instruction}`, `steer-${requestId}`), recorded: true };
   }

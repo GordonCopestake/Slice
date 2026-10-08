@@ -34,3 +34,11 @@ textarea { min-height: 90px; }
   .bar nav { margin-left: 0; width: 100%; }
   main { padding: 10px; }
 }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #222c37; }
+th { color: var(--muted); font-weight: 500; font-size: 13px; }
+h4 { margin: 14px 0 6px; font-size: 14px; color: var(--muted); }
+.badge.ready, .badge.pass, .badge.merged, .badge.cleaned, .badge.succeeded, .badge.verified_fixed { color: var(--ok); }
+.badge.publishing, .badge.pending, .badge.draft, .badge.changes_required, .badge.available { color: var(--warn); }
+.badge.unable_to_review, .badge.open { color: var(--bad); }
+a { color: var(--accent); }

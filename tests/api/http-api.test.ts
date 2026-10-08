@@ -13,15 +13,10 @@ import { OwnerAuth } from "../../apps/server/src/auth/owner-auth.js";
 import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-durable-adapter.js";
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
+import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
-
-const fakeRunner: RunnerGateway = {
-  prepareJob: async () => ({ baseCommit: "0123456789abcdef", repoPath: "/srv/slice/jobs/j/repo", worktreePath: "/srv/slice/jobs/j/author", reused: false }),
-  runCheck: async () => ({ status: "succeeded", exitCode: 0, outputTail: "" }),
-  cancelRunning: async () => {},
-  reconcile: async () => [],
-};
+import { fakeRunner } from "../support/fake-runner.js";
 
 const QUESTION_JSON = '{"kind":"question","questionId":"q1","question":"Which office allocates?","choices":["front","back"]}';
 const READY_JSON = '{"kind":"ready","summary":"Add an allocation screen.","criteria":[{"id":"c1","text":"Office staff can allocate items"}]}';
@@ -37,7 +32,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -46,8 +41,8 @@ async function startStack(): Promise<TestStack> {
   models.setProvider(faux.provider);
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner);
-  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public") });
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner());
+  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

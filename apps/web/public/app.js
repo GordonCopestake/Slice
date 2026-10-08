@@ -259,10 +259,13 @@ async function jobView(jobId) {
     if (["paused", "resumed", "cancelled", "requirements_ready", "question_asked", "question_answered", "blocked"].includes(event.type)) void render();
   });
 
+  const deliveryPanel = await buildDeliveryPanel(jobId);
+
   return el("section", {},
     el("div", { class: "card" }, el("h3", {}, job.title), status,
       job.issue ? el("p", { class: "muted" }, `from issue ${job.issue.repoSlug}#${job.issue.issueNumber} (${job.issue.url})`) : null),
     questions,
+    deliveryPanel,
     (() => {
       const steerForm = el("form", { class: "card", onsubmit: async (event) => {
         event.preventDefault();
@@ -283,6 +286,73 @@ async function jobView(jobId) {
     })(),
     actions,
     el("div", { class: "card" }, el("h3", {}, "Thread activity"), events),
+  );
+}
+
+/**
+ * Delivery panel: the gate's evidence, not a narrative. Checks, both reviews with the model that
+ * produced them, findings, the PR state, and the owner's own next actions.
+ */
+async function buildDeliveryPanel(jobId) {
+  let result;
+  try {
+    result = await api(`/api/jobs/${jobId}/delivery`);
+  } catch {
+    return null;
+  }
+  if (result.status !== 200 || !result.body.delivery) return null;
+  const d = result.body.delivery;
+  const panelError = el("p", { class: "error" });
+  const ownerAction = async (path) => {
+    try {
+      const outcome = await api(`/api/jobs/${jobId}/${path}`, { method: "POST", body: "{}" });
+      if (outcome.status === 409) {
+        panelError.textContent = outcome.body.message ?? "That action does not apply to the current state.";
+        return;
+      }
+      await render();
+    } catch (cause) {
+      panelError.textContent = String(cause.message);
+    }
+  };
+
+  const checkRows = (d.checks ?? []).map((check) => el("tr", {},
+    el("td", {}, check.checkId), el("td", {}, check.status), el("td", {}, check.exitCode === null ? "-" : String(check.exitCode)),
+    el("td", { class: "muted" }, check.headCommit.slice(0, 10))));
+  const reviewRows = (d.reviews ?? []).map((review) => el("tr", {},
+    el("td", {}, review.role), el("td", {}, review.verdict), el("td", { class: "muted" }, review.model),
+    el("td", { class: "muted" }, review.headCommit.slice(0, 10))));
+  const findingRows = (d.findings ?? []).map((finding) => el("tr", {},
+    el("td", {}, finding.id), el("td", {}, finding.severity), el("td", {}, finding.status), el("td", { class: "muted" }, finding.file)));
+
+  const ownerActions = el("div", { class: "row" });
+  if (d.stage === "ready" && d.gateVerdict === "pass") {
+    ownerActions.append(el("button", { class: "primary", onclick: () => void ownerAction("accept") }, "Accept this result"));
+  }
+  if (d.prState === "ready" || d.prState === "draft") {
+    ownerActions.append(el("button", { onclick: () => void ownerAction("observe-merge") }, "Check merge status"));
+  }
+  if (d.archiveState === "archived" && (d.cleanupState === "pending" || d.cleanupState === "failed")) {
+    ownerActions.append(el("button", { onclick: () => void ownerAction("cleanup-retry") }, "Retry workspace cleanup"));
+  }
+
+  return el("div", { class: "card" },
+    el("h3", {}, "Delivery"),
+    el("div", { class: "row" }, badge(d.stage), badge(d.gateVerdict), badge(d.prState),
+      el("span", { class: "muted" }, `round ${d.round} of 4`)),
+    d.headCommit ? el("p", { class: "muted" }, `head ${d.headCommit.slice(0, 10)} on base ${d.baseCommit.slice(0, 10)}`) : null,
+    d.prUrl ? el("p", {}, el("a", { href: d.prUrl }, `pull request #${d.prNumber}`)) : null,
+    d.acceptance ? el("p", { class: "muted" }, d.acceptance.stale ? "Acceptance is stale: the result changed after it was accepted." : "Accepted by the owner.") : null,
+    d.archiveState === "archived" ? el("p", {}, `Archived: ${d.archiveReason ?? ""} ${d.mergedRevision ? `merged revision ${String(d.mergedRevision).slice(0, 10)}` : ""}`) : null,
+    d.cleanupState !== "available" ? el("p", { class: "muted" }, `workspace cleanup: ${d.cleanupState}`) : null,
+    el("h4", {}, "Checks"),
+    checkRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "check"), el("th", {}, "status"), el("th", {}, "exit"), el("th", {}, "commit")), ...checkRows) : el("p", { class: "muted" }, "no checks recorded yet"),
+    el("h4", {}, "Independent reviews"),
+    reviewRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "role"), el("th", {}, "verdict"), el("th", {}, "model"), el("th", {}, "commit")), ...reviewRows) : el("p", { class: "muted" }, "no reviews recorded yet"),
+    el("h4", {}, "Findings"),
+    findingRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "id"), el("th", {}, "severity"), el("th", {}, "status"), el("th", {}, "file")), ...findingRows) : el("p", { class: "muted" }, "no findings recorded"),
+    ownerActions,
+    panelError,
   );
 }
 

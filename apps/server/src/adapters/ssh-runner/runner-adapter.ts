@@ -16,10 +16,29 @@ export type CheckRunResult = {
   outputTail: string;
 };
 
+export type AppliedChange = {
+  commit: string;
+  tree: string;
+  parent: string;
+};
+
+export type HeadState = {
+  head: string;
+  tree: string;
+  branch: string;
+  parent: string;
+  clean: boolean;
+};
+
 /** What the workflow coordinator needs from a runner; a fake can stand in for tests. */
 export interface RunnerGateway {
   prepareJob(input: { jobId: string; hostId: string; source: string; branch: string; leaseGeneration: number }): Promise<PreparedWorkspace>;
   runCheck(input: { jobId: string; hostId: string; leaseGeneration: number; checkId: string; command: string }): Promise<CheckRunResult>;
+  applyChange(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; patch: string; commitMessage: string; expectedParent: string }): Promise<AppliedChange>;
+  verifyHead(input: { jobId: string; hostId: string }): Promise<HeadState>;
+  readSource(input: { jobId: string; hostId: string; path: string }): Promise<string>;
+  exportCommit(input: { jobId: string; hostId: string; commit: string }): Promise<Buffer>;
+  cleanupJob(input: { jobId: string; hostId: string }): Promise<void>;
   cancelRunning(input: { jobId: string; hostId: string }): Promise<void>;
   reconcile(input: { jobId: string; hostId: string }): Promise<{ operationId: string; status: string }[]>;
 }
@@ -122,6 +141,63 @@ export class RunnerAdapter implements RunnerGateway {
       await delay(this.#pollIntervalMs);
     }
     throw new Error("the remote check exceeded the poll limit");
+  }
+
+  /**
+   * The only path to a source commit. Journal-backed like every mutation: a crash after the apply
+   * is reconciled by the runner's marker commit, never by blindly re-sending the patch.
+   */
+  async applyChange(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; patch: string; commitMessage: string; expectedParent: string }): Promise<AppliedChange> {
+    const payload = { op: "apply_change", ...input } satisfies JsonValue;
+    const transport = this.#transportFor(input.hostId);
+    return this.#journal.run(input.operationId, payload, {
+      execute: async () => {
+        const response = await transport.request(payload);
+        okOrThrow(response, "apply_change");
+        return { commit: String(response.commit), tree: String(response.tree), parent: String(response.parent) };
+      },
+      reconcile: async () => {
+        const settled = await transport.request({ op: "reconcile_apply", jobId: input.jobId, operationId: input.operationId });
+        if (settled.ok !== true) return { status: "unknown", reason: "the runner did not answer for this apply operation" };
+        if (settled.status === "not_started") return { status: "not_started" };
+        if (settled.status === "failed") return { status: "not_started" }; // the runner reset the worktree; a retry may re-apply
+        if (settled.status !== "succeeded") return { status: "unknown", reason: `the apply operation is ${String(settled.status)}` };
+        const head = await transport.request({ op: "verify_head", jobId: input.jobId });
+        if (head.ok !== true || typeof head.head !== "string" || typeof head.tree !== "string") {
+          return { status: "unknown", reason: "the committed head could not be read after reconciliation" };
+        }
+        return { status: "completed", result: { commit: String(head.head), tree: String(head.tree), parent: String(head.parent ?? input.expectedParent) } };
+      },
+    });
+  }
+
+  async verifyHead(input: { jobId: string; hostId: string }): Promise<HeadState> {
+    const response = await this.#transportFor(input.hostId).request({ op: "verify_head", jobId: input.jobId });
+    okOrThrow(response, "verify_head");
+    return {
+      head: String(response.head ?? ""),
+      tree: String(response.tree ?? ""),
+      branch: String(response.branch ?? ""),
+      parent: String(response.parent ?? ""),
+      clean: response.clean === true,
+    };
+  }
+
+  async readSource(input: { jobId: string; hostId: string; path: string }): Promise<string> {
+    const response = await this.#transportFor(input.hostId).request({ op: "read_source", jobId: input.jobId, path: input.path });
+    okOrThrow(response, "read_source");
+    return String(response.content ?? "");
+  }
+
+  async exportCommit(input: { jobId: string; hostId: string; commit: string }): Promise<Buffer> {
+    const response = await this.#transportFor(input.hostId).request({ op: "export_commit", jobId: input.jobId, commit: input.commit });
+    okOrThrow(response, "export_commit");
+    return Buffer.from(String(response.bundleBase64 ?? ""), "base64");
+  }
+
+  async cleanupJob(input: { jobId: string; hostId: string }): Promise<void> {
+    const response = await this.#transportFor(input.hostId).request({ op: "cleanup_job", jobId: input.jobId });
+    okOrThrow(response, "cleanup_job");
   }
 
   async cancelRunning(input: { jobId: string; hostId: string }): Promise<void> {
