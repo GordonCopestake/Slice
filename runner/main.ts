@@ -287,8 +287,9 @@ function handleApplyChange(journal: Journal, root: string, request: Extract<Requ
   }
   const applied = git(["-C", worktreePath, "apply", "--index", patchPath]);
   if (!applied.ok) {
-    // Undo the partial application so the worktree is never left half-patched.
-    git(["-C", worktreePath, "checkout", "--", "."]);
+    // Undo the partial application so the worktree is never left half-patched. 'checkout -- .' would
+    // restore from the index, which apply --index has already modified; reset --hard clears both.
+    git(["-C", worktreePath, "reset", "--hard", "HEAD"]);
     git(["-C", worktreePath, "clean", "-fd"]);
     journal.setStatus(request.operationId, "failed");
     return fail(`patch_apply_failed: ${applied.output}`);
@@ -296,7 +297,7 @@ function handleApplyChange(journal: Journal, root: string, request: Extract<Requ
   const message = `${String(request.commitMessage ?? "").replace(/\s+/g, " ").slice(0, 200) || "slice change"}\n\nslice-op:${request.operationId}`;
   const committed = git(["-C", worktreePath, "-c", "user.name=Slice Author", "-c", "user.email=author@slice.local", "commit", "-m", message]);
   if (!committed.ok) {
-    git(["-C", worktreePath, "checkout", "--", "."]);
+    git(["-C", worktreePath, "reset", "--hard", "HEAD"]);
     git(["-C", worktreePath, "clean", "-fd"]);
     journal.setStatus(request.operationId, "failed");
     return fail(`commit_failed: ${committed.output}`);
@@ -314,8 +315,8 @@ function reconcileApplyChange(root: string, jobId: string, operationId: string):
   if (!existsSync(worktreePath)) return { status: "failed" };
   const found = git(["-C", worktreePath, "log", "--fixed-strings", `--grep=slice-op:${operationId}`, "--format=%H", "-n", "1"]);
   if (found.ok && /^[0-9a-f]{7,64}$/.test(found.output)) return { status: "succeeded", commit: found.output };
-  // No marker commit: the worktree is disposable, so reset it to HEAD and call the attempt failed.
-  git(["-C", worktreePath, "checkout", "--", "."]);
+  // No marker commit: the worktree is disposable, so reset index and worktree to HEAD and call the attempt failed.
+  git(["-C", worktreePath, "reset", "--hard", "HEAD"]);
   git(["-C", worktreePath, "clean", "-fd"]);
   return { status: "failed" };
 }
