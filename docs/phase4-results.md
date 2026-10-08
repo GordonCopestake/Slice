@@ -1,6 +1,6 @@
 # Phase 4 results — more hosts, release readiness, and rollback evidence
 
-Status: **synthetic checks pass (164 Node tests; 21 were added in Phase 4). The live exit check has
+Status: **synthetic checks pass (165 Node tests; 22 were added in Phase 4). The live exit check has
 not been run** — it needs a real Windows worker, a real second Linux host, and a real staging
 environment. No claim below is presented as a live result.
 
@@ -92,7 +92,7 @@ unchanged).
 
 ## Verification
 
-`npm run check` passes: format, typecheck, build, and **164 Node tests** (21 were added in Phase 4).
+`npm run check` passes: format, typecheck, build, and **165 Node tests** (22 were added in Phase 4).
 
 | Exit-check row | Synthetic stand-in | Status |
 |---|---|---|
@@ -160,8 +160,18 @@ round is a separate commit; each finding is stated with its consequence:
    exist and are tested end to end, including that a pool cannot name a host the owner never registered
    (400, not 500) and that enabling an unknown host is 404 rather than a silent no-op success.
 
-This gap was found only because the service was actually started and its routes called. The synthetic
-test suite had never exercised those paths, which is a limit of testing a UI purely by parsing it.
+7. **The web app was dead outside a secure context.** `newRequestId` called `crypto.randomUUID`, which
+   browsers expose only over https or `http://localhost`. Served over plain HTTP on a tailnet address
+   it is `undefined`, and "New thread" failed outright - the UI was unusable in exactly the deployment
+   mode the new bind configuration enables. The helper now feature-detects and falls back to
+   `crypto.getRandomValues`, emitting the same UUID shape, and a guard test runs the real helper against
+   a `crypto` with no `randomUUID` while checking the result against the server's own id pattern.
+
+Rounds 6 and 7 were found **only by starting the service and using it in a browser**. The synthetic
+suite passed throughout both times. That is a real limit of this phase's verification: parsing the web
+app as JavaScript and asserting API shapes does not exercise the browser environment or the HTTP layer
+that sits between them. The live exit checks in the table above are what close that gap, and they have
+not been run.
 
 ## Running Phase 4 locally
 
