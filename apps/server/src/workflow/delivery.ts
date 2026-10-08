@@ -519,7 +519,10 @@ export class DeliveryLoop {
       this.#deps.delivery.setDeliveryStage(jobId, "publishing");
       return;
     }
-    const fixable = delivery.round < this.#maxRounds && (reasons.some((reason) => reason.includes("check")) || blocking.length > 0 || reviews.some((review) => review.verdict !== "pass"));
+    // A repair round is scheduled only for failures the author can act on, judged from the
+    // structured gate inputs, not from reason text. At the round limit the job blocks.
+    const fixable = delivery.round < this.#maxRounds
+      && (blocking.length > 0 || reviews.some((review) => review.verdict !== "pass") || checks.some((check) => !check.passed));
     if (fixable) {
       this.#deps.workflows.appendEvent(jobId, "repair_round_scheduled", { nextRound: delivery.round + 1, reasons });
       this.#deps.delivery.setDeliveryStage(jobId, "authoring");
@@ -712,9 +715,7 @@ export class DeliveryLoop {
   async withdrawReadiness(jobId: string): Promise<void> {
     const delivery = this.#deps.delivery.getDelivery(jobId);
     if (delivery === undefined || delivery.archiveState === "archived") return;
-    const job = this.#deps.workflows.getJob(jobId)!;
-    const project = this.#deps.workflows.getProject(job.projectId);
-    void job;
+    const project = this.#deps.workflows.getProject(this.#deps.workflows.getJob(jobId)?.projectId ?? "");
     this.#deps.delivery.markAcceptanceStale(jobId);
     if (delivery.prNumber !== null && delivery.prState === "ready" && project !== undefined) {
       try {
