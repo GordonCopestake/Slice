@@ -26,6 +26,9 @@ function startService(script: string, directory: string, port: number) {
   delete env.SLICE_LOCAL_BASE_URL;
   delete env.SLICE_LOCAL_MODEL_ID;
   delete env.SLICE_OPENAI_MODEL_ID;
+  delete env.SLICE_OWNER_PASSWORD;
+  delete env.SLICE_REQUIREMENTS_PROVIDER;
+  delete env.SLICE_REQUIREMENTS_MODEL_ID;
   return spawn(process.execPath, [script], { env, stdio: "ignore" });
 }
 
@@ -38,7 +41,7 @@ async function waitForHealth(port: number, child: ReturnType<typeof spawn>): Pro
     try {
       const response = await fetch(`http://127.0.0.1:${port}/healthz`);
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { service: "slice", status: "ready" });
+      assert.deepEqual(await response.json(), { service: "slice", status: "ready", auth: "not_configured" });
       return;
     } catch {
       await delay(25);
