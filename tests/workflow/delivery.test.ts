@@ -221,7 +221,7 @@ async function newHarness(options: { preview?: boolean } = {}): Promise<Harness>
     hostId: "runner-a",
     buildProfile: { setup: [], checks: [{ id: "test", command: "node check.js" }] },
     gitRemoteUrl: originUrl,
-    ...(options.preview === true ? { preview: { command: "node preview-server.js 8123", port: 8123, scenarios: [{ id: "home", route: "/", width: 800, height: 600 }] } } : {}),
+    ...(options.preview === true ? { preview: { command: "node preview-server.js 8321", port: 8321, scenarios: [{ id: "home", route: "/", width: 800, height: 600 }] } } : {}),
   });
 
   const faux = fauxProvider({
