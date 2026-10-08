@@ -175,21 +175,7 @@ export class DeliveryLoop {
     }
     // Every delivery role is checked against the project's model and privacy rules before any model
     // sees the patch. A project that forbids cloud models is blocked, never quietly downgraded.
-    const project = this.#deps.workflows.getProject(job.projectId);
-    if (project !== undefined) {
-      for (const [role, profile] of [
-        ["author", this.#deps.profiles.author],
-        ["code-review", this.#deps.profiles.codeReview],
-        ["security-review", this.#deps.profiles.securityReview],
-      ] as const) {
-        const violation = modelPolicyViolation(project, role, profile, this.#deps.policy);
-        if (violation !== null) {
-          this.#deps.workflows.appendEvent(job.jobId, "blocked", { reason: "model_policy", detail: violation });
-          this.#deps.workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked");
-          return;
-        }
-      }
-    }
+    if (this.#modelPolicyViolation(job) !== null) return;
     const delivery = this.#deps.delivery.ensureDelivery(job.jobId, baseCommit);
     for (const result of baseline) {
       this.#deps.delivery.recordCheckResult({
@@ -233,6 +219,29 @@ export class DeliveryLoop {
   }
 
   /** Advance the state machine until the job quiesces (waiting, blocked, ready, or finished). */
+  /**
+   * Check the three delivery roles against the project's current model and privacy rules. Returns a
+   * stated reason, or null when every role is allowed. Rules are checked against the resolved
+   * profile, never against a prompt.
+   */
+  #modelPolicyViolation(job: JobRecord): string | null {
+    const project = this.#deps.workflows.getProject(job.projectId);
+    if (project === undefined) return null;
+    for (const [role, profile] of [
+      ["author", this.#deps.profiles.author],
+      ["code-review", this.#deps.profiles.codeReview],
+      ["security-review", this.#deps.profiles.securityReview],
+    ] as const) {
+      const violation = modelPolicyViolation(project, role, profile, this.#deps.policy);
+      if (violation !== null) {
+        this.#deps.workflows.appendEvent(job.jobId, "blocked", { reason: "model_policy", detail: violation });
+        this.#deps.workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked");
+        return violation;
+      }
+    }
+    return null;
+  }
+
   /** Archived threads whose workspace deletion has not completed - the recovery sweep's input. */
   unfinishedCleanups(): DeliveryRecord[] {
     return this.#deps.delivery.listUnfinishedCleanups();
@@ -247,6 +256,9 @@ export class DeliveryLoop {
       if (job === undefined || delivery === undefined) return;
       if (delivery.archiveState === "archived" || delivery.stage === "ready") return;
       if (job.runState === "cancelled" || job.runState === "cancel_requested" || job.runState === "paused" || job.runState === "pause_requested" || job.runState === "waiting_user") return;
+      // Project model and privacy rules are re-checked on every step, so a rule changed after the
+      // workspace was prepared cannot let a later role conversation run.
+      if (this.#modelPolicyViolation(job) !== null) return;
       const before = `${delivery.stage}:${delivery.round}:${delivery.headCommit}`;
       switch (delivery.stage) {
         case "authoring": await this.#authorRound(job, delivery); break;
@@ -562,8 +574,10 @@ export class DeliveryLoop {
       rollback = { required: false, satisfied: true, paths: [], releaseId: null, rehearsalId: null };
     } else {
       const prior = this.#deps.releases.rollbackTarget(project.projectId);
-      const rehearsal = prior === undefined ? undefined
-        : this.#deps.releases.listRehearsals(project.projectId).find((entry) => entry.releaseId === prior.releaseId && entry.outcome === "passed" && entry.evidenceArtifactId !== null);
+      // The most recent rehearsal of that release is the evidence, not the best one ever recorded:
+      // a later failure is real signal and must not be outranked by an older pass.
+      const latest = this.#deps.releases.listRehearsals(project.projectId).find((entry) => entry.releaseId === prior?.releaseId);
+      const rehearsal = latest !== undefined && latest.outcome === "passed" && latest.evidenceArtifactId !== null ? latest : undefined;
       rollback = {
         required: true,
         satisfied: rehearsal !== undefined,
@@ -572,7 +586,7 @@ export class DeliveryLoop {
         rehearsalId: rehearsal?.rehearsalId ?? null,
       };
       if (prior === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and there is no recorded release to roll back to, so rollback compatibility cannot be evidenced`);
-      else if (rehearsal === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and no passing rollback rehearsal exists for ${prior.releaseId}`);
+      else if (rehearsal === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and the latest rollback rehearsal for ${prior.releaseId} is ${latest?.outcome ?? "missing"}, not a pass`);
     }
 
     const gateRecord = {

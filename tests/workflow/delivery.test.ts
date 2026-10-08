@@ -782,3 +782,82 @@ test("two rehearsals for one project cannot share a staging workspace", async ()
     assert.equal(h.releases.listRehearsals("demo").length, 2, "each attempt is its own record");
   } finally { await h.close(); }
 });
+
+test("tightening a project's model rules stops further role work at the next step", async () => {
+  const h = await newHarness();
+  try {
+    const failing = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "check.js"), "process.exit(9);\n"));
+    h.scriptResponses({
+      "req-1": [READY_JSON, READY_JSON],
+      "author-1": [patchJson(failing)],
+      "review-1": [PASS_JSON],
+      "security-1": [PASS_JSON],
+    });
+    const job = await h.coordinator.createJob({ requestId: "pol1", payloadHash: "hash-pol1", projectId: "demo", title: "Break", requestText: "Break the check", issue: null });
+    assert.equal(h.workflows.getJob(job.jobId)!.runState, "blocked", "failing checks exhaust the rounds and block");
+
+    // The owner then forbids the provider this project's roles use. Further work must stop on the
+    // next step, not continue because the rules were satisfied when the workspace was prepared.
+    h.workflows.setProjectModelRules("demo", { allowedProviders: ["not-faux"] });
+    await h.delivery.advance(job.jobId);
+    const events = h.workflows.eventsAfter(job.jobId, 0);
+    assert.ok(events.some((event) => event.type === "blocked" && JSON.stringify(event.payload).includes("model_policy")), JSON.stringify(events.map((event) => event.type)));
+    assert.equal(h.workflows.getJob(job.jobId)!.runState, "blocked");
+  } finally { await h.close(); }
+});
+
+test("a later failed rehearsal outranks an earlier pass as rollback evidence", async () => {
+  const h = await newHarness();
+  try {
+    const plain = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "first\n"));
+    const dbPatch = makePatch(h.originDir, h.artifactsDir, (work) => {
+      mkdirSync(join(work, "migrations"), { recursive: true });
+      writeFileSync(join(work, "migrations", "001_add.sql"), "ALTER TABLE t ADD COLUMN c TEXT;\n");
+    });
+    const followPatch = makePatch(h.originDir, h.artifactsDir, (work) => {
+      writeFileSync(join(work, "migrations", "002.sql"), "CREATE INDEX i ON t (c);\n");
+    }, (work) => {
+      mkdirSync(join(work, "migrations"), { recursive: true });
+      writeFileSync(join(work, "migrations", "001_add.sql"), "ALTER TABLE t ADD COLUMN c TEXT;\n");
+    });
+    const followPatch2 = makePatch(h.originDir, h.artifactsDir, (work) => {
+      writeFileSync(join(work, "migrations", "003.sql"), "CREATE TABLE IF NOT EXISTS audit (id INTEGER);\n");
+    }, (work) => {
+      mkdirSync(join(work, "migrations"), { recursive: true });
+      writeFileSync(join(work, "migrations", "001_add.sql"), "ALTER TABLE t ADD COLUMN c TEXT;\n");
+      writeFileSync(join(work, "migrations", "002.sql"), "CREATE INDEX i ON t (c);\n");
+    });
+    h.scriptResponses({
+      "req-1": [READY_JSON, READY_JSON, READY_JSON, READY_JSON],
+      "author-1": [patchJson(plain), patchJson(dbPatch), patchJson(followPatch), patchJson(followPatch2)],
+      "review-1": [PASS_JSON, PASS_JSON, PASS_JSON, PASS_JSON],
+      "security-1": [PASS_JSON, PASS_JSON, PASS_JSON, PASS_JSON],
+    });
+    const firstJob = await h.coordinator.createJob({ requestId: "rb1a", payloadHash: "h-rb1a", projectId: "demo", title: "Notes", requestText: "Add notes", issue: null });
+    h.gitHost.ownerMerge(h.deliveryStore.getDelivery(firstJob.jobId)!.prNumber!);
+    await h.delivery.observeMerge(firstJob.jobId);
+    const target = h.releases.rollbackTarget("demo")!;
+
+    const dbJob = await h.coordinator.createJob({ requestId: "rb1b", payloadHash: "h-rb1b", projectId: "demo", title: "Column", requestText: "Add a column", issue: null });
+    const rehearsal = await h.releaseService.restoreStaging("demo", target.releaseId);
+    assert.equal(rehearsal.rehearsal.outcome, "passed");
+    await h.coordinator.steer(dbJob.jobId, "steer-rb1b", "h-steer-rb1b", dbJob.commandRevision, "Proceed");
+    await h.coordinator.retryBlocked(dbJob.jobId);
+    assert.equal(h.deliveryStore.getDelivery(dbJob.jobId)!.stage, "ready", "the passing rehearsal satisfies the gate");
+
+    // A later rehearsal of the same release fails. The older pass no longer stands.
+    h.releases.recordRehearsal({
+      rehearsalId: "reh-later-failed", projectId: "demo", releaseId: target.releaseId, hostId: "runner-a",
+      headCommit: target.commitSha, outcome: "failed", checks: [{ checkId: "test", status: "failed", exitCode: 1, outputTail: "" }],
+      evidenceArtifactId: "later-evidence", reason: "the restored release no longer passes its checks",
+    });
+    const job = h.workflows.getJob(dbJob.jobId)!;
+    await h.coordinator.steer(dbJob.jobId, "steer-rb1c", "h-steer-rb1c", job.commandRevision, "Re-check the rollback evidence");
+    await h.coordinator.retryBlocked(dbJob.jobId);
+    const settled = h.deliveryStore.getDelivery(dbJob.jobId)!;
+    assert.notEqual(settled.stage, "ready", "a failed latest rehearsal withdraws the claim");
+    const record = h.deliveryStore.getGateRecord(dbJob.jobId) as { reasons: string[]; rollbackCompatibility: { satisfied: boolean } };
+    assert.equal(record.rollbackCompatibility.satisfied, false);
+    assert.ok(record.reasons.some((reason) => reason.includes("is failed, not a pass")), JSON.stringify(record.reasons));
+  } finally { await h.close(); }
+});

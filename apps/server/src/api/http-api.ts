@@ -384,6 +384,31 @@ export class SliceApi {
       return;
     }
 
+    const modelRulesEdit = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/model-rules$/.exec(path);
+    if (method === "POST" && modelRulesEdit !== null) {
+      const body = asObject(await readBody(request));
+      const project = this.#deps.workflows.getProject(modelRulesEdit[1]!);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (body.modelRules === null || typeof body.modelRules !== "object" || Array.isArray(body.modelRules)) throw new TypeError("modelRules must be an object");
+      const rules = body.modelRules as Record<string, JsonValue>;
+      const list = (value: JsonValue | undefined, field: string): string[] => {
+        if (value === undefined || value === null) return [];
+        if (!Array.isArray(value)) throw new TypeError(`${field} must be an array of names`);
+        return value.map((item) => { if (typeof item !== "string") throw new TypeError(`${field} entries must be strings`); return item; });
+      };
+      const updated = this.#deps.workflows.setProjectModelRules(modelRulesEdit[1]!, {
+        allowedProviders: list(rules.allowedProviders, "allowedProviders"),
+        allowedModelIds: list(rules.allowedModelIds, "allowedModelIds"),
+        allowCloud: rules.allowCloud === undefined ? true : rules.allowCloud === true,
+        localOnlyRoles: list(rules.localOnlyRoles, "localOnlyRoles"),
+      });
+      json(response, 200, { project: updated });
+      return;
+    }
+
     const toolchainEdit = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/toolchain$/.exec(path);
     if (method === "POST" && toolchainEdit !== null) {
       const body = asObject(await readBody(request));

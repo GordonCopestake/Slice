@@ -625,6 +625,18 @@ export class WorkflowStore {
   }
 
   /**
+   * Refine a project's model and privacy rules. Roles already admitted are not retroactively
+   * punished, but the delivery loop re-checks on every step, so a tightened rule stops further work.
+   */
+  setProjectModelRules(projectId: string, rules: Partial<ModelRules>): ProjectRecord {
+    assertId("projectId", projectId);
+    if (this.getProject(projectId) === undefined) throw new Error("project_not_found");
+    this.#database.prepare("UPDATE slice_projects SET model_rules_json = ?, updated_at = ? WHERE project_id = ?")
+      .run(JSON.stringify(modelRules(rules)), Date.now(), projectId);
+    return this.getProject(projectId)!;
+  }
+
+  /**
    * Refine a project's declared probes. The new probe set has a different digest, so any existing
    * attestation stops satisfying the project until the worker is probed again.
    */
