@@ -185,9 +185,18 @@ type Harness = {
   close: () => Promise<void>;
 };
 
-async function newHarness(): Promise<Harness> {
+async function newHarness(options: { preview?: boolean } = {}): Promise<Harness> {
   const directory = mkdtempSync(join(tmpdir(), "slice-delivery-"));
   const source = makeSourceRepo(directory);
+  let allowedBrowser: string | undefined;
+  if (options.preview === true) {
+    // A preview server in the source, and a registered fake browser that writes a PNG.
+    writeFileSync(join(source, "preview-server.js"), "const http = require('node:http');\nconst port = Number(process.argv[2]);\nhttp.createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<h1>preview</h1>'); }).listen(port, '127.0.0.1');\n");
+    git(["add", "-A"], source);
+    git([...gitConfig(), "commit", "-q", "-m", "preview server"], source);
+    allowedBrowser = join(directory, "fake-browser.sh");
+    writeFileSync(allowedBrowser, "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --screenshot=*) printf '\\x89PNG fake' > \"${arg#--screenshot=}\";; esac; done\nexit 0\n", { mode: 0o755 });
+  }
   const originDir = join(directory, "origin.git");
   git(["clone", "--bare", "-q", source, originDir]);
   git(["-C", originDir, "symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -195,7 +204,7 @@ async function newHarness(): Promise<Harness> {
 
   const runnerRoot = join(directory, "runner-root");
   mkdirSync(runnerRoot, { mode: 0o700 });
-  writeFileSync(join(runnerRoot, ".runner.json"), JSON.stringify({ allowedSources: [originUrl] }));
+  writeFileSync(join(runnerRoot, ".runner.json"), JSON.stringify({ allowedSources: [originUrl], ...(allowedBrowser === undefined ? {} : { allowedBrowser }) }));
   const transport = new LocalRunnerTransport(RUNNER_ENTRY, runnerRoot);
 
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
@@ -212,6 +221,7 @@ async function newHarness(): Promise<Harness> {
     hostId: "runner-a",
     buildProfile: { setup: [], checks: [{ id: "test", command: "node check.js" }] },
     gitRemoteUrl: originUrl,
+    ...(options.preview === true ? { preview: { command: "node preview-server.js 8321", port: 8321, scenarios: [{ id: "home", route: "/", width: 800, height: 600 }] } } : {}),
   });
 
   const faux = fauxProvider({
@@ -550,4 +560,54 @@ test("role configuration refuses reviewers that are not distinct from the author
     SLICE_SECURITY_REVIEW_PROVIDER: "q", SLICE_SECURITY_REVIEW_MODEL_ID: "m1",
   });
   assert.ok(ok !== null);
+});
+
+test("preview evidence: baseline and after screenshots come from the running preview and survive cleanup", async () => {
+  const h = await newHarness({ preview: true });
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "office notes\n"));
+    const jobId = await createReadyJob(h, "req9", [patch]);
+
+    const artifacts = h.deliveryStore.listArtifacts(jobId);
+    const baseline = artifacts.find((artifact) => artifact.kind === "screenshot-baseline");
+    const after = artifacts.find((artifact) => artifact.kind === "screenshot-after");
+    assert.ok(baseline !== undefined && after !== undefined, "both phases captured");
+    assert.equal(readFileSync(baseline.path).subarray(0, 4).toString("hex"), "89504e47", "the baseline PNG is the real capture");
+    const meta = artifacts.find((artifact) => artifact.kind === "screenshot-meta");
+    assert.ok(meta !== undefined);
+    const metaJson = JSON.parse(readFileSync(meta.path, "utf8")) as { scenario: string; viewport: { width: number }; commit: string; phase: string };
+    assert.equal(metaJson.scenario, "home");
+    assert.equal(metaJson.viewport.width, 800);
+
+    const events = h.workflows.eventsAfter(jobId, 0);
+    const captures = events.filter((event) => event.type === "screenshot_captured");
+    assert.ok(captures.some((event) => (event.payload as { phase: string }).phase === "baseline"));
+    assert.ok(captures.some((event) => (event.payload as { phase: string }).phase === "after"));
+    // Baseline and after are captured at different commits.
+    const commits = new Set(captures.map((event) => (event.payload as { commit: string }).commit));
+    assert.equal(commits.size, 2);
+
+    const merged = h.gitHost.ownerMerge(h.deliveryStore.getDelivery(jobId)!.prNumber!);
+    void merged;
+    assert.equal(await h.delivery.observeMerge(jobId), "merged");
+    assert.equal(existsSync(join(h.runnerRoot, jobId)), false, "the preview and workspace are cleaned");
+    const kept = h.deliveryStore.listArtifacts(jobId);
+    assert.ok(kept.some((artifact) => artifact.kind === "screenshot-baseline" && existsSync(artifact.path)), "screenshot evidence survives cleanup");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a project with no preview states screenshots are not applicable", async () => {
+  const h = await newHarness();
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "office notes\n"));
+    const jobId = await createReadyJob(h, "req10", [patch]);
+    const events = h.workflows.eventsAfter(jobId, 0);
+    const stated = events.find((event) => event.type === "screenshots_not_applicable");
+    assert.ok(stated !== undefined, "no UI: the reason is stated, not faked with an image");
+    assert.equal(h.deliveryStore.listArtifacts(jobId).some((artifact) => artifact.kind.startsWith("screenshot")), false);
+  } finally {
+    await h.close();
+  }
 });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -15,6 +16,10 @@ import { ApplicationStateStore } from "../../apps/server/src/state/application-s
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
+import { StatusReports } from "../../apps/server/src/workflow/status-reports.js";
+import { NotificationService } from "../../apps/server/src/workflow/notifications.js";
+import { NotificationStore } from "../../apps/server/src/records/notification-store.js";
+import { StatusStore } from "../../apps/server/src/records/status-store.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner } from "../support/fake-runner.js";
 
@@ -32,7 +37,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(options: { deliveryStore?: DeliveryStore } = {}): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -42,7 +47,7 @@ async function startStack(options: { deliveryStore?: DeliveryStore } = {}): Prom
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
   const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner());
-  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }) });
+  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }), ...(options.makeNotifications === undefined ? {} : { notifications: options.makeNotifications(workflows, state) }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -306,5 +311,223 @@ test("an issue maps to one job with its source link, and a second request shows 
   } finally {
     globalThis.fetch = originalFetch;
     await stack.close();
+  }
+});
+
+test("status report settings and history are exposed through the API", async () => {
+  const stack = await startStack({ makeStatus: (workflows, state) => new StatusReports({ workflows, deliveryStore: null, status: StatusStore.open(state.database) }) });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(QUESTION_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "web-r1", projectId: "demo", title: "Reports", request: "Add reporting" } });
+    assert.equal(created.status, 201);
+    const jobId = created.body.job.jobId;
+
+    const initial = await stack.call(`/api/jobs/${jobId}/status-reports`);
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.plan.intervalMinutes, 10);
+    assert.deepEqual(initial.body.reports, [], "no report exists before the first tick");
+
+    // An interval outside 1-60 is rejected and the saved interval is unchanged.
+    const bad = await stack.call(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: { enabled: true, intervalMinutes: 90 } });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error, "interval_out_of_range");
+    const afterBad = await stack.call(`/api/jobs/${jobId}/status-reports`);
+    assert.equal(afterBad.body.plan.intervalMinutes, 10);
+
+    const updated = await stack.call(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: { enabled: true, intervalMinutes: 30 } });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.plan.intervalMinutes, 30);
+    assert.equal(updated.body.job.reportIntervalMinutes, 30, "the job view shows the same setting");
+    assert.equal(updated.body.plan.generation, 2, "a settings change starts a new generation");
+
+    const missing = await stack.call("/api/jobs/no-such-job/status-reports");
+    assert.equal(missing.status, 404);
+  } finally {
+    await stack.close();
+  }
+});
+
+test("telegram linking state and the job notification view are exposed", async () => {
+  const stack = await startStack({
+    makeNotifications: (workflows, state) => new NotificationService({
+      workflows,
+      notifications: NotificationStore.open(state.database),
+      status: StatusStore.open(state.database),
+      telegram: null,
+    }),
+  });
+  try {
+    await login(stack);
+    const status = await stack.call("/api/telegram");
+    assert.equal(status.status, 200);
+    assert.equal(status.body.telegram.botConfigured, false, "no bot token: the service says so instead of pretending");
+    assert.equal(status.body.telegram.linked, false);
+
+    const code = await stack.call("/api/telegram/link-code", { method: "POST", body: {} });
+    assert.equal(code.status, 200);
+    assert.match(code.body.code, /^[a-f0-9]{12}$/);
+
+    const periodic = await stack.call("/api/telegram/periodic", { method: "POST", body: { enabled: true } });
+    assert.equal(periodic.status, 200);
+    assert.equal(periodic.body.telegram.periodicEnabled, true);
+
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(QUESTION_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "web-n1", projectId: "demo", title: "Notify", request: "Add alerts" } });
+    const notifications = await stack.call(`/api/jobs/${created.body.job.jobId}/notifications`);
+    assert.equal(notifications.status, 200);
+    assert.deepEqual(notifications.body.notifications, [], "nothing queued while the channel is unconfigured");
+  } finally {
+    await stack.close();
+  }
+});
+
+test("the thread picker searches active and archived views without touching workers", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-search-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON), fauxAssistantMessage(READY_JSON)]);
+    const a = await stack.call("/api/jobs", { method: "POST", body: { requestId: "s1", projectId: "demo", title: "Goods ready screen", request: "Add a goods ready screen" } });
+    const b = await stack.call("/api/jobs", { method: "POST", body: { requestId: "s2", projectId: "demo", title: "Allocation report", request: "Add an allocation report" } });
+
+    const byTitle = await stack.call("/api/jobs?query=allocation");
+    assert.deepEqual(byTitle.body.jobs.map((job: { jobId: string }) => job.jobId), [b.body.job.jobId]);
+
+    // Archive job a through the delivery records, exactly as a verified merge would.
+    deliveryStore.ensureDelivery(a.body.job.jobId, "abc1234");
+    deliveryStore.setPr(a.body.job.jobId, { number: 47, url: "https://example.test/pr/47", state: "ready" });
+    deliveryStore.recordMerge(a.body.job.jobId, "def5678", "test archive");
+
+    const active = await stack.call("/api/jobs?view=active");
+    assert.deepEqual(active.body.jobs.map((job: { jobId: string }) => job.jobId), [b.body.job.jobId], "archived threads leave the active view");
+    const archived = await stack.call("/api/jobs?view=archived");
+    assert.deepEqual(archived.body.jobs.map((job: { jobId: string }) => job.jobId), [a.body.job.jobId]);
+    assert.equal(archived.body.jobs[0].prNumber, 47);
+
+    // Search by PR number works in the archived view without resuming anything.
+    const byPr = await stack.call("/api/jobs?view=archived&query=47");
+    assert.deepEqual(byPr.body.jobs.map((job: { jobId: string }) => job.jobId), [a.body.job.jobId]);
+
+    // Archived threads stay read-only.
+    const steer = await stack.call(`/api/jobs/${a.body.job.jobId}/steer`, { method: "POST", body: { requestId: "s3", instruction: "reopen", expectedCommandRevision: 1 } });
+    assert.equal(steer.status, 409);
+    assert.equal(steer.body.error, "job_archived");
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a merged archived thread offers a linked follow-up job and stays untouched", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-followup-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const workflows = WorkflowStore.open(state.database);
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore, makeStatus: (workflows, state2) => new StatusReports({ workflows, deliveryStore, status: StatusStore.open(state2.database) }) });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON), fauxAssistantMessage(QUESTION_JSON)]);
+    const original = await stack.call("/api/jobs", { method: "POST", body: { requestId: "f1", projectId: "demo", title: "Merged work", request: "Do the thing" } });
+    const jobId = original.body.job.jobId;
+
+    // Follow-up before archiving is refused: active work uses steering.
+    const early = await stack.call(`/api/jobs/${jobId}/follow-up`, { method: "POST", body: { requestId: "f2", title: "too early", request: "more" } });
+    assert.equal(early.status, 409);
+    assert.equal(early.body.error, "job_not_archived");
+
+    deliveryStore.ensureDelivery(jobId, "abc1234");
+    deliveryStore.recordMerge(jobId, "def5678", "test merge");
+
+    const follow = await stack.call(`/api/jobs/${jobId}/follow-up`, { method: "POST", body: { requestId: "f3", title: "Follow-up work", request: "Extend the merged feature" } });
+    assert.equal(follow.status, 201);
+    assert.equal(follow.body.predecessorJobId, jobId);
+
+    const originalView = await stack.call(`/api/jobs/${jobId}`);
+    assert.equal(originalView.body.archived, true);
+    assert.equal(originalView.body.followUpJobId, follow.body.job.jobId);
+    const followView = await stack.call(`/api/jobs/${follow.body.job.jobId}`);
+    assert.equal(followView.body.predecessorJobId, jobId);
+    assert.equal(followView.body.archived, false, "the follow-up is a live thread of its own");
+
+    // The follow-up is a real thread: it carries its own reporting plan from creation.
+    const followReports = await stack.call(`/api/jobs/${follow.body.job.jobId}/status-reports`);
+    assert.equal(followReports.status, 200);
+    assert.equal(followReports.body.plan.intervalMinutes, 10);
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("evidence artifacts download safely, expire honestly, and never resolve a URL to a path", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-artifact-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const workflows = WorkflowStore.open(state.database);
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "art1", projectId: "demo", title: "Evidence", request: "Keep the proof" } });
+    const jobId = created.body.job.jobId;
+
+    const content = "final packet contents";
+    const digest = createHash("sha256").update(content).digest("hex");
+    const file = join(directory, "packet.json");
+    writeFileSync(file, content);
+    deliveryStore.ensureDelivery(jobId, "abc1234");
+    deliveryStore.recordArtifact({ jobId, id: "final-packet", kind: "packet", digest, sizeBytes: content.length, path: file, verificationKey: "k", expiresAt: Date.now() + 86_400_000 });
+    deliveryStore.recordArtifact({ jobId, id: "old-log", kind: "log", digest, sizeBytes: 3, path: file, verificationKey: "k", expiresAt: Date.now() - 1_000 });
+
+    const response = await fetch(`${stack.base}/api/jobs/${jobId}/artifacts/final-packet`, { headers: { cookie: stack.cookie } });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-disposition") ?? "", /attachment/);
+    assert.equal(await response.text(), content);
+
+    const expired = await stack.call(`/api/jobs/${jobId}/artifacts/old-log`);
+    assert.equal(expired.status, 410);
+    assert.equal(expired.body.error, "artifact_expired");
+    assert.equal(expired.body.digest, digest, "the manifest record remains after the file expires");
+
+    const missing = await stack.call(`/api/jobs/${jobId}/artifacts/nothing-here`);
+    assert.equal(missing.status, 404);
+
+    // A path-traversal attempt is rejected by the id rule before any file access.
+    const traversal = await fetch(`${stack.base}/api/jobs/${jobId}/artifacts/..%2Fstate`, { headers: { cookie: stack.cookie } });
+    assert.ok(traversal.status === 404 || traversal.status === 400);
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });

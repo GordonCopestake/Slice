@@ -38,6 +38,10 @@ export interface RunnerGateway {
   verifyHead(input: { jobId: string; hostId: string }): Promise<HeadState>;
   readSource(input: { jobId: string; hostId: string; path: string }): Promise<string>;
   exportCommit(input: { jobId: string; hostId: string; commit: string }): Promise<Buffer>;
+  startPreview(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; command: string; port: number }): Promise<{ status: string; port: number }>;
+  previewStatus(input: { jobId: string; hostId: string }): Promise<{ status: string; port?: number }>;
+  captureScreenshot(input: { jobId: string; hostId: string; scenarioId: string; route: string; commit: string; width: number; height: number }): Promise<Buffer>;
+  stopPreview(input: { jobId: string; hostId: string }): Promise<void>;
   cleanupJob(input: { jobId: string; hostId: string }): Promise<void>;
   cancelRunning(input: { jobId: string; hostId: string }): Promise<void>;
   reconcile(input: { jobId: string; hostId: string }): Promise<{ operationId: string; status: string }[]>;
@@ -193,6 +197,35 @@ export class RunnerAdapter implements RunnerGateway {
     const response = await this.#transportFor(input.hostId).request({ op: "export_commit", jobId: input.jobId, commit: input.commit });
     okOrThrow(response, "export_commit");
     return Buffer.from(String(response.bundleBase64 ?? ""), "base64");
+  }
+
+  async startPreview(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; command: string; port: number }): Promise<{ status: string; port: number }> {
+    const response = await this.#transportFor(input.hostId).request({
+      op: "start_preview", jobId: input.jobId, operationId: input.operationId, leaseGeneration: input.leaseGeneration, command: input.command, port: input.port,
+    });
+    okOrThrow(response, "start_preview");
+    return { status: String(response.status ?? "running"), port: Number(response.port ?? input.port) };
+  }
+
+  async previewStatus(input: { jobId: string; hostId: string }): Promise<{ status: string; port?: number }> {
+    const response = await this.#transportFor(input.hostId).request({ op: "preview_status", jobId: input.jobId });
+    okOrThrow(response, "preview_status");
+    return { status: String(response.status ?? "absent"), ...(response.port !== undefined ? { port: Number(response.port) } : {}) };
+  }
+
+  async captureScreenshot(input: { jobId: string; hostId: string; scenarioId: string; route: string; commit: string; width: number; height: number }): Promise<Buffer> {
+    const response = await this.#transportFor(input.hostId).request({
+      op: "capture_screenshot", jobId: input.jobId, scenarioId: input.scenarioId, route: input.route, commit: input.commit, width: input.width, height: input.height,
+    });
+    okOrThrow(response, "capture_screenshot");
+    return Buffer.from(String(response.pngBase64 ?? ""), "base64");
+  }
+
+  async stopPreview(input: { jobId: string; hostId: string }): Promise<void> {
+    const status = await this.previewStatus(input);
+    if (status.status === "absent") return;
+    const response = await this.#transportFor(input.hostId).request({ op: "stop_preview", jobId: input.jobId });
+    okOrThrow(response, "stop_preview");
   }
 
   async cleanupJob(input: { jobId: string; hostId: string }): Promise<void> {

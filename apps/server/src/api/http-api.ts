@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -8,6 +9,8 @@ import type { DeliveryStore } from "../records/delivery-store.js";
 import { verificationKey } from "../records/delivery-store.js";
 import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
 import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
+import type { StatusReports } from "../workflow/status-reports.js";
+import type { NotificationService } from "../workflow/notifications.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -17,6 +20,8 @@ export type ApiDependencies = {
   webDirectory: string;
   deliveryStore?: DeliveryStore;
   delivery?: DeliveryLoop | null;
+  status?: StatusReports | null;
+  notifications?: NotificationService | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -212,6 +217,37 @@ export class SliceApi {
       return;
     }
 
+    if (path === "/api/telegram" || path.startsWith("/api/telegram/")) {
+      if (this.#deps.notifications === undefined || this.#deps.notifications === null) {
+        json(response, 404, { error: "notifications_not_configured" });
+        return;
+      }
+      const rest = path.slice("/api/telegram".length);
+      if (method === "GET" && rest === "") {
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      if (method === "POST" && rest === "/link-code") {
+        const code = this.#deps.notifications.startLinkCode();
+        json(response, 200, { code, instructions: `Send "/link ${code}" to your Slice bot. The code works once and expires in 15 minutes.` });
+        return;
+      }
+      if (method === "POST" && rest === "/unlink") {
+        this.#deps.notifications.unlinkTelegram();
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      if (method === "POST" && rest === "/periodic") {
+        const body = asObject(await readBody(request));
+        if (typeof body.enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+        this.#deps.notifications.setPeriodicReports(body.enabled);
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      json(response, 404, { error: "not_found" });
+      return;
+    }
+
     if (method === "GET" && path === "/api/hosts") {
       json(response, 200, { hosts: this.#deps.workflows.listHosts() });
       return;
@@ -254,6 +290,18 @@ export class SliceApi {
             : [],
         },
         ...(typeof body.gitRemoteUrl === "string" ? { gitRemoteUrl: body.gitRemoteUrl } : {}),
+        ...(body.preview === undefined || body.preview === null ? {} : (() => {
+          if (typeof body.preview !== "object" || Array.isArray(body.preview)) throw new TypeError("preview must be an object");
+          const preview = body.preview as Record<string, JsonValue>;
+          const scenarios = Array.isArray(preview.scenarios)
+            ? preview.scenarios.map((item) => {
+                if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("scenario entries must be objects");
+                const scenario = item as Record<string, unknown>;
+                return { id: String(scenario.id ?? ""), route: String(scenario.route ?? ""), width: Number(scenario.width), height: Number(scenario.height) };
+              })
+            : [];
+          return { preview: { command: String(preview.command ?? ""), port: Number(preview.port), scenarios } };
+        })()),
       });
       json(response, 201, { project });
       return;
@@ -286,7 +334,22 @@ export class SliceApi {
     }
 
     if (method === "GET" && path === "/api/jobs") {
-      json(response, 200, { jobs: this.#deps.workflows.listJobs().map(publicJob) });
+      // Searchable thread picker: Active and Archived views, searchable by title, project, job id,
+      // PR number, branch, and creation date. Searching never attaches to or resumes a worker.
+      const view = url.searchParams.get("view") === "archived" ? "archived" : "active";
+      const query = (url.searchParams.get("query") ?? "").trim().toLowerCase().slice(0, 100);
+      const rows = this.#deps.workflows.listJobs()
+        .map((job) => ({ job, delivery: this.#deps.deliveryStore?.getDelivery(job.jobId), workspace: this.#deps.workflows.getWorkspace(job.jobId) }))
+        .filter((row) => (view === "archived") === (row.delivery?.archiveState === "archived"))
+        .filter((row) => query.length === 0
+          || `${row.job.title} ${row.job.projectId} ${row.job.jobId} ${row.delivery?.prNumber ?? ""} ${row.workspace?.branch ?? ""} ${new Date(row.job.createdAt).toISOString().slice(0, 10)}`.toLowerCase().includes(query))
+        .map((row) => ({
+          ...publicJob(row.job),
+          archived: row.delivery?.archiveState === "archived",
+          prNumber: row.delivery?.prNumber ?? null,
+          branch: row.workspace?.branch ?? null,
+        }));
+      json(response, 200, { jobs: rows });
       return;
     }
     if (method === "POST" && path === "/api/jobs") {
@@ -308,6 +371,7 @@ export class SliceApi {
       const issue = issueFromBody(body.issue, project.repoSlug);
       const payloadHash = hashJson({ projectId, title, request: requestText, issue: body.issue ?? null });
       const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title, requestText, issue });
+      this.#deps.status?.onJobCreated(job);
       json(response, 201, { job: publicJob(job) });
       return;
     }
@@ -348,6 +412,7 @@ export class SliceApi {
       const payloadHash = hashJson({ projectId, issue: snapshot, request: requestText });
       // A GitHub title is untrusted and can outgrow the job title limit; it is trimmed, not rejected.
       const job = await this.#deps.coordinator.createJob({ requestId, payloadHash, projectId, title: selected.title.slice(0, 200) || `Issue #${selected.number}`, requestText, issue: snapshot });
+      this.#deps.status?.onJobCreated(job);
       json(response, 201, { job: publicJob(job), existing: false });
       return;
     }
@@ -367,7 +432,69 @@ export class SliceApi {
           questions: this.#deps.workflows.openQuestions(jobId),
           events: this.#deps.workflows.eventsAfter(jobId, Math.max(this.#deps.workflows.latestEventSeq(jobId) - 50, 0)),
           workspace: this.#deps.workflows.getWorkspace(jobId) ?? null,
+          archived: this.#deps.deliveryStore?.getDelivery(jobId)?.archiveState === "archived",
+          predecessorJobId: this.#deps.workflows.getJobLink(jobId)?.predecessorJobId ?? null,
+          followUpJobId: this.#deps.workflows.getFollowUpJob(jobId)?.jobId ?? null,
         });
+        return;
+      }
+      if (method === "GET" && rest.startsWith("/artifacts/")) {
+        if (this.#deps.deliveryStore === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        // Artifact ids are validated against the job; a URL parameter never becomes a path.
+        const artifact = this.#deps.deliveryStore.getArtifact(jobId, rest.slice("/artifacts/".length));
+        if (artifact === undefined) {
+          json(response, 404, { error: "artifact_not_found" });
+          return;
+        }
+        if (artifact.expiresAt < Date.now()) {
+          // Retention removed the file; the manifest and policy record remain visible.
+          json(response, 410, { error: "artifact_expired", kind: artifact.kind, digest: artifact.digest, expiresAt: artifact.expiresAt, message: "This evidence artifact has expired. Its manifest record remains." });
+          return;
+        }
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(artifact.path);
+        } catch {
+          json(response, 410, { error: "artifact_file_missing", kind: artifact.kind, digest: artifact.digest });
+          return;
+        }
+        if (createHash("sha256").update(bytes).digest("hex") !== artifact.digest) {
+          json(response, 500, { error: "artifact_digest_mismatch", kind: artifact.kind });
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          // Served as an attachment so evidence can never execute inside the authenticated page.
+          "content-disposition": `attachment; filename="${jobId}-${artifact.id}"`,
+          "cache-control": "no-store",
+        });
+        response.end(bytes);
+        return;
+      }
+      if (method === "POST" && rest === "/follow-up") {
+        const delivery = this.#deps.deliveryStore?.getDelivery(jobId);
+        if (delivery === undefined || delivery.archiveState !== "archived") {
+          json(response, 409, { error: "job_not_archived", message: "Only an archived thread needs a follow-up job; active work uses steering." });
+          return;
+        }
+        const body = asObject(await readBody(request));
+        const requestId = requiredId(body, "requestId");
+        const title = requiredString(body, "title", 200);
+        const requestText = requiredString(body, "request", 100_000);
+        const created = await this.#deps.coordinator.createJob({
+          requestId,
+          payloadHash: hashJson({ predecessor: jobId, projectId: job.projectId, title, request: requestText }),
+          projectId: job.projectId,
+          title,
+          requestText,
+          issue: null,
+        });
+        this.#deps.workflows.recordJobLink(created.jobId, jobId);
+        this.#deps.status?.onJobCreated(created);
+        json(response, 201, { job: publicJob(created), predecessorJobId: jobId });
         return;
       }
       if (method === "GET" && rest === "/events") {
@@ -383,7 +510,10 @@ export class SliceApi {
         return;
       }
       if (method === "POST" && rest === "/cancel") {
-        json(response, 200, { job: publicJob(await this.#deps.coordinator.cancel(jobId)) });
+        const job = await this.#deps.coordinator.cancel(jobId);
+        // A cancelled job records one final status and stops its periodic reports.
+        this.#deps.status?.finalize(jobId, "the job was cancelled; no further periodic reports will be sent");
+        json(response, 200, { job: publicJob(job) });
         return;
       }
       if (method === "POST" && rest === "/steer") {
@@ -399,8 +529,54 @@ export class SliceApi {
         if (typeof expected !== "number" || !Number.isSafeInteger(expected)) throw new TypeError("expectedCommandRevision must be an integer");
         const payloadHash = hashJson({ jobId, instruction, expectedCommandRevision: expected });
         const result = await this.#deps.coordinator.steer(jobId, requestId, payloadHash, expected, instruction);
+        if (result.recorded) this.#deps.status?.onSteering(jobId);
         // A stale command revision returns the current state without applying the instruction.
         json(response, result.recorded ? 200 : 409, { job: publicJob(result.job), recorded: result.recorded });
+        return;
+      }
+      if (method === "GET" && rest === "/notifications") {
+        if (this.#deps.notifications === undefined || this.#deps.notifications === null) {
+          json(response, 404, { error: "notifications_not_configured" });
+          return;
+        }
+        json(response, 200, { notifications: this.#deps.notifications.notificationsFor(jobId) });
+        return;
+      }
+      if (method === "GET" && rest === "/status-reports") {
+        if (this.#deps.status === undefined || this.#deps.status === null) {
+          json(response, 404, { error: "reports_not_configured" });
+          return;
+        }
+        const plan = this.#deps.workflows.getJob(jobId) === undefined ? undefined : this.#deps.status.planFor(jobId);
+        if (plan === undefined) {
+          json(response, 404, { error: "job_not_found" });
+          return;
+        }
+        json(response, 200, { plan, reports: this.#deps.status.reportsFor(jobId) });
+        return;
+      }
+      if (method === "POST" && rest === "/report-settings") {
+        if (this.#deps.status === undefined || this.#deps.status === null) {
+          json(response, 404, { error: "reports_not_configured" });
+          return;
+        }
+        const body = asObject(await readBody(request));
+        const enabled = body.enabled;
+        const intervalMinutes = body.intervalMinutes;
+        if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+        if (typeof intervalMinutes !== "number" || !Number.isSafeInteger(intervalMinutes)) throw new TypeError("intervalMinutes must be an integer");
+        if (intervalMinutes < 1 || intervalMinutes > 60) {
+          // Rejected without changing the saved interval, per the verification table.
+          json(response, 400, { error: "interval_out_of_range", message: "Report intervals must be between 1 and 60 minutes; the saved interval is unchanged" });
+          return;
+        }
+        const job = this.#deps.workflows.setReportSettings(jobId, enabled, intervalMinutes);
+        if (job === undefined) {
+          json(response, 404, { error: "job_not_found" });
+          return;
+        }
+        const plan = this.#deps.status.settingsChanged(jobId, enabled, intervalMinutes);
+        json(response, 200, { job: publicJob(job), plan });
         return;
       }
       if (method === "POST" && rest === "/requirements/answers") {

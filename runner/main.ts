@@ -8,7 +8,7 @@
  *   node main.js --supervise <journalDir> <worktree> <operationId> <timeoutMs> <command...>
  */
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -45,6 +45,10 @@ type Request =
   | { op: "reconcile_apply"; jobId: string; operationId: string }
   | { op: "read_source"; jobId: string; path: string }
   | { op: "export_commit"; jobId: string; commit: string }
+  | { op: "start_preview"; jobId: string; operationId: string; leaseGeneration: number; command: string; port: number; ttlMs?: number }
+  | { op: "preview_status"; jobId: string }
+  | { op: "capture_screenshot"; jobId: string; scenarioId: string; route: string; commit: string; width: number; height: number }
+  | { op: "stop_preview"; jobId: string }
   | { op: "cleanup_job"; jobId: string };
 
 type Response =
@@ -165,16 +169,18 @@ function git(args: string[]): { ok: boolean; output: string } {
   return { ok: result.status === 0, output: output.slice(0, 4_000) };
 }
 
-function readConfig(root: string): { allowedSources: string[] } {
+function readConfig(root: string): { allowedSources: string[]; allowedBrowser: string | null } {
   try {
-    const parsed = JSON.parse(readFileSync(join(root, ".runner.json"), "utf8")) as { allowedSources?: unknown };
+    const parsed = JSON.parse(readFileSync(join(root, ".runner.json"), "utf8")) as { allowedSources?: unknown; allowedBrowser?: unknown };
     if (!Array.isArray(parsed.allowedSources) || parsed.allowedSources.some((s) => typeof s !== "string" || s.length === 0)) {
       throw new Error("missing allowedSources");
     }
-    return { allowedSources: parsed.allowedSources as string[] };
+    // The screenshot browser is a registered absolute path, never a model-supplied command.
+    const browser = typeof parsed.allowedBrowser === "string" && parsed.allowedBrowser.startsWith("/") ? parsed.allowedBrowser : null;
+    return { allowedSources: parsed.allowedSources as string[], allowedBrowser: browser };
   } catch {
     // With no explicit allowlist the runner accepts nothing; registration is deliberate.
-    return { allowedSources: [] };
+    return { allowedSources: [], allowedBrowser: null };
   }
 }
 
@@ -510,6 +516,134 @@ function handleCleanup(journal: Journal, root: string, request: Extract<Request,
   return { ok: true, removed: true };
 }
 
+/**
+ * Previews are long-lived supervised processes on the runner, bound by the application itself to
+ * the host's loopback. The control service exposes them only as a stated URL; closing a preview
+ * page in a browser never touches the job. The preview process is a journaled operation, so
+ * cancellation, reconciliation, and cleanup treat it exactly like any other supervised work.
+ */
+function handleStartPreview(journal: Journal, root: string, request: Extract<Request, { op: "start_preview" }>): Response {
+  assertId(request.jobId, "jobId");
+  assertId(request.operationId, "operationId");
+  if (!COMMAND_PATTERN.test(request.command)) return fail("command_not_allowed");
+  if (!Number.isSafeInteger(request.port) || request.port < 1024 || request.port > 65_535) return fail("preview_port_invalid");
+  const jobDir = join(root, request.jobId);
+  const worktreePath = join(jobDir, "author");
+  if (!existsSync(worktreePath)) return fail("workspace_missing");
+  const lease = journal.lease(request.jobId, request.leaseGeneration);
+  if (!lease.allowed) return fail(lease.reason ?? "lease_denied");
+
+  const recordPath = join(jobDir, ".preview.json");
+  const existing = readPreviewRecord(recordPath);
+  if (existing !== undefined) {
+    if (pidAliveOf(journal, existing.operationId)) return { ok: true, status: "running", reused: true, port: existing.port };
+    // A dead preview must be reconciled to a settled state before a new one is planned; the old
+    // operation id stays settled and a fresh id (chosen by the caller) plans cleanly.
+    const resolved = resolveRunning(journal, existing.operationId);
+    journal.setStatus(existing.operationId, resolved.status as "succeeded" | "failed" | "uncertain", resolved.exitCode);
+    try {
+      rmSync(recordPath, { force: true });
+    } catch { /* the record is disposable */ }
+  }
+
+  journal.plan(request.operationId, request.jobId, request.leaseGeneration, "preview");
+  const ttlMs = request.ttlMs ?? 2 * 3_600_000;
+  const child = spawn(process.execPath, [
+    process.argv[1] ?? "main.js", "--supervise", journal.dir, worktreePath, request.operationId, String(ttlMs), ...request.command.split(/\s+/),
+  ], { detached: true, stdio: "ignore" });
+  if (child.pid === undefined) {
+    journal.setStatus(request.operationId, "failed");
+    return fail("spawn_failed");
+  }
+  try {
+    writeFileSync(journal.pidFile(request.operationId), String(child.pid), { mode: 0o600 });
+    writeFileSync(recordPath, JSON.stringify({ operationId: request.operationId, port: request.port }), { mode: 0o600 });
+  } catch { /* the supervisor's own pid write still stands */ }
+  child.unref();
+  return { ok: true, status: "running", port: request.port };
+}
+
+function readPreviewRecord(recordPath: string): { operationId: string; port: number } | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(recordPath, "utf8")) as { operationId?: unknown; port?: unknown };
+    if (typeof parsed.operationId !== "string" || typeof parsed.port !== "number") return undefined;
+    return { operationId: parsed.operationId, port: parsed.port };
+  } catch {
+    return undefined;
+  }
+}
+
+function pidAliveOf(journal: Journal, operationId: string): boolean {
+  try {
+    const pid = Number(readFileSync(journal.pidFile(operationId), "utf8").trim());
+    return Number.isInteger(pid) && pidAlive(pid);
+  } catch {
+    return false;
+  }
+}
+
+function handlePreviewStatus(journal: Journal, root: string, request: Extract<Request, { op: "preview_status" }>): Response {
+  assertId(request.jobId, "jobId");
+  const record = readPreviewRecord(join(root, request.jobId, ".preview.json"));
+  if (record === undefined) return { ok: true, status: "absent" };
+  if (pidAliveOf(journal, record.operationId)) return { ok: true, status: "running", port: record.port };
+  return { ok: true, status: "stopped", port: record.port };
+}
+
+/**
+ * capture_screenshot runs the registered headless browser against the job's own preview on the
+ * runner loopback. The browser path comes from the runner configuration, never from a model; the
+ * route is a path on the preview, never an arbitrary URL. Output is bounded to 8 MiB.
+ */
+function handleCaptureScreenshot(journal: Journal, root: string, request: Extract<Request, { op: "capture_screenshot" }>): Response {
+  assertId(request.jobId, "jobId");
+  assertId(request.scenarioId, "scenarioId");
+  if (!/^[0-9a-f]{7,64}$/.test(request.commit)) return fail("commit_invalid");
+  if (!/^\/[A-Za-z0-9._/?=&%-]{0,200}$/.test(request.route)) return fail("route_invalid");
+  if (!Number.isSafeInteger(request.width) || request.width < 320 || request.width > 2000) return fail("viewport_invalid");
+  if (!Number.isSafeInteger(request.height) || request.height < 320 || request.height > 2000) return fail("viewport_invalid");
+  const config = readConfig(root);
+  if (config.allowedBrowser === null) return fail("browser_not_configured");
+  const record = readPreviewRecord(join(root, request.jobId, ".preview.json"));
+  if (record === undefined || !pidAliveOf(journal, record.operationId)) return fail("preview_not_running");
+
+  const shotsDir = join(root, request.jobId, "shots");
+  mkdirSync(shotsDir, { recursive: true, mode: 0o700 });
+  const outPath = join(shotsDir, `${request.scenarioId}-${request.commit.slice(0, 12)}.png`);
+  const result = spawnSync(config.allowedBrowser, [
+    "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+    `--window-size=${request.width},${request.height}`,
+    "--virtual-time-budget=6000",
+    `--screenshot=${outPath}`,
+    `http://127.0.0.1:${record.port}${request.route}`,
+  ], { timeout: 45_000, encoding: "buffer" });
+  if (result.status !== 0 || !existsSync(outPath)) return fail(`capture_failed: ${String(result.stderr ?? "").slice(0, 300) || "no output file"}`);
+  const bytes = readFileSync(outPath);
+  if (bytes.length === 0 || bytes.length > 8_000_000) return fail("screenshot_size_invalid");
+  return { ok: true, pngBase64: bytes.toString("base64"), byteLength: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+function handleStopPreview(journal: Journal, root: string, request: Extract<Request, { op: "stop_preview" }>): Response {
+  assertId(request.jobId, "jobId");
+  const recordPath = join(root, request.jobId, ".preview.json");
+  const record = readPreviewRecord(recordPath);
+  if (record === undefined) return { ok: true, status: "absent" };
+  const cancelled = handleCancel(journal, { op: "cancel_process", jobId: request.jobId, operationId: record.operationId });
+  if (!cancelled.ok) return cancelled;
+  // Deletion waits for confirmed termination: only settle the journal row once the process group
+  // is gone. If it is still dying, leave the operation running so cleanup refuses and retries.
+  const deadline = Date.now() + 3_000;
+  while (pidAliveOf(journal, record.operationId) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+  }
+  if (pidAliveOf(journal, record.operationId)) return { ok: true, status: "cancel_signalled" };
+  journal.setStatus(record.operationId, "succeeded", 0);
+  try {
+    rmSync(recordPath, { force: true });
+  } catch { /* the record is disposable */ }
+  return { ok: true, status: "stopped" };
+}
+
 function runSupervisor(argv: string[]): void {
   // --supervise <journalDir> <worktree> <operationId> <timeoutMs> <command...>
   const [journalDir, worktree, operationId, timeoutRaw, ...command] = argv;
@@ -632,6 +766,18 @@ async function main(): Promise<void> {
         break;
       case "export_commit":
         response = handleExportCommit(root, request);
+        break;
+      case "start_preview":
+        response = handleStartPreview(journal, root, request);
+        break;
+      case "preview_status":
+        response = handlePreviewStatus(journal, root, request);
+        break;
+      case "capture_screenshot":
+        response = handleCaptureScreenshot(journal, root, request);
+        break;
+      case "stop_preview":
+        response = handleStopPreview(journal, root, request);
         break;
       case "cleanup_job":
         response = handleCleanup(journal, root, request);

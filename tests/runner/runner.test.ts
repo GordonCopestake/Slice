@@ -388,3 +388,95 @@ test("read_source stays inside the worktree and export_commit only carries the b
     assert.ok(Buffer.from(String(bundle.bundleBase64), "base64").length > 100);
   } finally { f.cleanup(); }
 });
+
+test("previews run as supervised jobs, capture screenshots through the registered browser, and stop cleanly", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-runner-preview-"));
+  const root = join(directory, "runner-root");
+  mkdirSync(root, { mode: 0o700 });
+  // The browser is a registered fixture that writes a PNG at the --screenshot path.
+  const browser = join(directory, "fake-browser.sh");
+  writeFileSync(browser, "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --screenshot=*) printf '\\x89PNG fake' > \"${arg#--screenshot=}\";; esac; done\nexit 0\n", { mode: 0o755 });
+  writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [], allowedBrowser: browser }));
+  const source = makeSourceRepo(directory);
+  writeFileSync(join(source, "preview-server.js"), "const http = require('node:http');\nconst port = Number(process.argv[2]);\nhttp.createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<h1>preview</h1>'); }).listen(port, '127.0.0.1');\n");
+  git(["add", "-A"], source);
+  git(["-c", "user.email=slice@example.invalid", "-c", "user.name=Slice Test", "commit", "-q", "-m", "preview server"], source);
+  const transport = new LocalRunnerTransport(RUNNER_ENTRY, root);
+  const call = async (payload: Record<string, unknown>): Promise<Record<string, unknown>> => await transport.request(payload as JsonValue) as Record<string, unknown>;
+  try {
+    writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [source], allowedBrowser: browser }));
+    const prepared = await call({ op: "prepare_job", jobId: "job-20", source, branch: "slice/job-20/ui", leaseGeneration: 1 });
+    assert.equal(prepared.ok, true);
+
+    const refusedPort = await call({ op: "start_preview", jobId: "job-20", operationId: "job-20:preview", leaseGeneration: 1, command: "node preview-server.js 80", port: 80 });
+    assert.equal(refusedPort.ok, false);
+    assert.equal(refusedPort.error, "preview_port_invalid");
+
+    const started = await call({ op: "start_preview", jobId: "job-20", operationId: "job-20:preview", leaseGeneration: 1, command: "node preview-server.js 8123", port: 8123 });
+    assert.equal(started.ok, true);
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-20" })).status === "running");
+
+    const shot = await call({ op: "capture_screenshot", jobId: "job-20", scenarioId: "home", route: "/", commit: String(prepared.baseCommit), width: 800, height: 600 });
+    assert.equal(shot.ok, true);
+    assert.ok(typeof shot.pngBase64 === "string" && Buffer.from(String(shot.pngBase64), "base64").subarray(0, 4).toString("hex") === "89504e47", "the captured file is the PNG the browser wrote");
+    assert.match(String(shot.sha256), /^[0-9a-f]{64}$/);
+
+    const badRoute = await call({ op: "capture_screenshot", jobId: "job-20", scenarioId: "evil", route: "http://evil.invalid/", commit: String(prepared.baseCommit), width: 800, height: 600 });
+    assert.equal(badRoute.ok, false);
+    assert.equal(badRoute.error, "route_invalid");
+
+    const stopped = await call({ op: "stop_preview", jobId: "job-20" });
+    assert.equal(stopped.ok, true);
+    assert.equal(stopped.status, "stopped");
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-20" })).status === "absent");
+
+    // Cleanup is allowed once the preview operation is confirmed stopped.
+    const cleaned = await call({ op: "cleanup_job", jobId: "job-20" });
+    assert.equal(cleaned.ok, true, "a running preview would have blocked cleanup until stopped");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("screenshot capture refuses when no browser is registered on the runner", async () => {
+  const f = newFixture([]);
+  try {
+    writeFileSync(join(f.root, ".runner.json"), JSON.stringify({ allowedSources: [f.source] }));
+    const prepared = await f.call({ op: "prepare_job", jobId: "job-21", source: f.source, branch: "slice/job-21/ui", leaseGeneration: 1 });
+    assert.equal(prepared.ok, true);
+    const noBrowser = await f.call({ op: "capture_screenshot", jobId: "job-21", scenarioId: "home", route: "/", commit: String(prepared.baseCommit), width: 800, height: 600 });
+    assert.equal(noBrowser.ok, false);
+    assert.equal(noBrowser.error, "browser_not_configured");
+  } finally { f.cleanup(); }
+});
+
+test("a preview that died is reconciled before a new phase plans a fresh operation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-runner-preview2-"));
+  const root = join(directory, "runner-root");
+  mkdirSync(root, { mode: 0o700 });
+  writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [] }));
+  const source = makeSourceRepo(directory);
+  writeFileSync(join(source, "preview-server.js"), "const http = require('node:http');\nhttp.createServer((_q, r) => r.end('x')).listen(Number(process.argv[2]), '127.0.0.1');\n");
+  git(["add", "-A"], source);
+  git(["-c", "user.email=slice@example.invalid", "-c", "user.name=Slice Test", "commit", "-q", "-m", "preview"], source);
+  const transport = new LocalRunnerTransport(RUNNER_ENTRY, root);
+  const call = async (payload: Record<string, unknown>): Promise<Record<string, unknown>> => await transport.request(payload as JsonValue) as Record<string, unknown>;
+  try {
+    writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [source] }));
+    const prepared = await call({ op: "prepare_job", jobId: "job-30", source, branch: "slice/job-30/ui", leaseGeneration: 1 });
+    assert.equal(prepared.ok, true);
+    const started = await call({ op: "start_preview", jobId: "job-30", operationId: "job-30:preview:baseline", leaseGeneration: 1, command: "node preview-server.js 8124", port: 8124 });
+    assert.equal(started.ok, true);
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-30" })).status === "running");
+
+    // Kill the preview process group out from under the runner, as a host crash would.
+    const pidFile = join(root, ".journal", "pids", "job-30:preview:baseline");
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-30" })).status === "stopped");
+
+    // A new phase uses a fresh operation id; the dead one is reconciled, not re-planned.
+    const again = await call({ op: "start_preview", jobId: "job-30", operationId: "job-30:preview:after", leaseGeneration: 1, command: "node preview-server.js 8125", port: 8125 });
+    assert.equal(again.ok, true, "the settled baseline preview does not block a fresh phase");
+    const stopped = await call({ op: "stop_preview", jobId: "job-30" });
+    assert.equal(stopped.ok, true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
