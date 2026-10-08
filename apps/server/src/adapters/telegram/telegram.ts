@@ -1,6 +1,6 @@
 export type TelegramSendOutcome = { status: "sent" } | { status: "failed"; reason: string } | { status: "uncertain"; reason: string };
 
-export type TelegramMessage = { messageId: number; chatId: string; text: string };
+export type TelegramMessage = { updateId: number; messageId: number; chatId: string; text: string };
 
 export type TelegramGateway = {
   sendMessage(chatId: string, text: string): Promise<TelegramSendOutcome>;
@@ -47,11 +47,11 @@ export class TelegramClient implements TelegramGateway {
     try {
       const response = await this.#fetch(`${this.#baseUrl}/bot${this.#token}/getUpdates?offset=${offset + 1}&timeout=0`, { method: "GET" });
       if (!response.ok) return [];
-      const json = await response.json() as { result?: { message_id?: number; chat?: { id?: number }; text?: string }[] };
+      const json = await response.json() as { result?: { update_id?: number; message_id?: number; chat?: { id?: number }; text?: string }[] };
       const messages: TelegramMessage[] = [];
       for (const item of json.result ?? []) {
-        if (typeof item.text !== "string" || typeof item.chat?.id !== "number" || typeof item.message_id !== "number") continue;
-        messages.push({ messageId: item.message_id, chatId: String(item.chat.id), text: item.text });
+        if (typeof item.text !== "string" || typeof item.chat?.id !== "number" || typeof item.message_id !== "number" || typeof item.update_id !== "number") continue;
+        messages.push({ updateId: item.update_id, messageId: item.message_id, chatId: String(item.chat.id), text: item.text });
       }
       return messages;
     } catch {

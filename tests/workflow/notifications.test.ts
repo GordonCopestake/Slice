@@ -156,10 +156,14 @@ test("account linking confirms only the current single-use code and records the 
   const h = stack();
   try {
     const code = h.service.startLinkCode();
-    h.telegram.messages = [{ messageId: 7, chatId: "chat-99", text: `/link ${code}` }];
+    h.telegram.messages = [{ updateId: 7, messageId: 7, chatId: "chat-99", text: `/link ${code}` }];
     assert.equal(await h.service.pollLink(), true);
     assert.equal(h.service.telegramStatus().linked, true);
-    assert.equal(h.telegram.offsetSeen, 0);
+    assert.equal(h.telegram.offsetSeen, 0, "the first poll starts from the stored offset");
+    // A second poll requests only updates after the highest update_id already seen.
+    h.telegram.messages = [];
+    await h.service.pollLink();
+    assert.equal(h.telegram.offsetSeen, 7, "the offset advances by update_id, never re-reading a spent link");
     // The code is spent: presenting it again does nothing.
     assert.equal(h.outbox.confirmLink("chat-99", code), false);
     assert.equal(h.service.telegramStatus().linkPending, false);

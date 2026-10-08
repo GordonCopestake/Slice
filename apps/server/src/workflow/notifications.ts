@@ -155,7 +155,8 @@ export class NotificationService {
     let linked = false;
     let offset = state.updateOffset;
     for (const message of messages) {
-      offset = Math.max(offset, message.messageId);
+      // Telegram's getUpdates offset filters by update_id, the global increasing update key.
+      offset = Math.max(offset, message.updateId);
       const match = /^\/link\s+([A-Za-z0-9]{6,16})$/u.exec(message.text.trim());
       if (match !== null && this.#deps.notifications.confirmLink(message.chatId, match[1] ?? "")) linked = true;
     }

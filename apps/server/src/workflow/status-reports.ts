@@ -1,5 +1,5 @@
 import type { DeliveryStore } from "../records/delivery-store.js";
-import type { JobRecord } from "../records/workflow-store.js";
+import type { JobRecord, WorkflowStore } from "../records/workflow-store.js";
 import type { StatusStore } from "../records/status-store.js";
 import type { EtaEstimate, ReportPlan, StatusReportRecord } from "../records/status-store.js";
 
@@ -121,10 +121,11 @@ export class StatusReports {
       if (delivery.stage !== "ready") continue;
       const job = this.#deps.workflows.getJob(delivery.jobId);
       if (job === undefined) continue;
-      const readyEvent = this.#deps.workflows.eventsAfter(job.jobId, 0).find((event) => event.type === "ready_for_owner");
+      const events = allEvents(this.#deps.workflows, job.jobId);
+      const readyEvent = events.find((event) => event.type === "ready_for_owner");
       const readyAt = readyEvent?.createdAt ?? job.updatedAt;
       const stageEntries = new Map<string, number>();
-      for (const event of this.#deps.workflows.eventsAfter(job.jobId, 0)) {
+      for (const event of events) {
         const stage = stageOfEvent(event.type);
         if (stage !== null && !stageEntries.has(stage)) stageEntries.set(stage, event.createdAt);
       }
@@ -135,7 +136,7 @@ export class StatusReports {
   }
 
   #build(job: JobRecord, plan: ReportPlan, now: number, terminal: boolean, terminalReason: string | null): Record<string, unknown> {
-    const events = this.#deps.workflows.eventsAfter(job.jobId, 0);
+    const events = allEvents(this.#deps.workflows, job.jobId);
     const since = plan.lastReportAt ?? job.createdAt - 1;
     const completedSince: string[] = [];
     let lastEventAt = job.createdAt;
@@ -208,6 +209,21 @@ export class StatusReports {
       note: `estimated ${minutes(estimate.minSeconds)}-${minutes(estimate.maxSeconds)} minutes from ${estimate.cohortSize} comparable job(s) in this project at the same stage; ${errorNote}`,
     };
   }
+}
+
+/** Read the whole event ledger for a job, paging past the per-call limit. */
+function allEvents(workflows: WorkflowStore, jobId: string): { type: string; createdAt: number; payload: unknown; seq: number }[] {
+  const all: { type: string; createdAt: number; payload: unknown; seq: number }[] = [];
+  let cursor = 0;
+  for (;;) {
+    const page = workflows.eventsAfter(jobId, cursor, 1000);
+    if (page.length === 0) break;
+    all.push(...page);
+    const last = page[page.length - 1];
+    if (last === undefined) break;
+    cursor = last.seq;
+  }
+  return all;
 }
 
 function stageOfEvent(type: string): string | null {

@@ -759,7 +759,7 @@ export class DeliveryLoop {
     }
     try {
       const started = await this.#deps.runner.startPreview({
-        jobId, hostId: workspace.hostId, operationId: `${jobId}:preview`, leaseGeneration: workspace.leaseGeneration,
+        jobId, hostId: workspace.hostId, operationId: `${jobId}:preview:${phase}`, leaseGeneration: workspace.leaseGeneration,
         command: project.preview.command, port: project.preview.port,
       });
       const host = this.#deps.workflows.getHost(workspace.hostId);

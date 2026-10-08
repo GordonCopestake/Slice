@@ -447,3 +447,36 @@ test("screenshot capture refuses when no browser is registered on the runner", a
     assert.equal(noBrowser.error, "browser_not_configured");
   } finally { f.cleanup(); }
 });
+
+test("a preview that died is reconciled before a new phase plans a fresh operation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-runner-preview2-"));
+  const root = join(directory, "runner-root");
+  mkdirSync(root, { mode: 0o700 });
+  writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [] }));
+  const source = makeSourceRepo(directory);
+  writeFileSync(join(source, "preview-server.js"), "const http = require('node:http');\nhttp.createServer((_q, r) => r.end('x')).listen(Number(process.argv[2]), '127.0.0.1');\n");
+  git(["add", "-A"], source);
+  git(["-c", "user.email=slice@example.invalid", "-c", "user.name=Slice Test", "commit", "-q", "-m", "preview"], source);
+  const transport = new LocalRunnerTransport(RUNNER_ENTRY, root);
+  const call = async (payload: Record<string, unknown>): Promise<Record<string, unknown>> => await transport.request(payload as JsonValue) as Record<string, unknown>;
+  try {
+    writeFileSync(join(root, ".runner.json"), JSON.stringify({ allowedSources: [source] }));
+    const prepared = await call({ op: "prepare_job", jobId: "job-30", source, branch: "slice/job-30/ui", leaseGeneration: 1 });
+    assert.equal(prepared.ok, true);
+    const started = await call({ op: "start_preview", jobId: "job-30", operationId: "job-30:preview:baseline", leaseGeneration: 1, command: "node preview-server.js 8124", port: 8124 });
+    assert.equal(started.ok, true);
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-30" })).status === "running");
+
+    // Kill the preview process group out from under the runner, as a host crash would.
+    const pidFile = join(root, ".journal", "pids", "job-30:preview:baseline");
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+    await waitUntil(async () => (await call({ op: "preview_status", jobId: "job-30" })).status === "stopped");
+
+    // A new phase uses a fresh operation id; the dead one is reconciled, not re-planned.
+    const again = await call({ op: "start_preview", jobId: "job-30", operationId: "job-30:preview:after", leaseGeneration: 1, command: "node preview-server.js 8125", port: 8125 });
+    assert.equal(again.ok, true, "the settled baseline preview does not block a fresh phase");
+    const stopped = await call({ op: "stop_preview", jobId: "job-30" });
+    assert.equal(stopped.ok, true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

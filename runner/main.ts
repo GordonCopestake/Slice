@@ -535,7 +535,16 @@ function handleStartPreview(journal: Journal, root: string, request: Extract<Req
 
   const recordPath = join(jobDir, ".preview.json");
   const existing = readPreviewRecord(recordPath);
-  if (existing !== undefined && pidAliveOf(journal, existing.operationId)) return { ok: true, status: "running", reused: true, port: existing.port };
+  if (existing !== undefined) {
+    if (pidAliveOf(journal, existing.operationId)) return { ok: true, status: "running", reused: true, port: existing.port };
+    // A dead preview must be reconciled to a settled state before a new one is planned; the old
+    // operation id stays settled and a fresh id (chosen by the caller) plans cleanly.
+    const resolved = resolveRunning(journal, existing.operationId);
+    journal.setStatus(existing.operationId, resolved.status as "succeeded" | "failed" | "uncertain", resolved.exitCode);
+    try {
+      rmSync(recordPath, { force: true });
+    } catch { /* the record is disposable */ }
+  }
 
   journal.plan(request.operationId, request.jobId, request.leaseGeneration, "preview");
   const ttlMs = request.ttlMs ?? 2 * 3_600_000;
