@@ -1,6 +1,6 @@
 # Phase 2 results: deliver a checked PR
 
-Status: **synthetic checks pass (104 Node tests, of which 34 are Phase 2). The live exit check is
+Status: **synthetic checks pass (105 Node tests; 23 were added in Phase 2). The live exit check is
 not tested** — it needs a disposable GitHub repository with branch protection, a GitHub App, a
 branch-writer deploy key, a check-publisher App, and a real SSH runner host, none of which existed
 for this run. Synthetic and live results are kept separate below.
@@ -60,9 +60,9 @@ for this run. Synthetic and live results are kept separate below.
   marked stale, the PR returns to draft, and the gate resets, before the new requirements revision
   runs the full loop again. Steering a merged, archived thread is refused with an explanation.
 
-## Synthetic checks run
+## Checks run
 
-`npm run check` passes: format, typecheck, build, and 104 Node tests. The Phase 2 tests are real
+`npm run check` passes: format, typecheck, build, and 105 Node tests. The Phase 2 tests are real
 integration tests, not stubs of the workflow:
 
 - `tests/workflow/delivery.test.ts` drives the whole loop against a **real runner binary**, a **real
@@ -124,6 +124,32 @@ untested.**
   exercised only against the synthetic host.
 - The delivery loop resumes on restart by re-reading the recorded stage. A job blocked before the
   restart stays blocked; it is not auto-retried.
+
+## Review rounds
+
+Five independent review passes were run over the Phase 2 diff before this record was written. Each
+round is a separate commit and each finding is stated with its consequence:
+
+1. **Loop bounds, ownership, archived read-only.** The advance loop cap (12) was smaller than a
+   worst-case four-round delivery (17+ steps), which could stall a job mid-delivery; `reconcile_apply`
+   did not check that the operation belonged to the requested job; a merged job stayed `running`;
+   answers could still reach an archived thread; a publishing job stuck on an outage waited for a
+   restart instead of the periodic sweep.
+2. **Gate scheduling from structured data.** The gate decided "the author can fix this" by matching
+   the word *check* in reason strings; it now judges from the structured gate inputs, so rewording a
+   reason can never change scheduling. (This round also verified, with no change needed, that the git
+   bundle crosses the runner channel as base64 — ssh publishing never reads the runner's filesystem —
+   and that review repair attempts already use distinct journal request ids.)
+3. **Finding ids namespaced by role.** Finding ids are model-supplied text; a code-review and a
+   security-review finding could both be called `F1`, and the second was silently dropped by the
+   `(job_id, finding_id)` primary key — a security finding could vanish behind a name collision.
+   Ids are now stored as `<role>:<id>`, and a resolution that re-uses the namespaced id shown in the
+   review context is not doubled.
+4. **Undo partial patch application.** The runner's undo paths used `git checkout -- .`, which
+   restores the worktree *from the index* — but `git apply --index` had already staged the partial
+   application, so a failed apply left applied content staged and copied back. All three undo paths
+   now use `git reset --hard HEAD` plus `git clean -fd`.
+5. **Documentation accuracy.** Test counts in this record corrected to 105; no code change.
 
 ## Running Phase 2 locally
 
