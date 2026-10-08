@@ -343,15 +343,28 @@ export class WorkflowStore {
       this.#database.close();
       throw error;
     }
-    // Migration: Phase 2 adds a per-project push remote. Existing rows keep NULL and use the default.
-    const columns = this.#database.prepare("PRAGMA table_info(slice_projects)").all() as { name: string }[];
-    if (!columns.some((column) => column.name === "git_remote_url")) {
-      this.#database.exec("ALTER TABLE slice_projects ADD COLUMN git_remote_url TEXT");
-    }
-    // Migration: Phase 3 adds per-project preview and browser scenarios.
-    if (!columns.some((column) => column.name === "preview_json")) {
-      this.#database.exec("ALTER TABLE slice_projects ADD COLUMN preview_json TEXT");
-    }
+    // Migrations. `CREATE TABLE IF NOT EXISTS` only shapes databases created by this build: a table
+    // that already existed keeps its old columns forever, so every column added after the first
+    // release has to be added explicitly. Without this, an upgraded deployment creates tables that
+    // work and writes that fail with "table has no column named ...".
+    const ensureColumn = (table: string, column: string, definition: string): void => {
+      const columns = this.#database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      if (!columns.some((entry) => entry.name === column)) this.#database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    };
+
+    // Phase 2: a per-project push remote. Existing rows keep NULL and use the default.
+    ensureColumn("slice_projects", "git_remote_url", "TEXT");
+    // Phase 3: per-project preview and browser scenarios.
+    ensureColumn("slice_projects", "preview_json", "TEXT");
+    // Phase 4: placement, model/privacy rules, toolchain declarations, and workspace release.
+    ensureColumn("slice_hosts", "capacity", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn("slice_hosts", "enabled", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn("slice_projects", "pool_id", "TEXT");
+    ensureColumn("slice_projects", "required_os", "TEXT NOT NULL DEFAULT 'linux'");
+    ensureColumn("slice_projects", "model_rules_json", "TEXT");
+    ensureColumn("slice_projects", "toolchain_json", "TEXT");
+    // An existing workspace was never released, so 0 matches what the fresh schema says.
+    ensureColumn("slice_workspaces", "released", "INTEGER NOT NULL DEFAULT 0");
   }
 
   static open(database: DatabaseSync): WorkflowStore {
@@ -1117,6 +1130,13 @@ export class WorkflowStore {
       .prepare("SELECT * FROM slice_sessions WHERE token_hash = ? AND expires_at > ?")
       .get(tokenHash, Date.now()) as { token_hash: string; csrf_hash: string; expires_at: number } | undefined;
     return row === undefined ? undefined : { tokenHash: row.token_hash, csrfHash: row.csrf_hash, expiresAt: row.expires_at };
+  }
+
+  /** Replace a session's CSRF hash. Returns false when no live session matched. */
+  rotateSessionCsrf(tokenHash: string, csrfHash: string): boolean {
+    return this.#database
+      .prepare("UPDATE slice_sessions SET csrf_hash = ? WHERE token_hash = ? AND expires_at > ?")
+      .run(csrfHash, tokenHash, Date.now()).changes > 0;
   }
 
   endSession(tokenHash: string): void {

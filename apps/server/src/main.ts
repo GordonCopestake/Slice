@@ -4,7 +4,7 @@ import { resolve, join } from "node:path";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { SliceApi } from "./api/http-api.js";
 import { OwnerAuth } from "./auth/owner-auth.js";
-import { createConfiguredModels } from "./adapters/models/configured-models.js";
+import { createConfiguredModels, PLUS_PRO_PROVIDER } from "./adapters/models/configured-models.js";
 import { PiDurableAdapter } from "./adapters/pi-durable/pi-durable-adapter.js";
 import { GithubClient } from "./adapters/github/git-host.js";
 import { GitBundlePublisher } from "./adapters/git/branch-publisher.js";
@@ -186,10 +186,24 @@ export async function startSlice(): Promise<void> {
     const databasePath = join(stateDirectory, "state.sqlite");
     state = ApplicationStateStore.open(databasePath);
     workflows = WorkflowStore.open(state.database);
+    const models = createConfiguredModels(process.env, { credentials: new FileCredentialStore(stateDirectory) });
+    // Fail fast. A profile the runtime cannot resolve used to surface only when a job ran: the job
+    // blocked with reason "no_model" and nothing said which model was missing or why. The ChatGPT
+    // Plus/Pro provider, for example, is only registered when SLICE_PLUS_PRO is set.
+    const declaredProfiles = [requirementsProfile(process.env), ...Object.values(roleProfiles(process.env) ?? {})]
+      .filter((profile): profile is ModelProfile => profile !== undefined && profile !== null);
+    for (const profile of declaredProfiles) {
+      if (models.getModel(profile.provider, profile.modelId) === undefined) {
+        const hint = profile.provider === PLUS_PRO_PROVIDER && process.env.SLICE_PLUS_PRO === undefined
+          ? " (the ChatGPT Plus/Pro provider is only registered when SLICE_PLUS_PRO is set)"
+          : "";
+        throw new Error(`Configured model ${profile.provider}/${profile.modelId} is not available in the model registry${hint}`);
+      }
+    }
     adapter = await PiDurableAdapter.open({
       durableDatabasePath: databasePath,
       state,
-      models: createConfiguredModels(process.env, { credentials: new FileCredentialStore(stateDirectory) }),
+      models,
       registry: createRegistry(),
     });
     const auth = new OwnerAuth(workflows, process.env);

@@ -713,3 +713,53 @@ test("host pools and host enablement are reachable through the API the web shell
     assert.equal((await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: "no" } })).status, 400, "a known host rejects a non-boolean");
   } finally { await stack.close(); }
 });
+
+test("a reload resumes the session instead of dead-ending at the sign-in form", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    const oldCsrf = stack.csrf;
+
+    const resumed = await stack.call("/api/session", { csrf: false });
+    assert.equal(resumed.status, 200, "a live cookie must be resumable");
+    assert.equal(resumed.body.authenticated, true);
+    assert.equal(typeof resumed.body.csrfToken, "string");
+    assert.notEqual(resumed.body.csrfToken, oldCsrf, "resuming issues a fresh token rather than echoing the old one");
+
+    // The plaintext token is never stored, so the previous one is genuinely dead, not merely unused.
+    const stale = await stack.call("/api/hosts", { method: "POST", body: { hostId: "resume-1", address: "resume-1.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" }, csrf: false });
+    assert.equal(stale.status, 403, JSON.stringify(stale.body));
+    assert.equal(stale.body.error, "csrf_token_missing");
+
+    stack.csrf = resumed.body.csrfToken;
+    const fresh = await stack.call("/api/hosts", { method: "POST", body: { hostId: "resume-1", address: "resume-1.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    assert.equal(fresh.status, 201, JSON.stringify(fresh.body));
+  } finally { await stack.close(); }
+});
+
+test("resuming is refused without a valid session cookie", async () => {
+  const stack = await startStack();
+  try {
+    const anonymous = await stack.call("/api/session", { cookie: "", csrf: false });
+    assert.equal(anonymous.status, 401);
+    assert.equal(anonymous.body.error, "authentication_required");
+    // A forged cookie must not be resumable either.
+    const forged = await stack.call("/api/session", { cookie: "slice_session=forged-token-value", csrf: false });
+    assert.equal(forged.status, 401);
+  } finally { await stack.close(); }
+});
+
+test("a host's declared capacity is honoured instead of silently defaulting to one", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    const registered = await stack.call("/api/hosts", { method: "POST", body: { hostId: "cap-host", address: "cap.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs", capacity: 4 } });
+    assert.equal(registered.status, 201, JSON.stringify(registered.body));
+    assert.equal(registered.body.host.capacity, 4, "the owner asked for 4 concurrent jobs and got 4");
+
+    const tooBig = await stack.call("/api/hosts", { method: "POST", body: { hostId: "cap-host-2", address: "cap2.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs", capacity: 999 } });
+    assert.equal(tooBig.status, 400, JSON.stringify(tooBig.body));
+    const notNumber = await stack.call("/api/hosts", { method: "POST", body: { hostId: "cap-host-3", address: "cap3.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs", capacity: "lots" } });
+    assert.equal(notNumber.status, 400);
+  } finally { await stack.close(); }
+});

@@ -184,7 +184,11 @@ export class JobCoordinator {
     const submission = await this.#adapter.submit(conversationId(threadId), `${job.jobId}:${submissionSuffix}`, content);
     const settled = await submission.wait(BACKGROUND_CONTEXT);
     if (settled.status !== "done" || settled.answer === undefined) {
-      this.#workflows.appendEvent(job.jobId, "requirements_task_failed", { status: settled.status });
+      // The runtime states why a submission ended without an answer; keeping it is the difference
+      // between a blocked job someone can fix and one nobody can explain.
+      const reason = typeof settled.reason === "string" ? settled.reason.slice(0, 500) : "no reason reported";
+      this.#workflows.appendEvent(job.jobId, "requirements_task_failed", { status: settled.status, reason });
+      this.#workflows.appendEvent(job.jobId, "blocked", { reason: `requirements_task_failed: ${reason}` });
       return this.#workflows.setRunState(job.jobId, ["running", "waiting_user"], "blocked") ?? this.#workflows.getJob(job.jobId)!;
     }
     const text = await this.#answerText(conversationId(threadId), settled.answer);

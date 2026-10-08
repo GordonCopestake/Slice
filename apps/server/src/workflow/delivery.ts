@@ -316,8 +316,8 @@ export class DeliveryLoop {
     const thread = await createRoleConversation(this.#deps.adapter, profile, AUTHOR_INSTRUCTIONS);
     const turn = await runRoleTurn(this.#deps.adapter, thread, `${jobId}:author:r${round}`, context);
     if (!turn.ok) {
-      this.#deps.workflows.appendEvent(jobId, "author_task_failed", { round, status: turn.status });
-      this.#block(jobId, `the author task failed (${turn.status})`);
+      this.#deps.workflows.appendEvent(jobId, "author_task_failed", { round, status: turn.status, reason: turn.reason });
+      this.#block(jobId, `the author task failed (${turn.status}: ${turn.reason})`);
       return;
     }
     const output = parseAuthorOutput(turn.text);
@@ -472,6 +472,7 @@ export class DeliveryLoop {
         const content = attempt === 0 ? context : `${context}\n\nYour previous reply did not match the review report contract. Reply with ONLY the JSON object described in your instructions.`;
         const turn = await runRoleTurn(this.#deps.adapter, thread, requestId, content);
         if (!turn.ok) {
+          this.#deps.workflows.appendEvent(jobId, "review_task_failed", { role, requestId, status: turn.status, reason: turn.reason });
           output = { verdict: "unable_to_review", scope: "the review task failed", findings: [] };
           break;
         }

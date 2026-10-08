@@ -12,14 +12,18 @@ export async function createRoleConversation(adapter: PiDurableAdapter, profile:
   return await adapter.createThread({ model: { provider: profile.provider, modelId: profile.modelId }, instructions });
 }
 
-export type RoleTurnResult = { ok: true; text: string } | { ok: false; status: string };
+export type RoleTurnResult = { ok: true; text: string } | { ok: false; status: string; reason: string };
 
 export async function runRoleTurn(adapter: PiDurableAdapter, threadId: ConversationId, requestId: string, content: string): Promise<RoleTurnResult> {
   const submission = await adapter.submit(threadId, requestId, content);
   const settled = await submission.wait(BACKGROUND_CONTEXT);
-  if (settled.status !== "done" || settled.answer === undefined) return { ok: false, status: settled.status };
+  // The runtime reports why a submission ended without an answer. Recording only the status left a
+  // blocked job with no stated cause anywhere, which is unfixable from the outside.
+  const failed = (status: string, reason: string | undefined): RoleTurnResult =>
+    ({ ok: false, status, reason: typeof reason === "string" && reason.length > 0 ? reason.slice(0, 500) : "no reason reported" });
+  if (settled.status !== "done" || settled.answer === undefined) return failed(settled.status, settled.reason);
   const conversation = await adapter.conversation(threadId);
-  if (conversation === undefined) return { ok: false, status: "conversation_missing" };
+  if (conversation === undefined) return failed("conversation_missing", undefined);
   const entry = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
   const message = entry?.model?.[0];
   if (message === undefined) return { ok: true, text: "" };

@@ -144,6 +144,12 @@ export class SliceApi {
       }
       const status = error instanceof SyntaxError || error instanceof TypeError || error instanceof RangeError ? 400 : 500;
       const message = error instanceof Error ? error.message : "internal error";
+      if (status === 500) {
+        // An unexpected failure used to vanish: the client saw internal_error with an empty message
+        // and the log saw nothing. Method, path, and the error itself are recorded; request bodies
+        // and secrets never are.
+        process.stderr.write(`slice api error: ${request.method ?? "?"} ${url.pathname} -> ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}\n`);
+      }
       // Never echo request bodies or secrets; type errors carry field names, not values.
       json(response, status, { error: status === 500 ? "internal_error" : "invalid_request", message: status === 500 ? "" : message });
     }
@@ -205,6 +211,18 @@ export class SliceApi {
     }
 
     // Everything below the session route is owner-only.
+    if (method === "GET" && path === "/api/session") {
+      // A reload resumes a live session instead of forcing the owner to retype the password; a
+      // client without a valid cookie gets 401 exactly as before.
+      const resumed = this.#deps.auth.resumeSession(request);
+      if (resumed === null) {
+        json(response, 401, { error: "authentication_required" });
+        return;
+      }
+      json(response, 200, { authenticated: true, csrfToken: resumed.csrfToken });
+      return;
+    }
+
     const authed = this.#deps.auth.readSession(request);
     if (authed === null) {
       json(response, 401, { error: "authentication_required" });
@@ -269,6 +287,9 @@ export class SliceApi {
         os: body.os === "linux" || body.os === "windows" ? body.os : (() => { throw new TypeError("os must be linux or windows"); })(),
         sshUser: requiredString(body, "sshUser", 64),
         runnerRoot: requiredString(body, "runnerRoot", 200),
+        // The owner UI offers a capacity field. Dropping it here meant a host registered with
+        // capacity 4 silently took 1 job, and placement then reported "1/1".
+        ...(body.capacity === undefined ? {} : { capacity: numberInRange(body.capacity, "capacity", 1, 64) }),
       });
       json(response, 201, { host });
       return;

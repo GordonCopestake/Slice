@@ -22,13 +22,16 @@ async function unusedPort(): Promise<number> {
 }
 
 function startService(script: string, directory: string, port: number, extraEnv: Record<string, string> = {}) {
-  const env: NodeJS.ProcessEnv = { ...process.env, SLICE_STATE_DIR: directory, SLICE_PORT: String(port), ...extraEnv };
+  const env: NodeJS.ProcessEnv = { ...process.env, SLICE_STATE_DIR: directory, SLICE_PORT: String(port) };
   delete env.SLICE_LOCAL_BASE_URL;
   delete env.SLICE_LOCAL_MODEL_ID;
   delete env.SLICE_OPENAI_MODEL_ID;
   delete env.SLICE_OWNER_PASSWORD;
   delete env.SLICE_REQUIREMENTS_PROVIDER;
   delete env.SLICE_REQUIREMENTS_MODEL_ID;
+  // Caller-supplied values are applied last, after the inherited ones are cleared; otherwise a test
+  // that sets one of these silently gets the default of not having it.
+  Object.assign(env, extraEnv);
   return spawn(process.execPath, [script], { env, stdio: "ignore" });
 }
 
@@ -228,5 +231,24 @@ test("a bad bind address or Host allowlist stops startup instead of widening exp
       await stopService(child);
       await rm(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("a configured model the runtime cannot resolve stops startup instead of blocking jobs", { timeout: 30_000 }, async () => {
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+  const directory = await mkdtemp(join(tmpdir(), "slice-service-model-"));
+  const port = await unusedPort();
+  // Previously this started happily and every job blocked later with reason "no_model" and no hint
+  // about which model was missing.
+  const child = startService(script, directory, port, {
+    SLICE_REQUIREMENTS_PROVIDER: "not-a-provider",
+    SLICE_REQUIREMENTS_MODEL_ID: "not-a-model",
+  });
+  try {
+    const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+    assert.notEqual(code, 0, "an unresolvable requirements model must refuse to start");
+  } finally {
+    await stopService(child);
+    await rm(directory, { recursive: true, force: true });
   }
 });

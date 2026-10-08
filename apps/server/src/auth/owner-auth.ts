@@ -79,6 +79,19 @@ export class OwnerAuth {
     return timingSafeEqual(expected, actual);
   }
 
+  /**
+   * Resume a live session after a page reload. The plaintext CSRF token is never stored, so a new
+   * one is issued and its hash replaces the old: only a client that already holds the HttpOnly
+   * session cookie can obtain it, and any previously leaked token stops working at the same time.
+   */
+  resumeSession(request: { headers: Record<string, string | string[] | undefined> }): Session | null {
+    const read = this.readSession(request);
+    if (read === null) return null;
+    const csrfToken = randomBytes(32).toString("base64url");
+    if (!this.#store.rotateSessionCsrf(sha256(read.session.token), sha256(csrfToken))) return null;
+    return { token: read.session.token, csrfToken };
+  }
+
   endSession(token: string): void {
     this.#store.endSession(sha256(token));
   }

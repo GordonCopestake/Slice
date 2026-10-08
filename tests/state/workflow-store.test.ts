@@ -201,3 +201,51 @@ test("retention prunes only terminal old rows and keeps the recent floor", () =>
     assert.notEqual(store.getOperation("op-4"), undefined, "the floor keeps the most recent rows even when old");
   } finally { cleanup(); }
 });
+
+test("a database created by an older build is migrated, not left half-upgraded", () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-workflow-upgrade-"));
+  const path = join(directory, "state.sqlite");
+  // Recreate the schema as it stood before Phase 4: same tables, fewer columns.
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE slice_hosts (host_id TEXT PRIMARY KEY, address TEXT NOT NULL, os TEXT NOT NULL,
+      ssh_user TEXT NOT NULL, runner_root TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE slice_projects (project_id TEXT PRIMARY KEY, repo_slug TEXT NOT NULL, default_branch TEXT NOT NULL,
+      host_id TEXT NOT NULL, build_profile_json TEXT NOT NULL, status TEXT NOT NULL,
+      profile_revision INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE slice_workspaces (job_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, lease_generation INTEGER NOT NULL,
+      workspace_path TEXT NOT NULL, base_commit TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL);
+    INSERT INTO slice_hosts (host_id, address, os, ssh_user, runner_root, created_at)
+      VALUES ('old-host', 'old.internal', 'linux', 'slice', '/srv/slice/jobs', 1);
+    INSERT INTO slice_projects (project_id, repo_slug, default_branch, host_id, build_profile_json, status,
+      profile_revision, created_at, updated_at)
+      VALUES ('old-project', 'you/old', 'main', 'old-host', '{"checks":[]}', 'active', 1, 1, 1);
+    INSERT INTO slice_workspaces (job_id, host_id, lease_generation, workspace_path, base_commit, status, created_at)
+      VALUES ('old-job', 'old-host', 1, '/srv/slice/jobs/old-job', 'abc', 'prepared', 1);
+  `);
+  legacy.close();
+
+  const state = ApplicationStateStore.open(path);
+  const store = WorkflowStore.open(state.database);
+  try {
+    // The pre-existing rows survive and gain the new column defaults.
+    const host = store.getHost("old-host");
+    assert.ok(host !== undefined, "an existing host must still be readable");
+    assert.equal(host.capacity, 1, "an existing host gets the default capacity rather than undefined");
+    assert.equal(host.enabled, true);
+    const project = store.getProject("old-project")!;
+    assert.equal(project.requiredOs, "linux", "an existing project keeps working on a Linux worker");
+    assert.deepEqual(project.modelRules, { allowedProviders: [], allowedModelIds: [], allowCloud: true, localOnlyRoles: [] });
+    assert.deepEqual(store.listUsableHosts().map((entry) => entry.hostId), ["old-host"]);
+
+    // The failure this migration prevents: a write that names a column the old table never had.
+    const added = store.registerHost({ hostId: "new-host", address: "new.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs", capacity: 3 });
+    assert.equal(added.capacity, 3);
+    assert.equal(store.setHostEnabled("old-host", false), true);
+    assert.equal(store.getHost("old-host")!.enabled, false);
+    assert.deepEqual(store.listUsableHosts().map((entry) => entry.hostId), ["new-host"], "a migrated host is still placeable");
+  } finally {
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

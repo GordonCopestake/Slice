@@ -63,14 +63,19 @@ async function render() {
     return;
   }
   $("#nav").hidden = false;
+  // The view is fetched after the old one is cleared. Without a placeholder a slow read shows a blank
+  // page, which reads as a broken app rather than a loading one.
+  main.append(el("div", { class: "card" }, el("p", { class: "muted" }, "Loading…")));
   try {
-    if (state.view === "jobs") main.append(await jobsView());
-    else if (state.view === "new") main.append(newJobView());
-    else if (state.view === "projects") main.append(await projectsView());
-    else if (state.view === "job") main.append(await jobView(state.jobId));
+    const view = state.view === "jobs" ? await jobsView()
+      : state.view === "new" ? newJobView()
+      : state.view === "projects" ? await projectsView()
+      : await jobView(state.jobId);
+    // Replaces the placeholder rather than sitting under it.
+    main.replaceChildren(view);
   } catch (cause) {
     // A failed read (expired session, network) shows a reason and a way back, not a blank page.
-    main.append(el("div", { class: "card" },
+    main.replaceChildren(el("div", { class: "card" },
       el("p", { class: "error" }, `Could not load this view: ${String(cause.message)}`),
       el("button", { onclick: async () => { await fetch("/api/session/end", { method: "POST", credentials: "same-origin", headers: { "x-csrf-token": state.csrf } }); state.csrf = null; await render(); } }, "Sign in again")));
   }
@@ -395,14 +400,26 @@ async function jobView(jobId) {
 
   const stream = new EventSource(`/api/jobs/${jobId}/events`, { withCredentials: true });
   state.stream = stream;
+  // The stream replays the whole ledger from the beginning on every connect, and the snapshot states
+  // where the ledger ended at that moment. Re-rendering for a *replayed* historical event starts a
+  // new stream that replays the same event again: an endless loop that opens a fresh EventSource each
+  // time, saturates the browser's six-connections-per-host limit, and leaves the page blank.
+  const refreshOn = new Set(["paused", "resumed", "cancelled", "requirements_ready", "question_asked", "question_answered", "blocked"]);
+  let snapshotCursor = 0;
+  let refreshQueued = false;
   stream.addEventListener("snapshot", (message) => {
     const snapshot = JSON.parse(message.data);
+    snapshotCursor = snapshot.cursor;
     status.replaceChildren(badge(snapshot.job.stage), badge(snapshot.job.runState), el("span", { class: "muted" }, `command revision ${snapshot.job.commandRevision}`));
   });
   stream.addEventListener("event", (message) => {
     const event = JSON.parse(message.data);
     events.append(el("li", {}, el("time", {}, new Date(event.createdAt).toLocaleTimeString()), `${event.type} `, el("span", { class: "muted" }, JSON.stringify(event.payload))));
-    if (["paused", "resumed", "cancelled", "requirements_ready", "question_asked", "question_answered", "blocked"].includes(event.type)) void render();
+    if (event.seq > snapshotCursor && refreshOn.has(event.type) && !refreshQueued) {
+      // Coalesced: a burst of new events refreshes the view once, not once per event.
+      refreshQueued = true;
+      setTimeout(() => { refreshQueued = false; void render(); }, 250);
+    }
   });
 
   const reports = await buildReportsPanel(jobId);
@@ -621,11 +638,14 @@ for (const button of document.querySelectorAll("#nav button[data-view]")) {
 }
 
 (async () => {
+  // A reload should not force the owner to retype a long password on a phone. The server issues a
+  // fresh CSRF token to anything holding a live session cookie, so a returning session is resumed
+  // rather than dead-ended at the sign-in form.
   try {
     const response = await fetch("/api/session", { credentials: "same-origin" });
     if (response.ok) {
-      // A live session still needs the CSRF token, which only login returns; re-authenticate is not possible
-      // without the password, so a page reload starts a fresh login. The session cookie stays HttpOnly.
+      const body = await response.json();
+      if (typeof body.csrfToken === "string") state.csrf = body.csrfToken;
     }
   } catch { /* offline */ }
   await render();
