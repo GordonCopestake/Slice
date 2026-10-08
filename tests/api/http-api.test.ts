@@ -442,7 +442,7 @@ test("a merged archived thread offers a linked follow-up job and stays untouched
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
   const deliveryStore = DeliveryStore.open(state.database);
-  const stack = await startStack({ deliveryStore });
+  const stack = await startStack({ deliveryStore, makeStatus: (workflows, state2) => new StatusReports({ workflows, deliveryStore, status: StatusStore.open(state2.database) }) });
   try {
     await login(stack);
     await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
@@ -472,6 +472,11 @@ test("a merged archived thread offers a linked follow-up job and stays untouched
     const followView = await stack.call(`/api/jobs/${follow.body.job.jobId}`);
     assert.equal(followView.body.predecessorJobId, jobId);
     assert.equal(followView.body.archived, false, "the follow-up is a live thread of its own");
+
+    // The follow-up is a real thread: it carries its own reporting plan from creation.
+    const followReports = await stack.call(`/api/jobs/${follow.body.job.jobId}/status-reports`);
+    assert.equal(followReports.status, 200);
+    assert.equal(followReports.body.plan.intervalMinutes, 10);
   } finally {
     await stack.close();
     state.close();

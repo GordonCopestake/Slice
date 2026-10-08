@@ -493,6 +493,7 @@ export class SliceApi {
           issue: null,
         });
         this.#deps.workflows.recordJobLink(created.jobId, jobId);
+        this.#deps.status?.onJobCreated(created);
         json(response, 201, { job: publicJob(created), predecessorJobId: jobId });
         return;
       }
