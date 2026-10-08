@@ -10,16 +10,12 @@ import { ApplicationStateStore } from "../../apps/server/src/state/application-s
 import { WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
 import { JobCoordinator, parseRequirementsOutput } from "../../apps/server/src/workflow/coordinator.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
+import { fakeRunner as buildFakeRunner } from "../support/fake-runner.js";
 
 const PROFILE: BuildProfile = { setup: [], checks: [{ id: "test", command: "npm test" }] };
 
 /** A runner that always succeeds, so coordinator tests can watch the full requirements-to-workspace path. */
-const fakeRunner: RunnerGateway = {
-  prepareJob: async () => ({ baseCommit: "0123456789abcdef", repoPath: "/srv/slice/jobs/j/repo", worktreePath: "/srv/slice/jobs/j/author", reused: false }),
-  runCheck: async () => ({ status: "succeeded", exitCode: 0, outputTail: "" }),
-  cancelRunning: async () => {},
-  reconcile: async () => [],
-};
+const fakeRunner: RunnerGateway = buildFakeRunner();
 
 const QUESTION_JSON = '{"kind":"question","questionId":"q1","question":"Which office allocates?","choices":["front","back"]}';
 const READY_JSON = '{"kind":"ready","summary":"Add an allocation screen.","criteria":[{"id":"c1","text":"Office staff can allocate items"}]}';

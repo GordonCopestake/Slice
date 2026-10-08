@@ -4,9 +4,9 @@ Slice is a small, self-hosted agent service. Its goal is to turn a plain-languag
 
 ## Current state
 
-Phase 0 is complete and signed off (2026-10-07). Phase 1 is implemented and synthetically verified (82 tests): single-owner authentication, a project and host registry, jobs created from a request or a GitHub issue, the requirements question-and-answer exchange, a responsive state page with reconnecting event streams, pause/resume/cancel, steering with command revisions, and an SSH runner with a journal, supervised operations, and fenced leases. The Phase 1 live exit check (two demo repositories on a real runner, phone and desktop browsers) has not been run; see [Phase 1 results](docs/phase1-results.md). The service does not yet create branches or pull requests (Phase 2), and there is no Telegram integration.
+Phase 0 is complete and signed off (2026-10-07). Phase 1 is implemented and synthetically verified; its live exit check has not been run (see [Phase 1 results](docs/phase1-results.md)). Phase 2 is implemented and synthetically verified (104 tests): author, code-review, and security-review roles with distinct model identities, validated patches applied only by the runner, findings the author cannot close, at most four repair rounds, a deterministic readiness gate bound to verification keys, journal-backed publishing (push, draft PR, five `slice/*` checks, promotion) that becomes ready only on host acknowledgement, verified merge observation with archiving and idempotent workspace cleanup while evidence is retained, and a delivery panel in the web app. The Phase 2 live exit check (disposable repository, branch protection, separate GitHub identities, real runner) has not been run; see [Phase 2 results](docs/phase2-results.md). Periodic reports, previews, screenshots, and Telegram belong to Phase 3.
 
-See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), [Phase 0 results](docs/phase0-results.md), and the [Phase 0 security review](docs/phase0-security-review.md).
+See [the build specification](docs/build-spec.md), [the spec review](docs/spec-review.md), [Phase 0 results](docs/phase0-results.md), the [Phase 0 security review](docs/phase0-security-review.md), [Phase 1 results](docs/phase1-results.md), and [Phase 2 results](docs/phase2-results.md).
 
 ## Run locally
 

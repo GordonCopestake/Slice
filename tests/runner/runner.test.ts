@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -300,4 +301,85 @@ test("the SSH transport refuses to run without a host key pin and builds a fixed
     ].join("\n"), { mode: 0o755 });
     await assert.rejects(recording.request({ op: "health" }), /REMOTE HOST IDENTIFICATION HAS CHANGED|ssh runner request failed/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+// ------------------------------------------------------------- Phase 2 ops
+
+const NEW_FILE_PATCH = [
+  "diff --git a/added.md b/added.md",
+  "new file mode 100644",
+  "--- /dev/null",
+  "+++ b/added.md",
+  "@@ -0,0 +1 @@",
+  "+office note",
+].join("\n");
+
+test("apply_change commits a validated patch and stamps the commit with its operation marker", async () => {
+  const f = newFixture([]);
+  try {
+    writeFileSync(join(f.root, ".runner.json"), JSON.stringify({ allowedSources: [f.source] }));
+    const prepared = await f.call({ op: "prepare_job", jobId: "job-10", source: f.source, branch: "slice/job-10/x", leaseGeneration: 1 });
+    const base = String(prepared.baseCommit);
+    const applied = await f.call({ op: "apply_change", jobId: "job-10", operationId: "job-10:commit:r1", leaseGeneration: 1, patch: NEW_FILE_PATCH, commitMessage: "add a note", expectedParent: base });
+    assert.equal(applied.ok, true);
+    assert.match(String(applied.commit), /^[0-9a-f]{40}$/);
+    const message = spawnSync("git", ["-C", join(f.root, "job-10", "author"), "log", "-1", "--format=%B"], { encoding: "utf8" }).stdout;
+    assert.ok(message.includes("slice-op:job-10:commit:r1"), "the marker makes an interrupted apply reconcilable");
+
+    const head = await f.call({ op: "verify_head", jobId: "job-10" });
+    assert.equal(head.ok, true);
+    assert.equal(head.head, applied.commit);
+    assert.equal(head.clean, true, "the commit left no uncommitted changes");
+
+    // A replay against a stale parent fails loudly instead of stacking commits.
+    const stale = await f.call({ op: "apply_change", jobId: "job-10", operationId: "job-10:commit:r2", leaseGeneration: 1, patch: NEW_FILE_PATCH, commitMessage: "again", expectedParent: base });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "parent_mismatch");
+
+    // A patch git refuses is a recorded failure.
+    const bad = await f.call({ op: "apply_change", jobId: "job-10", operationId: "job-10:commit:r3", leaseGeneration: 1, patch: "not a diff at all", commitMessage: "bad", expectedParent: String(applied.commit) });
+    assert.equal(bad.ok, false);
+    assert.match(String(bad.error), /patch_rejected/);
+  } finally { f.cleanup(); }
+});
+
+test("reconcile settles an interrupted apply by the marker commit, and a failed apply may be retried", async () => {
+  const f = newFixture([]);
+  try {
+    writeFileSync(join(f.root, ".runner.json"), JSON.stringify({ allowedSources: [f.source] }));
+    const prepared = await f.call({ op: "prepare_job", jobId: "job-11", source: f.source, branch: "slice/job-11/x", leaseGeneration: 1 });
+    const journalDb = new DatabaseSync(join(f.root, ".journal", "journal.sqlite"));
+    // Simulate a runner that died between the apply and the status record.
+    journalDb.prepare("INSERT INTO operations (operation_id, job_id, lease_generation, op, status, exit_code, started_at, updated_at) VALUES ('job-11:commit:r1', 'job-11', 1, 'apply_change', 'running', NULL, ?, ?)").run(Date.now(), Date.now());
+    journalDb.close();
+    const reconciled = await f.call({ op: "reconcile", jobId: "job-11" });
+    assert.equal(reconciled.ok, true);
+    const rows = reconciled.operations as { operationId: string; status: string }[];
+    assert.deepEqual(rows.find((row) => row.operationId === "job-11:commit:r1")?.status, "failed", "no marker commit means the attempt failed");
+
+    // The same operation ID may now be re-planned, because its failure is recorded.
+    const retried = await f.call({ op: "apply_change", jobId: "job-11", operationId: "job-11:commit:r1", leaseGeneration: 1, patch: NEW_FILE_PATCH, commitMessage: "retry", expectedParent: String(prepared.baseCommit) });
+    assert.equal(retried.ok, true);
+  } finally { f.cleanup(); }
+});
+
+test("read_source stays inside the worktree and export_commit only carries the branch head", async () => {
+  const f = newFixture([]);
+  try {
+    writeFileSync(join(f.root, ".runner.json"), JSON.stringify({ allowedSources: [f.source] }));
+    await f.call({ op: "prepare_job", jobId: "job-12", source: f.source, branch: "slice/job-12/x", leaseGeneration: 1 });
+    const ok = await f.call({ op: "read_source", jobId: "job-12", path: "check.js" });
+    assert.equal(ok.ok, true);
+    assert.ok(String(ok.content).includes("check ok"));
+    for (const path of ["../escape", "/etc/passwd", "..", "subdir/../../x"]) {
+      const refused = await f.call({ op: "read_source", jobId: "job-12", path });
+      assert.equal(refused.ok, false, `${path} must not be readable`);
+    }
+    const head = await f.call({ op: "verify_head", jobId: "job-12" });
+    const wrong = await f.call({ op: "export_commit", jobId: "job-12", commit: "0123456789abcdef0123456789abcdef01234567" });
+    assert.equal(wrong.ok, false, "a bundle is only exported for the actual branch head");
+    const bundle = await f.call({ op: "export_commit", jobId: "job-12", commit: String(head.head) });
+    assert.equal(bundle.ok, true);
+    assert.ok(Buffer.from(String(bundle.bundleBase64), "base64").length > 100);
+  } finally { f.cleanup(); }
 });

@@ -34,6 +34,8 @@ export type ProjectRecord = {
   defaultBranch: string;
   hostId: string;
   buildProfile: BuildProfile;
+  /** Where the feature branch is pushed; defaults to https://github.com/<slug>.git. */
+  gitRemoteUrl: string | null;
   status: ProjectStatus;
   createdAt: number;
   updatedAt: number;
@@ -273,6 +275,11 @@ export class WorkflowStore {
       this.#database.close();
       throw error;
     }
+    // Migration: Phase 2 adds a per-project push remote. Existing rows keep NULL and use the default.
+    const columns = this.#database.prepare("PRAGMA table_info(slice_projects)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "git_remote_url")) {
+      this.#database.exec("ALTER TABLE slice_projects ADD COLUMN git_remote_url TEXT");
+    }
   }
 
   static open(database: DatabaseSync): WorkflowStore {
@@ -326,6 +333,7 @@ export class WorkflowStore {
     defaultBranch: string;
     hostId: string;
     buildProfile: BuildProfile;
+    gitRemoteUrl?: string | null;
   }): ProjectRecord {
     assertId("projectId", project.projectId);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(project.repoSlug)) {
@@ -334,12 +342,17 @@ export class WorkflowStore {
     if (!/^[A-Za-z0-9._/-]{1,100}$/.test(project.defaultBranch)) throw new TypeError("Default branches must be a plain ref name");
     if (this.getHost(project.hostId) === undefined) throw new Error(`Host ${project.hostId} is not registered`);
     validateBuildProfile(project.buildProfile);
+    if (project.gitRemoteUrl !== undefined && project.gitRemoteUrl !== null) {
+      if (!/^(https|file):\/\/[^\s]{1,300}$/.test(project.gitRemoteUrl) || /@/.test(project.gitRemoteUrl)) {
+        throw new TypeError("Git remote URLs must be https:// or file:// without embedded credentials");
+      }
+    }
     const now = Date.now();
     this.#database
       .prepare(`INSERT INTO slice_projects
-        (project_id, revision, git_provider, repo_slug, default_branch, host_id, build_profile_json, status, created_at, updated_at)
-        VALUES (?, 1, 'github', ?, ?, ?, ?, 'active', ?, ?)`)
-      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId, JSON.stringify(project.buildProfile), now, now);
+        (project_id, revision, git_provider, repo_slug, default_branch, host_id, build_profile_json, git_remote_url, status, created_at, updated_at)
+        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, 'active', ?, ?)`)
+      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId, JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null, now, now);
     return this.getProject(project.projectId)!;
   }
 
@@ -860,6 +873,7 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     defaultBranch: String(row.default_branch),
     hostId: String(row.host_id),
     buildProfile: parseJson<BuildProfile>(String(row.build_profile_json), { setup: [], checks: [] }),
+    gitRemoteUrl: row.git_remote_url === null || row.git_remote_url === undefined ? null : String(row.git_remote_url),
     status: String(row.status) as ProjectStatus,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),

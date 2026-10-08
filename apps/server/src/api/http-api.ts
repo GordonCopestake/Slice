@@ -4,7 +4,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { OwnerAuth } from "../auth/owner-auth.js";
 import { hashJson, IdempotencyConflictError, type JsonValue } from "../state/application-state.js";
 import type { IssueSnapshot, WorkflowStore } from "../records/workflow-store.js";
+import type { DeliveryStore } from "../records/delivery-store.js";
+import { verificationKey } from "../records/delivery-store.js";
 import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
+import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -12,6 +15,8 @@ export type ApiDependencies = {
   workflows: WorkflowStore;
   coordinator: JobCoordinator;
   webDirectory: string;
+  deliveryStore?: DeliveryStore;
+  delivery?: DeliveryLoop | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -248,6 +253,7 @@ export class SliceApi {
               })
             : [],
         },
+        ...(typeof body.gitRemoteUrl === "string" ? { gitRemoteUrl: body.gitRemoteUrl } : {}),
       });
       json(response, 201, { project });
       return;
@@ -381,6 +387,11 @@ export class SliceApi {
         return;
       }
       if (method === "POST" && rest === "/steer") {
+        if (this.#deps.deliveryStore?.getDelivery(jobId)?.archiveState === "archived") {
+          // A merged thread is history; follow-up work is a new linked job, never a reopened branch.
+          json(response, 409, { error: "job_archived", message: "This thread is merged and archived; start a linked follow-up job instead." });
+          return;
+        }
         const body = asObject(await readBody(request));
         const requestId = requiredId(body, "requestId");
         const instruction = requiredString(body, "instruction", 20_000);
@@ -400,6 +411,56 @@ export class SliceApi {
         if (typeof revision !== "number" || !Number.isSafeInteger(revision)) throw new TypeError("revision must be an integer");
         const result = await this.#deps.coordinator.answerQuestion(jobId, questionId, revision, answer);
         json(response, result.accepted ? 200 : 409, { job: publicJob(result.job), accepted: result.accepted });
+        return;
+      }
+      if (method === "GET" && rest === "/delivery") {
+        if (this.#deps.deliveryStore === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        json(response, 200, publicDelivery(this.#deps.deliveryStore, jobId));
+        return;
+      }
+      if (method === "POST" && rest === "/accept") {
+        if (this.#deps.deliveryStore === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        const delivery = this.#deps.deliveryStore.getDelivery(jobId);
+        if (delivery === undefined || delivery.stage !== "ready" || delivery.gateVerdict !== "pass") {
+          json(response, 409, { error: "not_ready_to_accept", message: "Only a gate-passed, published job can be accepted." });
+          return;
+        }
+        const project = this.#deps.workflows.getProject(job.projectId);
+        if (project === undefined) throw new Error("the job's project is no longer registered");
+        this.#deps.deliveryStore.recordAcceptance(jobId, verificationKey({
+          repoSlug: project.repoSlug,
+          baseCommit: delivery.baseCommit,
+          headCommit: delivery.headCommit,
+          requirementsRevision: job.requirementsRevision,
+          profileRevision: job.profileRevision,
+          policyVersion: POLICY_VERSION,
+        }));
+        this.#deps.workflows.appendEvent(jobId, "result_accepted", { verificationKey: "recorded" });
+        json(response, 200, { acceptance: this.#deps.deliveryStore.getAcceptance(jobId) });
+        return;
+      }
+      if (method === "POST" && rest === "/observe-merge") {
+        if (this.#deps.delivery === null || this.#deps.delivery === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        const outcome = await this.#deps.delivery.observeMerge(jobId);
+        json(response, 200, { outcome, delivery: this.#deps.deliveryStore?.getDelivery(jobId) ?? null });
+        return;
+      }
+      if (method === "POST" && rest === "/cleanup-retry") {
+        if (this.#deps.delivery === null || this.#deps.delivery === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        await this.#deps.delivery.retryCleanup(jobId);
+        json(response, 200, { delivery: this.#deps.deliveryStore?.getDelivery(jobId) ?? null });
         return;
       }
       if (method === "PATCH" && rest === "/status-settings") {
@@ -496,6 +557,46 @@ function issueFromBody(value: JsonValue | undefined, registeredRepoSlug: string)
     url: issue.url,
     title: issue.title,
     issueUpdatedAt: issue.updatedAt,
+  };
+}
+
+function publicDelivery(store: DeliveryStore, jobId: string): Record<string, unknown> {
+  const delivery = store.getDelivery(jobId);
+  if (delivery === undefined) return { delivery: null };
+  return {
+    delivery,
+    commits: store.listCommits(jobId),
+    checks: store.listCheckResults(jobId).map((result) => ({
+      checkId: result.checkId,
+      headCommit: result.headCommit,
+      status: result.status,
+      exitCode: result.exitCode,
+      command: result.command,
+      environment: result.environment,
+      sourceDigest: result.sourceDigest,
+      verificationKey: result.verificationKey,
+      outputTail: result.outputTail.slice(-2_000),
+      createdAt: result.createdAt,
+    })),
+    reviews: store.listReviewReports(jobId).map((report) => ({
+      role: report.role,
+      headCommit: report.headCommit,
+      verdict: report.verdict,
+      scope: report.scope,
+      model: `${report.provider}/${report.modelId}`,
+      verificationKey: report.verificationKey,
+      createdAt: report.createdAt,
+    })),
+    findings: store.listFindings(jobId),
+    artifacts: store.listArtifacts(jobId).map((artifact) => ({
+      id: artifact.id,
+      kind: artifact.kind,
+      digest: artifact.digest,
+      sizeBytes: artifact.sizeBytes,
+      expiresAt: artifact.expiresAt,
+      expired: artifact.expiresAt < Date.now(),
+    })),
+    acceptance: store.getAcceptance(jobId) ?? null,
   };
 }
 

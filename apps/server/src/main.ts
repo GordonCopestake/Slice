@@ -6,14 +6,19 @@ import { SliceApi } from "./api/http-api.js";
 import { OwnerAuth } from "./auth/owner-auth.js";
 import { createConfiguredModels } from "./adapters/models/configured-models.js";
 import { PiDurableAdapter } from "./adapters/pi-durable/pi-durable-adapter.js";
+import { GithubClient } from "./adapters/github/git-host.js";
+import { GitBundlePublisher } from "./adapters/git/branch-publisher.js";
 import { RunnerAdapter } from "./adapters/ssh-runner/runner-adapter.js";
 import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/runner-transport.js";
 import { WorkflowStore } from "./records/workflow-store.js";
+import { DeliveryStore } from "./records/delivery-store.js";
 import { ApplicationStateStore } from "./state/application-state.js";
 import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
 import { ExternalOperationJournal } from "./workflow/external-operation-journal.js";
+import { DeliveryLoop } from "./workflow/delivery.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
+import { roleProfiles } from "./workflow/role-config.js";
 
 /** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
 const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -93,6 +98,34 @@ function buildRunner(workflows: WorkflowStore, state: ApplicationStateStore, sta
   throw new Error("SLICE_RUNNER_MODE must be local or ssh");
 }
 
+/**
+ * Phase 2 delivery wiring. It needs a runner, the three distinct role profiles, and a GitHub token.
+ * Without any of them the job stops after its workspace with a stated reason instead of pretending
+ * delivery started.
+ */
+function buildDelivery(
+  adapter: PiDurableAdapter,
+  workflows: WorkflowStore,
+  state: ApplicationStateStore,
+  stateDirectory: string,
+  runner: RunnerAdapter | null,
+): DeliveryLoop | null {
+  const profiles = roleProfiles(process.env);
+  const token = process.env.SLICE_GITHUB_TOKEN;
+  if (profiles === null || runner === null || token === undefined) return null;
+  return new DeliveryLoop({
+    adapter,
+    workflows,
+    delivery: DeliveryStore.open(state.database),
+    runner,
+    gitHost: new GithubClient({ token }),
+    publisher: new GitBundlePublisher(stateDirectory),
+    journal: new ExternalOperationJournal(state.database),
+    profiles,
+    artifactsDir: join(stateDirectory, "artifacts"),
+  });
+}
+
 export async function startSlice(): Promise<void> {
   // Tighten every file this process creates, including the SQLite database and its write-ahead log.
   process.umask(0o077);
@@ -105,6 +138,7 @@ export async function startSlice(): Promise<void> {
   let server: ReturnType<typeof createServer> | undefined;
   let workflows: WorkflowStore | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
+  let mergePoller: NodeJS.Timeout | undefined;
 
   try {
     const databasePath = join(stateDirectory, "state.sqlite");
@@ -117,8 +151,10 @@ export async function startSlice(): Promise<void> {
       registry: createRegistry(),
     });
     const auth = new OwnerAuth(workflows, process.env);
-    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), buildRunner(workflows, state, stateDirectory));
-    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public") });
+    const runner = buildRunner(workflows, state, stateDirectory);
+    const delivery = buildDelivery(adapter, workflows, state, stateDirectory, runner);
+    const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery);
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
@@ -148,7 +184,19 @@ export async function startSlice(): Promise<void> {
     server.on("error", (error: Error) => {
       process.stderr.write(`Slice server error: ${error.message}\n`);
     });
-    process.stdout.write(`Slice Phase 1 service listening on 127.0.0.1:${port}\n`);
+    process.stdout.write(`Slice service listening on 127.0.0.1:${port}\n`);
+
+    // Restart recovery: resume delivery where the recorded stage left off, and re-check merges.
+    if (delivery !== null) {
+      const activeWorkflows = workflows!;
+      void resumeDelivery(delivery, activeWorkflows).catch((error: unknown) => {
+        process.stderr.write(`Delivery resume failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
+      });
+      mergePoller = setInterval(() => {
+        void pollMerges(delivery, activeWorkflows).catch(() => { /* the next tick retries */ });
+      }, 60_000);
+      mergePoller.unref();
+    }
 
     await new Promise<void>((resolveStop) => {
       const stop = (): void => resolveStop();
@@ -157,7 +205,35 @@ export async function startSlice(): Promise<void> {
     });
   } finally {
     if (retentionTimer !== undefined) clearInterval(retentionTimer);
+    if (mergePoller !== undefined) clearInterval(mergePoller);
     await shutdown(server, adapter, state, lock);
+  }
+}
+
+/** Resume in-flight delivery work; durable submissions and journals make the replay safe. */
+async function resumeDelivery(delivery: DeliveryLoop, workflows: WorkflowStore): Promise<void> {
+  for (const record of delivery.activeDeliveries()) {
+    const job = workflows.getJob(record.jobId);
+    if (job === undefined) continue;
+    if (record.archiveState === "archived") {
+      if (record.cleanupState === "pending" || record.cleanupState === "failed") await delivery.retryCleanup(record.jobId);
+      continue;
+    }
+    if (record.stage === "ready") {
+      await delivery.observeMerge(record.jobId);
+      continue;
+    }
+    if (job.runState === "running") await delivery.advance(record.jobId);
+  }
+}
+
+/** Periodic merge reconciliation for jobs waiting on the owner. */
+async function pollMerges(delivery: DeliveryLoop, workflows: WorkflowStore): Promise<void> {
+  for (const record of delivery.activeDeliveries()) {
+    if (record.stage !== "ready" || record.prNumber === null) continue;
+    const job = workflows.getJob(record.jobId);
+    if (job === undefined || job.runState === "cancelled") continue;
+    await delivery.observeMerge(record.jobId);
   }
 }
 
