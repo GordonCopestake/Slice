@@ -28,8 +28,14 @@ import { StatusReports } from "./workflow/status-reports.js";
 import { roleProfiles } from "./workflow/role-config.js";
 import { modelPolicy } from "./workflow/model-policy.js";
 
-/** Only these Host header values are served, so a rebound DNS name cannot reach the loopback listener. */
-const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+/**
+ * Only these Host header values are served, so a rebound DNS name cannot reach the listener. The
+ * default is loopback only; serving another interface (a tailnet address, for example) requires the
+ * owner to name both the bind address and the host values that may reach it.
+ */
+const DEFAULT_ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+// A Host header is either a plain hostname/IP or a bracketed IPv6 literal, exactly as a client sends it.
+const HOST_PATTERN = /^(?:[A-Za-z0-9._-]{1,253}|\[[0-9A-Fa-f:.]{1,45}\])$/;
 
 /** A shutdown must release the owner lock, so it never waits on a peer longer than this. */
 const SHUTDOWN_BUDGET_MS = 5_000;
@@ -38,6 +44,29 @@ function configuredPort(value: string | undefined): number {
   const port = Number(value ?? "3000");
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("SLICE_PORT must be between 1 and 65535");
   return port;
+}
+
+/**
+ * Where the listener binds. Loopback by default: an owner who wants the service reachable from
+ * another machine names the address explicitly, and the Host allowlist has to name it too.
+ */
+function configuredBindAddress(value: string | undefined): string {
+  const address = value ?? "127.0.0.1";
+  // Bind addresses are raw (no brackets): an IPv4 literal, or an IPv6 literal Node can listen on.
+  if (!/^(\d{1,3}\.){3}\d{1,3}$|^[0-9A-Fa-f:.]{1,45}$/.test(address)) throw new Error("SLICE_BIND_ADDRESS must be an IP address");
+  return address;
+}
+
+function configuredAllowedHosts(value: string | undefined): Set<string> {
+  const hosts = (value ?? DEFAULT_ALLOWED_HOSTS.join(","))
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (hosts.length === 0) throw new Error("SLICE_ALLOWED_HOSTS must name at least one host");
+  for (const host of hosts) {
+    if (!HOST_PATTERN.test(host)) throw new Error("SLICE_ALLOWED_HOSTS entries must be plain hostnames or IP literals");
+  }
+  return new Set(hosts);
 }
 
 function configuredStateDirectory(): string {
@@ -185,9 +214,12 @@ export async function startSlice(): Promise<void> {
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
     retentionTimer.unref();
+    const port = configuredPort(process.env.SLICE_PORT);
+    const bindAddress = configuredBindAddress(process.env.SLICE_BIND_ADDRESS);
+    const allowedHosts = configuredAllowedHosts(process.env.SLICE_ALLOWED_HOSTS);
     server = createServer((request, response) => {
       const host = request.headers.host?.replace(/:\d+$/, "") ?? "";
-      if (!ALLOWED_HOSTS.has(host)) {
+      if (!allowedHosts.has(host)) {
         response.writeHead(421, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         response.end(JSON.stringify({ error: "unknown_host" }));
         return;
@@ -200,17 +232,16 @@ export async function startSlice(): Promise<void> {
       }
       void api.handle(request, response);
     });
-    const port = configuredPort(process.env.SLICE_PORT);
     await new Promise<void>((resolveListen, rejectListen) => {
       server!.once("error", rejectListen);
-      server!.listen(port, "127.0.0.1", () => resolveListen());
+      server!.listen(port, bindAddress, () => resolveListen());
     });
     // Past this point a later server error must not disappear into a listener that already settled.
     server.removeAllListeners("error");
     server.on("error", (error: Error) => {
       process.stderr.write(`Slice server error: ${error.message}\n`);
     });
-    process.stdout.write(`Slice service listening on 127.0.0.1:${port}\n`);
+    process.stdout.write(`Slice service listening on ${bindAddress}:${port}\n`);
 
     // Restart recovery: resume delivery where the recorded stage left off, and re-check merges.
     if (delivery !== null) {

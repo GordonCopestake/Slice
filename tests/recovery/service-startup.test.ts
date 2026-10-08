@@ -21,8 +21,8 @@ async function unusedPort(): Promise<number> {
   return address.port;
 }
 
-function startService(script: string, directory: string, port: number) {
-  const env: NodeJS.ProcessEnv = { ...process.env, SLICE_STATE_DIR: directory, SLICE_PORT: String(port) };
+function startService(script: string, directory: string, port: number, extraEnv: Record<string, string> = {}) {
+  const env: NodeJS.ProcessEnv = { ...process.env, SLICE_STATE_DIR: directory, SLICE_PORT: String(port), ...extraEnv };
   delete env.SLICE_LOCAL_BASE_URL;
   delete env.SLICE_LOCAL_MODEL_ID;
   delete env.SLICE_OPENAI_MODEL_ID;
@@ -188,5 +188,45 @@ test("service health works and the state lock releases after restart", { timeout
     if (first !== undefined) await stopService(first);
     if (restarted !== undefined) await stopService(restarted);
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an owner can name the address and Host values the service serves", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "slice-service-bind-"));
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+  const port = await unusedPort();
+  const child = startService(script, directory, port, {
+    SLICE_BIND_ADDRESS: "127.0.0.1",
+    SLICE_ALLOWED_HOSTS: `127.0.0.1,tailnet.internal`,
+  });
+  try {
+    await waitForHealth(port, child);
+    assert.equal(await rawStatus(port, `tailnet.internal:${port}`), 200, "a named tailnet host is served");
+    assert.equal(await rawStatus(port, "evil.example"), 421, "an unnamed host is still refused");
+    assert.equal(await rawStatus(port, `localhost:${port}`), 421, "loopback is no longer automatic once the owner names hosts");
+  } finally {
+    await stopService(child);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a bad bind address or Host allowlist stops startup instead of widening exposure", { timeout: 30_000 }, async () => {
+  const script = fileURLToPath(new URL("../../apps/server/src/main.js", import.meta.url));
+  for (const [name, value] of [
+    ["SLICE_BIND_ADDRESS", "evil.example"],
+    ["SLICE_BIND_ADDRESS", "127.0.0.1; iptables -F"],
+    ["SLICE_ALLOWED_HOSTS", "evil example"],
+    ["SLICE_ALLOWED_HOSTS", ""],
+  ] as const) {
+    const directory = await mkdtemp(join(tmpdir(), "slice-service-bad-"));
+    const port = await unusedPort();
+    const child = startService(script, directory, port, { [name]: value });
+    try {
+      const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+      assert.notEqual(code, 0, `${name}=${JSON.stringify(value)} must refuse to start`);
+    } finally {
+      await stopService(child);
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 });
