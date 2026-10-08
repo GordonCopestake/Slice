@@ -175,40 +175,76 @@ async function projectsView() {
   const hostId = el("input", { placeholder: "runner-a" });
   const address = el("input", { placeholder: "runner.internal" });
   const sshUser = el("input", { placeholder: "slice-runner" });
-  const runnerRoot = el("input", { placeholder: "/srv/slice/jobs" });
+  const runnerRoot = el("input", { placeholder: "/srv/slice/jobs or D:\\slice\\jobs" });
+  const hostOs = el("select", {}, el("option", { value: "linux" }, "linux"), el("option", { value: "windows" }, "windows"));
+  const hostCapacity = el("input", { type: "number", min: "1", max: "64", value: "1", title: "How many jobs this worker may carry at once" });
+  const poolId = el("input", { placeholder: "pool-1" });
   const projectId = el("input", { placeholder: "demo-app" });
   const repoSlug = el("input", { placeholder: "you/demo-app" });
   const branch = el("input", { placeholder: "main" });
   const checkId = el("input", { placeholder: "test" });
   const checkCommand = el("input", { placeholder: "npm test" });
+  const toolchainTool = el("input", { placeholder: "node --version", title: "A tool this project's build profile needs on its worker" });
   const error = el("p", { class: "error" });
+  const hostsCard = el("div", { class: "card" },
+    el("h3", {}, "Registered hosts"),
+    ...hosts.hosts.map((host) => el("p", {},
+      `${host.hostId} — ${host.address} (${host.os}, ${host.sshUser}, ${host.runnerRoot}) `,
+      badge(host.enabled ? `capacity ${host.capacity}` : "disabled"),
+      " ", el("button", { onclick: async () => {
+        await api(`/api/hosts/${host.hostId}/enabled`, { method: "POST", body: JSON.stringify({ enabled: !host.enabled }) });
+        await render();
+      } }, host.enabled ? "Disable" : "Enable"),
+    )),
+    hosts.hosts.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
+    el("div", { class: "row" }, hostId, address, hostOs, sshUser, runnerRoot, hostCapacity,
+      el("button", { class: "primary", onclick: async () => {
+        try {
+          await api("/api/hosts", { method: "POST", body: JSON.stringify({
+            hostId: hostId.value, address: address.value, os: hostOs.value, sshUser: sshUser.value,
+            runnerRoot: runnerRoot.value, capacity: Number(hostCapacity.value || 1),
+          }) });
+          await render();
+        } catch (cause) { error.textContent = String(cause.message); }
+      } }, "Add host")),
+    el("div", { class: "row" }, poolId,
+      el("button", { onclick: async () => {
+        try {
+          await api("/api/host-pools", { method: "POST", body: JSON.stringify({ poolId: poolId.value, hosts: hosts.hosts.map((host) => host.hostId) }) });
+          await render();
+        } catch (cause) { error.textContent = String(cause.message); }
+      } }, "Pool all hosts (a job uses one worker with room)")),
+  );
   return el("section", {},
-    el("div", { class: "card" },
-      el("h3", {}, "Registered hosts"),
-      ...hosts.hosts.map((host) => el("p", {}, `${host.hostId} — ${host.address} (${host.os}, ${host.sshUser}, ${host.runnerRoot})`)),
-      hosts.hosts.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
-      el("div", { class: "row" }, hostId, address, sshUser, runnerRoot,
-        el("button", { class: "primary", onclick: async () => {
-          try { await api("/api/hosts", { method: "POST", body: JSON.stringify({ hostId: hostId.value, address: address.value, os: "linux", sshUser: sshUser.value, runnerRoot: runnerRoot.value }) }); await render(); }
-          catch (cause) { error.textContent = String(cause.message); }
-        } }, "Add host")),
-    ),
+    hostsCard,
     el("div", { class: "card" },
       el("h3", {}, "Registered projects"),
       ...projects.projects.map((project) => el("p", {},
         `${project.projectId} — ${project.repoSlug} @ ${project.hostId} `, badge(project.status),
+        badge(project.requiredOs),
+        project.toolchain && project.toolchain.length > 0 ? badge(`toolchain ${project.toolchain.length}`) : null,
         " ", el("button", { onclick: async () => {
           await api(`/api/projects/${project.projectId}/status`, { method: "POST", body: JSON.stringify({ status: project.status === "active" ? "paused" : "active" }) });
           await render();
         } }, project.status === "active" ? "Pause" : "Activate"),
+        project.toolchain && project.toolchain.length > 0 ? el("button", { onclick: async () => {
+          try {
+            const { body } = await api(`/api/projects/${project.projectId}/toolchain-check`, { method: "POST" });
+            error.textContent = body.passed
+              ? `${project.projectId} on ${body.hostId}: ${body.tools.map((tool) => `${tool.id} ${tool.version}`).join(", ")}`
+              : `${project.projectId} on ${body.hostId}: ${body.tools.map((tool) => `${tool.id} exit ${tool.exitCode}`).join(", ")}`;
+          } catch (cause) { error.textContent = String(cause.message); }
+        } }, "Verify toolchain") : null,
       )),
       projects.projects.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
-      el("div", { class: "row" }, projectId, repoSlug, branch, checkId, checkCommand,
+      el("div", { class: "row" }, projectId, repoSlug, branch, checkId, checkCommand, toolchainTool,
         el("button", { class: "primary", onclick: async () => {
           try {
             await api("/api/projects", { method: "POST", body: JSON.stringify({
               projectId: projectId.value, repoSlug: repoSlug.value, defaultBranch: branch.value,
               hostId: hostId.value || (hosts.hosts[0] && hosts.hosts[0].hostId),
+              requiredOs: hostOs.value,
+              ...(toolchainTool.value ? { toolchain: [{ id: toolchainTool.value.split(/\s+/)[0], command: toolchainTool.value }] } : {}),
               buildProfile: { setup: [], checks: [{ id: checkId.value, command: checkCommand.value }] },
             }) });
             await render();
@@ -216,8 +252,46 @@ async function projectsView() {
         } }, "Add project")),
       error,
     ),
+    releasesCard(projects.projects),
     telegramCard(telegramResult),
   );
+}
+
+/** Releases and rollback rehearsals, per project. A restore runs on the project's own worker. */
+function releasesCard(projects) {
+  const cards = projects.map((project) => {
+    const list = el("div", {});
+    const note = el("p", { class: "muted" });
+    const load = async () => {
+      try {
+        const [{ body: releases }, { body: rehearsals }] = await Promise.all([
+          api(`/api/projects/${project.projectId}/releases`),
+          api(`/api/projects/${project.projectId}/rollback-rehearsals`),
+        ]);
+        list.replaceChildren(
+          ...(releases.releases.length === 0 ? [el("p", { class: "muted" }, "No releases recorded yet.")] : releases.releases.map((release) => el("p", {},
+            `${release.commitSha.slice(0, 12)} ${release.branch}${release.prNumber ? ` PR #${release.prNumber}` : ""} `,
+            badge(release.state), badge(release.restorable ? "restorable" : "no artifact"),
+            release.restorable ? el("button", { onclick: async () => {
+              note.textContent = "Rehearsing in a staging workspace on the project's worker...";
+              try {
+                const { body } = await api(`/api/projects/${project.projectId}/releases/${release.releaseId}/restore-staging`, { method: "POST" });
+                note.textContent = `Rehearsal ${body.rehearsal.outcome}: ${body.checks.map((check) => `${check.checkId} ${check.status}`).join(", ")}${body.rehearsal.reason ? ` — ${body.rehearsal.reason}` : ""}`;
+                await load();
+              } catch (cause) { note.textContent = String(cause.message); }
+            } }, "Rehearse restore") : null,
+          ))),
+          ...(rehearsals.rehearsals.length === 0 ? [] : [el("h4", {}, "Rollback rehearsals"), ...rehearsals.rehearsals.map((rehearsal) => el("p", {},
+            `${rehearsal.releaseId} on ${rehearsal.hostId} `, badge(rehearsal.outcome), rehearsal.reason ? el("span", { class: "muted" }, ` ${rehearsal.reason}`) : null,
+          ))]),
+        );
+      } catch (cause) { list.replaceChildren(el("p", { class: "error" }, String(cause.message))); }
+    };
+    void load();
+    return el("div", { class: "card" }, el("h3", {}, `Releases — ${project.projectId}`), list, note,
+      el("button", { onclick: () => { void load(); } }, "Refresh"));
+  });
+  return cards;
 }
 
 /** Telegram linking and periodic-report opt-in. Status only: the token never reaches the browser. */
@@ -300,6 +374,9 @@ async function jobView(jobId) {
       el("button", { onclick: () => void act("pause") }, "Pause"),
       el("button", { onclick: () => void act("resume") }, "Resume"),
       el("button", { onclick: () => void act("cancel") }, "Cancel"),
+      // A job that blocked on the environment (no worker, no capacity, wrong OS, unverified toolchain,
+      // model rules, or missing rollback evidence) is retried after the owner fixes it.
+      job.runState === "blocked" ? el("button", { class: "primary", onclick: () => void act("retry") }, "Retry") : null,
     ),
     actionError,
   );
