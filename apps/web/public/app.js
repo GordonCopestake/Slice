@@ -26,6 +26,9 @@ function el(tag, attrs = {}, ...children) {
   for (const [key, value] of Object.entries(attrs)) {
     if (key === "class") node.className = value;
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    // Boolean properties (checked, disabled) must be set as properties: an attribute of "false"
+    // is still a present attribute and would render as enabled/checked.
+    else if (typeof value === "boolean") node[key] = value;
     else node.setAttribute(key, value);
   }
   for (const child of children) {
@@ -94,37 +97,42 @@ function loginView() {
 async function jobsView() {
   const view = state.threadsView ?? "active";
   const query = state.threadsQuery ?? "";
-  const { body } = await api(`/api/jobs?view=${encodeURIComponent(view)}&query=${encodeURIComponent(query)}`);
+  const results = el("div", {});
   let debounce;
+  async function loadResults() {
+    const { body } = await api(`/api/jobs?view=${encodeURIComponent(state.threadsView ?? "active")}&query=${encodeURIComponent(state.threadsQuery ?? "")}`);
+    results.replaceChildren(...(body.jobs.length === 0
+      ? [el("p", { class: "muted card" }, (state.threadsView ?? "active") === "archived" ? "No archived threads match." : "No threads yet. Start one with New request.")]
+      : body.jobs.map((job) => el("div", { class: "card" },
+          el("div", { class: "row" },
+            el("strong", {}, job.title),
+            badge(job.stage),
+            badge(job.runState),
+            job.archived ? badge("archived") : null,
+            el("span", { class: "muted" }, job.projectId),
+            job.prNumber ? el("span", { class: "muted" }, `PR #${job.prNumber}`) : null,
+            job.branch ? el("span", { class: "muted" }, job.branch) : null,
+            el("span", { class: "muted" }, new Date(job.updatedAt).toLocaleString()),
+          ),
+          job.issue ? el("p", { class: "muted" }, `issue ${job.issue.repoSlug}#${job.issue.issueNumber}`) : null,
+          el("button", { onclick: () => { state.jobId = job.jobId; state.view = "job"; void render(); } }, job.archived ? "Open result" : "Open"),
+        ))));
+  }
   const search = el("input", {
     placeholder: "search by title, project, PR number, branch, or date",
     value: query,
     oninput: () => {
       clearTimeout(debounce);
-      debounce = setTimeout(() => { state.threadsQuery = search.value; void render(); }, 400);
+      // Only the results update while typing; the field keeps focus and the text stays put.
+      debounce = setTimeout(() => { state.threadsQuery = search.value; void loadResults(); }, 400);
     },
   });
   const tabs = el("div", { class: "row" },
     el("button", { class: view === "active" ? "primary" : "", onclick: () => { state.threadsView = "active"; void render(); } }, "Active"),
     el("button", { class: view === "archived" ? "primary" : "", onclick: () => { state.threadsView = "archived"; void render(); } }, "Archived"),
     search);
-  const list = el("div", {}, tabs, ...(body.jobs.length === 0
-    ? [el("p", { class: "muted card" }, view === "archived" ? "No archived threads match." : "No threads yet. Start one with New request.")]
-    : body.jobs.map((job) => el("div", { class: "card" },
-        el("div", { class: "row" },
-          el("strong", {}, job.title),
-          badge(job.stage),
-          badge(job.runState),
-          job.archived ? badge("archived") : null,
-          el("span", { class: "muted" }, job.projectId),
-          job.prNumber ? el("span", { class: "muted" }, `PR #${job.prNumber}`) : null,
-          job.branch ? el("span", { class: "muted" }, job.branch) : null,
-          el("span", { class: "muted" }, new Date(job.updatedAt).toLocaleString()),
-        ),
-        job.issue ? el("p", { class: "muted" }, `issue ${job.issue.repoSlug}#${job.issue.issueNumber}`) : null,
-        el("button", { onclick: () => { state.jobId = job.jobId; state.view = "job"; void render(); } }, job.archived ? "Open result" : "Open"),
-      ))));
-  return list;
+  await loadResults();
+  return el("div", {}, tabs, results);
 }
 
 function newJobView() {
