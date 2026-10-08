@@ -60,6 +60,8 @@ export type ProjectRecord = {
   /** Which worker OS this project's build profile needs. */
   requiredOs: "linux" | "windows";
   modelRules: ModelRules;
+  /** Tools this project's build profile needs on its worker. A Windows project must declare them. */
+  toolchain: { id: string; command: string }[];
   buildProfile: BuildProfile;
   /** Where the feature branch is pushed; defaults to https://github.com/<slug>.git. */
   gitRemoteUrl: string | null;
@@ -205,6 +207,15 @@ export class WorkflowStore {
           hosts_json TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS slice_toolchain_attestations (
+          host_id TEXT NOT NULL,
+          project_id TEXT NOT NULL,
+          passed INTEGER NOT NULL,
+          tools_json TEXT NOT NULL,
+          profile_revision INTEGER NOT NULL,
+          verified_at INTEGER NOT NULL,
+          PRIMARY KEY (host_id, project_id)
+        );
         CREATE TABLE IF NOT EXISTS slice_projects (
           project_id TEXT PRIMARY KEY,
           revision INTEGER NOT NULL,
@@ -215,6 +226,7 @@ export class WorkflowStore {
           pool_id TEXT,
           required_os TEXT NOT NULL DEFAULT 'linux',
           model_rules_json TEXT,
+          toolchain_json TEXT,
           build_profile_json TEXT NOT NULL,
           status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'removed')),
           created_at INTEGER NOT NULL,
@@ -398,6 +410,57 @@ export class WorkflowStore {
       .map((row) => ({ poolId: String(row.pool_id), hosts: parseJson<string[]>(String(row.hosts_json), []), createdAt: Number(row.created_at) }));
   }
 
+  /**
+   * Record what a worker actually reported for a project's declared tools. An attestation is only
+   * valid for the profile revision it was taken against, so a changed toolchain invalidates it.
+   */
+  recordAttestation(input: { hostId: string; projectId: string; profileRevision: number; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] }): void {
+    assertId("hostId", input.hostId);
+    assertId("projectId", input.projectId);
+    this.#database.prepare(
+      `INSERT INTO slice_toolchain_attestations (host_id, project_id, passed, tools_json, profile_revision, verified_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(host_id, project_id) DO UPDATE SET passed = excluded.passed, tools_json = excluded.tools_json,
+         profile_revision = excluded.profile_revision, verified_at = excluded.verified_at`,
+    ).run(input.hostId, input.projectId, input.passed ? 1 : 0, JSON.stringify(input.tools), input.profileRevision, Date.now());
+  }
+
+  getAttestation(hostId: string, projectId: string): { hostId: string; projectId: string; passed: boolean; profileRevision: number; verifiedAt: number; tools: Record<string, unknown>[] } | undefined {
+    assertId("hostId", hostId);
+    assertId("projectId", projectId);
+    const row = this.#database.prepare("SELECT * FROM slice_toolchain_attestations WHERE host_id = ? AND project_id = ?").get(hostId, projectId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : {
+      hostId: String(row.host_id),
+      projectId: String(row.project_id),
+      passed: Number(row.passed) !== 0,
+      profileRevision: Number(row.profile_revision),
+      verifiedAt: Number(row.verified_at),
+      tools: parseJson<Record<string, unknown>[]>(String(row.tools_json), []),
+    };
+  }
+
+  /**
+   * Whether a project's declared tools are attested on a given worker, for the project's current
+   * profile revision. A missing, failed, or stale attestation is not ready - never assumed.
+   */
+  toolchainReady(project: ProjectRecord, hostId: string): { ready: true } | { ready: false; reason: string } {
+    if (project.toolchain.length === 0) return { ready: true };
+    const attestation = this.getAttestation(hostId, project.projectId);
+    if (attestation === undefined) return { ready: false, reason: `no toolchain attestation on ${hostId} for project ${project.projectId}` };
+    if (!attestation.passed) return { ready: false, reason: `the last toolchain check on ${hostId} for ${project.projectId} failed` };
+    if (attestation.profileRevision !== project.revision) {
+      return { ready: false, reason: `the toolchain attestation on ${hostId} is for profile revision ${attestation.profileRevision}; the project is on ${project.revision}` };
+    }
+    const attested = new Map(attestation.tools.map((tool) => [String(tool.id ?? ""), tool]));
+    for (const tool of project.toolchain) {
+      const entry = attested.get(tool.id);
+      if (entry === undefined) return { ready: false, reason: `tool ${tool.id} was never probed on ${hostId}` };
+      if (entry.command !== tool.command) return { ready: false, reason: `tool ${tool.id} was probed with a different command on ${hostId}` };
+      if (typeof entry.version !== "string" || entry.version.length === 0) return { ready: false, reason: `tool ${tool.id} reported no version on ${hostId}` };
+    }
+    return { ready: true };
+  }
+
   /** Jobs currently occupying a host. The job being placed is excluded: its own workspace must not
    * block its own re-placement when delivery re-runs. */
   activeHostCount(hostId: string, excludeJobId?: string): number {
@@ -459,6 +522,7 @@ export class WorkflowStore {
     poolId?: string | null;
     requiredOs?: "linux" | "windows";
     modelRules?: Partial<ModelRules>;
+    toolchain?: { id: string; command: string }[];
     buildProfile: BuildProfile;
     gitRemoteUrl?: string | null;
     preview?: PreviewConfig | null;
@@ -479,13 +543,19 @@ export class WorkflowStore {
       }
     }
     if (project.preview !== undefined && project.preview !== null) validatePreview(project.preview);
+    const toolchain = toolchainRules(project.toolchain);
+    // A Windows project is only allowed to exist with a declared toolchain: without one there is
+    // nothing to attest, and the project would silently run on an unverified worker.
+    if ((project.requiredOs ?? "linux") === "windows" && toolchain.length === 0) {
+      throw new TypeError("A Windows project must declare the toolchain its build profile needs");
+    }
     const now = Date.now();
     this.#database
       .prepare(`INSERT INTO slice_projects
-        (project_id, revision, git_provider, repo_slug, default_branch, host_id, pool_id, required_os, model_rules_json, build_profile_json, git_remote_url, preview_json, status, created_at, updated_at)
-        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+        (project_id, revision, git_provider, repo_slug, default_branch, host_id, pool_id, required_os, model_rules_json, toolchain_json, build_profile_json, git_remote_url, preview_json, status, created_at, updated_at)
+        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
       .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId,
-        project.poolId ?? null, project.requiredOs ?? "linux", JSON.stringify(modelRules(project.modelRules)),
+        project.poolId ?? null, project.requiredOs ?? "linux", JSON.stringify(modelRules(project.modelRules)), JSON.stringify(toolchain),
         JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null,
         project.preview === undefined || project.preview === null ? null : JSON.stringify(project.preview), now, now);
     return this.getProject(project.projectId)!;
@@ -1083,6 +1153,7 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     poolId: row.pool_id === null || row.pool_id === undefined ? null : String(row.pool_id),
     requiredOs: (row.required_os === null || row.required_os === undefined ? "linux" : String(row.required_os)) as ProjectRecord["requiredOs"],
     modelRules: modelRules(parseJson<Partial<ModelRules>>(String(row.model_rules_json ?? "{}"), {})),
+    toolchain: toolchainRules(parseJson<unknown>(String(row.toolchain_json ?? "[]"), [])),
     buildProfile: parseJson<BuildProfile>(String(row.build_profile_json), { setup: [], checks: [] }),
     gitRemoteUrl: row.git_remote_url === null || row.git_remote_url === undefined ? null : String(row.git_remote_url),
     preview: row.preview_json === null || row.preview_json === undefined ? null : parseJson<PreviewConfig | null>(String(row.preview_json), null),
@@ -1090,6 +1161,19 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
+}
+
+/** Toolchain entries are plain argv commands, validated the same way the runner validates them. */
+function toolchainRules(input: unknown): { id: string; command: string }[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((entry): entry is { id: string; command: string } => {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+      const tool = entry as Record<string, unknown>;
+      return typeof tool.id === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(tool.id)
+        && typeof tool.command === "string" && /^[A-Za-z0-9._/@-]{1,128}(\s+[A-Za-z0-9._/@:=,+.-]{1,256})*$/.test(tool.command);
+    })
+    .slice(0, 16);
 }
 
 /** Model and privacy rules are normalised here so a malformed rule never reaches a role conversation. */

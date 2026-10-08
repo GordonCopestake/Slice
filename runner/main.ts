@@ -49,6 +49,7 @@ type Request =
   | { op: "preview_status"; jobId: string }
   | { op: "capture_screenshot"; jobId: string; scenarioId: string; route: string; commit: string; width: number; height: number }
   | { op: "stop_preview"; jobId: string }
+  | { op: "probe_toolchain"; jobId: string; tools: { id: string; command: string }[] }
   | { op: "cleanup_job"; jobId: string };
 
 type Response =
@@ -644,6 +645,36 @@ function handleStopPreview(journal: Journal, root: string, request: Extract<Requ
   return { ok: true, status: "stopped" };
 }
 
+/**
+ * Run the project's declared tool probes on this host and report what actually answered. The
+ * commands are plain argv from registered project configuration, validated by the same pattern as
+ * every other operation; nothing here comes from a model.
+ */
+function handleProbeToolchain(root: string, request: Extract<Request, { op: "probe_toolchain" }>): Response {
+  assertId(request.jobId, "jobId");
+  const marker = jobMarker(join(root, request.jobId));
+  if (marker === undefined || marker.jobId !== request.jobId) return fail("manifest_mismatch");
+  if (request.tools.length === 0 || request.tools.length > 16) return fail("tool_count_invalid");
+  const worktreePath = join(root, request.jobId, "author");
+  const results: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] = [];
+  for (const tool of request.tools) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(tool.id)) return fail("tool_id_invalid");
+    if (!COMMAND_PATTERN.test(tool.command)) return fail(`command_not_allowed: ${tool.id}`);
+    const [program, ...args] = tool.command.split(/\s+/);
+    const result = spawnSync(program ?? "", args, { cwd: worktreePath, encoding: "utf8", timeout: 30_000, env: { PATH: process.env.PATH ?? "" }, shell: false });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    const exitCode = typeof result.status === "number" ? result.status : null;
+    results.push({
+      id: tool.id,
+      command: tool.command,
+      exitCode,
+      version: exitCode === 0 ? (output.split(/\r?\n/)[0] ?? "").slice(0, 120) : null,
+      outputTail: output.slice(-500),
+    });
+  }
+  return { ok: true, tools: results, allPassed: results.every((tool) => tool.exitCode === 0 && tool.version !== null && tool.version.length > 0) };
+}
+
 function runSupervisor(argv: string[]): void {
   // --supervise <journalDir> <worktree> <operationId> <timeoutMs> <command...>
   const [journalDir, worktree, operationId, timeoutRaw, ...command] = argv;
@@ -778,6 +809,9 @@ async function main(): Promise<void> {
         break;
       case "stop_preview":
         response = handleStopPreview(journal, root, request);
+        break;
+      case "probe_toolchain":
+        response = handleProbeToolchain(root, request);
         break;
       case "cleanup_job":
         response = handleCleanup(journal, root, request);

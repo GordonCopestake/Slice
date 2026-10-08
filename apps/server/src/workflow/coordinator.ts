@@ -100,6 +100,44 @@ export class JobCoordinator {
     return this.#profile !== null;
   }
 
+  /**
+   * Ask a worker what it actually has. The probes are the project's own declared tool commands, run
+   * on a host the project could use, and the result is recorded as an attestation bound to the
+   * project's current profile revision. Nothing is inferred: a host that does not answer fails.
+   */
+  async verifyToolchain(projectId: string): Promise<{ hostId: string; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] }> {
+    const project = this.#workflows.getProject(projectId);
+    if (project === undefined) throw new Error("project_not_found");
+    if (this.#runner === null) throw new Error("no runner is configured for this service");
+    if (project.toolchain.length === 0) throw new Error("the project declares no toolchain to verify");
+    const placement = this.#workflows.chooseHost(project);
+    if ("reason" in placement) throw new Error(placement.detail);
+    const host = placement.host;
+    // The probe needs a prepared workspace to run in; a throwaway probe job keeps real jobs untouched.
+    const probeJobId = `probe-${projectId}`;
+    let tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[];
+    try {
+      await this.#runner.prepareJob({
+        jobId: probeJobId,
+        hostId: host.hostId,
+        source: project.gitRemoteUrl ?? `https://github.com/${project.repoSlug}.git`,
+        branch: `slice/${probeJobId}/toolchain`,
+        leaseGeneration: 1,
+      });
+      const result = await this.#runner.probeToolchain({ jobId: probeJobId, hostId: host.hostId, tools: project.toolchain });
+      tools = result.tools;
+      const passed = result.allPassed;
+      this.#workflows.recordAttestation({ hostId: host.hostId, projectId, profileRevision: project.revision, passed, tools });
+      this.#workflows.appendEvent(probeJobId, "toolchain_checked", { hostId: host.hostId, projectId, passed, tools: tools.map((tool) => ({ id: tool.id, version: tool.version, exitCode: tool.exitCode })) });
+      return { hostId: host.hostId, passed, tools };
+    } finally {
+      // The probe workspace is disposable; a failed cleanup is recorded by the runner's own state.
+      try {
+        await this.#runner.cleanupJob({ jobId: probeJobId, hostId: host.hostId });
+      } catch { /* probe workspaces are reclaimed by the runner's retention */ }
+    }
+  }
+
   async createJob(input: {
     requestId: string;
     payloadHash: string;
@@ -202,6 +240,14 @@ export class JobCoordinator {
         return;
       }
       const host = placement.host;
+      // A project with a declared toolchain runs only on a worker that has actually passed those
+      // probes for the current profile revision. An unverified worker never starts work.
+      const toolchain = this.#workflows.toolchainReady(project, host.hostId);
+      if (!toolchain.ready) {
+        this.#workflows.appendEvent(jobId, "blocked", { reason: "toolchain_unverified", detail: toolchain.reason });
+        this.#workflows.setRunState(jobId, ["running", "waiting_user"], "blocked");
+        return;
+      }
       let workspace = this.#workflows.getWorkspace(jobId);
       // Git ref components may not begin with a dash, so the short title is trimmed of edge dashes.
       const shortTitle = job.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "change";
@@ -300,6 +346,28 @@ export class JobCoordinator {
     const resumed = this.#workflows.setRunState(jobId, ["paused"], open ? "waiting_user" : "running")!;
     this.#workflows.appendEvent(jobId, "resumed", { runState: resumed.runState });
     return resumed;
+  }
+
+  /**
+   * Retry a job that blocked on the environment (no host, no capacity, wrong OS, unverified
+   * toolchain, model policy). The owner fixes the environment and asks for a retry; the job re-enters
+   * the same placement and preparation path, so nothing is skipped and nothing is assumed.
+   */
+  async retryBlocked(jobId: string): Promise<JobRecord> {
+    const job = this.#workflows.getJob(jobId);
+    if (job === undefined) throw new Error(`Job ${jobId} is not known`);
+    if (job.runState !== "blocked") throw new JobStateConflictError(`Job ${jobId} is ${job.runState}, not blocked`);
+    this.#workflows.appendEvent(jobId, "retry_requested", { stage: job.stage });
+    if (job.stage === "requirements") {
+      // Requirements never settled: the blocking reason may have been the model rules themselves.
+      const question = this.#workflows.openQuestions(jobId)[0];
+      const running = this.#workflows.setRunState(jobId, ["blocked"], question === undefined ? "running" : "waiting_user")!;
+      if (question === undefined) return this.#runRequirements(running, job.requestText);
+      return running;
+    }
+    const running = this.#workflows.setRunState(jobId, ["blocked"], "running")!;
+    await this.#advanceWorkspace(running);
+    return this.#workflows.getJob(jobId)!;
   }
 
   async cancel(jobId: string): Promise<JobRecord> {

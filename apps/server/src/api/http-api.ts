@@ -313,6 +313,13 @@ export class SliceApi {
               })
             : [],
         },
+        ...(Array.isArray(body.toolchain)
+          ? { toolchain: body.toolchain.map((item) => {
+              if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("toolchain entries must be objects");
+              const tool = item as Record<string, unknown>;
+              return { id: String(tool.id ?? ""), command: String(tool.command ?? "") };
+            }) }
+          : {}),
         ...(typeof body.gitRemoteUrl === "string" ? { gitRemoteUrl: body.gitRemoteUrl } : {}),
         ...(body.preview === undefined || body.preview === null ? {} : (() => {
           if (typeof body.preview !== "object" || Array.isArray(body.preview)) throw new TypeError("preview must be an object");
@@ -331,11 +338,57 @@ export class SliceApi {
       return;
     }
 
+    const toolchainCheck = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/toolchain-check$/.exec(path);
+    if (method === "POST" && toolchainCheck !== null) {
+      const projectId = toolchainCheck[1]!;
+      const project = this.#deps.workflows.getProject(projectId);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (project.toolchain.length === 0) {
+        json(response, 409, { error: "no_toolchain_declared", message: "The project declares no toolchain to verify" });
+        return;
+      }
+      type ToolchainResult = { hostId: string; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] };
+      let result: ToolchainResult;
+      try {
+        result = await this.#deps.coordinator.verifyToolchain(projectId);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 300) : "unknown";
+        json(response, 502, { error: "toolchain_check_failed", message: reason });
+        return;
+      }
+      const attestation = this.#deps.workflows.getAttestation(result.hostId, projectId);
+      json(response, 200, {
+        hostId: result.hostId,
+        passed: result.passed,
+        tools: result.tools.map((tool) => ({ id: tool.id, command: tool.command, exitCode: tool.exitCode, version: tool.version })),
+        attestedForRevision: attestation?.profileRevision ?? null,
+        projectRevision: project.revision,
+      });
+      return;
+    }
+
     const projectStatus = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/status$/.exec(path);
     if (method === "POST" && projectStatus !== null) {
       const body = asObject(await readBody(request));
       const status = body.status;
       if (status !== "active" && status !== "paused" && status !== "removed") throw new TypeError("status must be active, paused, or removed");
+      // A project whose worker toolchain is not attested cannot be activated.
+      if (status === "active") {
+        const candidate = this.#deps.workflows.getProject(projectStatus[1]!);
+        if (candidate !== undefined && candidate.toolchain.length > 0) {
+          const hosts = candidate.poolId === null
+            ? [candidate.hostId]
+            : this.#deps.workflows.getPool(candidate.poolId)?.hosts ?? [];
+          const ready = hosts.some((hostId) => this.#deps.workflows.toolchainReady(candidate, hostId).ready);
+          if (!ready) {
+            json(response, 409, { error: "toolchain_unverified", message: `No host for ${candidate.projectId} has passed its declared toolchain checks for the current profile revision` });
+            return;
+          }
+        }
+      }
       const project = this.#deps.workflows.setProjectStatus(projectStatus[1]!, status);
       if (project === undefined) {
         json(response, 404, { error: "project_not_found" });
@@ -531,6 +584,10 @@ export class SliceApi {
       }
       if (method === "POST" && rest === "/resume") {
         json(response, 200, { job: publicJob(this.#deps.coordinator.resume(jobId)) });
+        return;
+      }
+      if (method === "POST" && rest === "/retry") {
+        json(response, 200, { job: publicJob(await this.#deps.coordinator.retryBlocked(jobId)) });
         return;
       }
       if (method === "POST" && rest === "/cancel") {
