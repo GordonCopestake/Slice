@@ -1,6 +1,6 @@
 # Phase 3 results: evidence, thread history, and notifications
 
-Status: **synthetic checks pass (132 Node tests; 27 were added in Phase 3). The live exit check is
+Status: **synthetic checks pass (133 Node tests; 28 were added in Phase 3). The live exit check is
 not tested** — it needs a phone/tablet/desktop browser trial against a running service with a real
 preview, and a linked Telegram account, none of which existed for this run. Synthetic and live
 results are kept separate below.
@@ -60,7 +60,7 @@ results are kept separate below.
 
 ## Checks run
 
-`npm run check` passes: format, typecheck, build, and 132 Node tests. The Phase 3 tests map onto the
+`npm run check` passes: format, typecheck, build, and 133 Node tests. The Phase 3 tests map onto the
 spec's verification table:
 
 | Verification | Result |
@@ -125,6 +125,29 @@ process), but the browser-assessment half needs an owner trial. It stays open un
   separate from the control UI).
 - Chromium's own sandbox is left at its default; the runner never adds `--no-sandbox`.
 - Archived search is a substring match over a bounded haystack, not full-text search.
+
+## Review rounds
+
+Five independent review passes were run over the Phase 3 diff before this record was written. Each
+round is a separate commit; each finding is stated with its consequence:
+
+1. **Preview re-plan, long ledgers, Telegram offsets.** A second preview phase reused the first
+   phase's operation id — it only worked while the first preview was still alive, and a preview that
+   had died would make the 'after' captures fail; phases now use distinct ids and a dead preview is
+   reconciled first. Status reports and calibration read the whole event ledger instead of the first
+   200 events. Telegram's getUpdates offset is the global `update_id`, not the message id, so a spent
+   link message is never re-read.
+2. **Follow-up reporting plan.** A follow-up job created from an archived thread carried no reporting
+   plan and would never report; it is now registered like any new job.
+3. **Web search focus and checkbox state.** The thread search re-rendered the whole view per
+   keystroke, dropping focus and typed text (a real problem on phones); only the results now update.
+   The element helper set `checked` as an attribute, so a false value still rendered a checked box —
+   the reports-off and Telegram-periodic toggles were inverted on load.
+4. **Confirmed termination before settling.** `stop_preview` settled the journal row the instant it
+   signalled, so a following cleanup could delete while the preview was still dying; it now waits for
+   confirmed termination, and a still-shutting-down preview leaves cleanup to refuse and retry.
+5. **Full-diff review.** Scope, secrets, generated files, and documentation counts checked; no code
+   change beyond this record.
 
 ## Running Phase 3 locally
 
