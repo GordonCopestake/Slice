@@ -377,9 +377,10 @@ export class WorkflowStore {
     return { ...host, capacity, enabled, createdAt };
   }
 
-  setHostEnabled(hostId: string, enabled: boolean): void {
+  /** Returns false when no host matched, so a typo cannot look like a successful change. */
+  setHostEnabled(hostId: string, enabled: boolean): boolean {
     assertId("hostId", hostId);
-    this.#database.prepare("UPDATE slice_hosts SET enabled = ? WHERE host_id = ?").run(enabled ? 1 : 0, hostId);
+    return this.#database.prepare("UPDATE slice_hosts SET enabled = ? WHERE host_id = ?").run(enabled ? 1 : 0, hostId).changes > 0;
   }
 
   /** Hosts that may still take work. A disabled host keeps its existing work but takes no new job. */
@@ -392,7 +393,7 @@ export class WorkflowStore {
     if (pool.hosts.length === 0 || pool.hosts.length > 32) throw new TypeError("A host pool needs between 1 and 32 hosts");
     for (const hostId of pool.hosts) {
       assertId("hostId", hostId);
-      if (this.getHost(hostId) === undefined) throw new Error(`Pool host ${hostId} is not registered`);
+      if (this.getHost(hostId) === undefined) throw new TypeError(`Pool host ${hostId} is not registered`);
     }
     const createdAt = Date.now();
     this.#database.prepare("INSERT INTO slice_host_pools (pool_id, hosts_json, created_at) VALUES (?, ?, ?)")

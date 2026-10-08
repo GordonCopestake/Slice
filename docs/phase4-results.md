@@ -1,6 +1,6 @@
 # Phase 4 results — more hosts, release readiness, and rollback evidence
 
-Status: **synthetic checks pass (161 Node tests; 19 were added in Phase 4). The live exit check has
+Status: **synthetic checks pass (164 Node tests; 21 were added in Phase 4). The live exit check has
 not been run** — it needs a real Windows worker, a real second Linux host, and a real staging
 environment. No claim below is presented as a live result.
 
@@ -92,7 +92,7 @@ unchanged).
 
 ## Verification
 
-`npm run check` passes: format, typecheck, build, and **161 Node tests** (19 added in this phase).
+`npm run check` passes: format, typecheck, build, and **164 Node tests** (21 were added in Phase 4).
 
 | Exit-check row | Synthetic stand-in | Status |
 |---|---|---|
@@ -153,6 +153,15 @@ round is a separate commit; each finding is stated with its consequence:
    form's select, so a Linux project could be created as a Windows one by accident.
 5. **Full-diff review.** Scope, secrets, generated files, and documentation counts checked; no code
    change beyond this record.
+6. **The pool and host-enable routes did not exist.** The web shell called `POST /api/host-pools` and
+   `POST /api/hosts/:id/enabled`, the store implemented both, and this document listed both — but the
+   HTTP layer never routed them, so "Create pool" and the enable/disable buttons in the owner UI could
+   only fail. `GET /api/host-pools`, `POST /api/host-pools`, and `POST /api/hosts/:id/enabled` now
+   exist and are tested end to end, including that a pool cannot name a host the owner never registered
+   (400, not 500) and that enabling an unknown host is 404 rather than a silent no-op success.
+
+This gap was found only because the service was actually started and its routes called. The synthetic
+test suite had never exercised those paths, which is a limit of testing a UI purely by parsing it.
 
 ## Running Phase 4 locally
 

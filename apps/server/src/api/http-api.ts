@@ -274,6 +274,36 @@ export class SliceApi {
       return;
     }
 
+    // A disabled host keeps the work it already holds and takes no new job, so the owner can take a
+    // worker out of rotation without cancelling anything in flight.
+    const hostEnabled = /^\/api\/hosts\/([A-Za-z0-9._-]{1,128})\/enabled$/.exec(path);
+    if (method === "POST" && hostEnabled !== null) {
+      if (this.#deps.workflows.getHost(hostEnabled[1]!) === undefined) {
+        json(response, 404, { error: "host_not_found" });
+        return;
+      }
+      const body = asObject(await readBody(request));
+      if (typeof body.enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+      this.#deps.workflows.setHostEnabled(hostEnabled[1]!, body.enabled);
+      json(response, 200, { host: this.#deps.workflows.getHost(hostEnabled[1]!) });
+      return;
+    }
+
+    if (method === "GET" && path === "/api/host-pools") {
+      json(response, 200, { pools: this.#deps.workflows.listPools() });
+      return;
+    }
+    if (method === "POST" && path === "/api/host-pools") {
+      const body = asObject(await readBody(request));
+      if (!Array.isArray(body.hosts)) throw new TypeError("hosts must be an array of registered host ids");
+      const pool = this.#deps.workflows.registerPool({
+        poolId: requiredId(body, "poolId"),
+        hosts: body.hosts.map((item) => { if (typeof item !== "string") throw new TypeError("hosts entries must be strings"); return item; }),
+      });
+      json(response, 201, { pool });
+      return;
+    }
+
     if (method === "GET" && path === "/api/projects") {
       json(response, 200, { projects: this.#deps.workflows.listProjects(false) });
       return;

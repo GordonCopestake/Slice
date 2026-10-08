@@ -678,3 +678,38 @@ test("a second toolchain check re-prepares its own workspace instead of trusting
     assert.equal(second.body.passed, true);
   } finally { await stack.close(); }
 });
+
+test("host pools and host enablement are reachable through the API the web shell uses", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    for (const hostId of ["pool-a", "pool-b"]) {
+      const registered = await stack.call("/api/hosts", { method: "POST", body: { hostId, address: `${hostId}.internal`, os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+      assert.equal(registered.status, 201, JSON.stringify(registered.body));
+    }
+    assert.deepEqual((await stack.call("/api/host-pools")).body.pools, []);
+
+    const created = await stack.call("/api/host-pools", { method: "POST", body: { poolId: "primary", hosts: ["pool-a", "pool-b"] } });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.deepEqual(created.body.pool.hosts, ["pool-a", "pool-b"]);
+    assert.deepEqual((await stack.call("/api/host-pools")).body.pools.map((pool: { poolId: string }) => pool.poolId), ["primary"]);
+
+    // A pool may not name a host the owner never registered: placement would then claim a worker
+    // that does not exist.
+    const hostile = await stack.call("/api/host-pools", { method: "POST", body: { poolId: "ghosts", hosts: ["not-registered"] } });
+    assert.equal(hostile.status, 400, JSON.stringify(hostile.body));
+
+    const disabled = await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: false } });
+    assert.equal(disabled.status, 200, JSON.stringify(disabled.body));
+    assert.equal(disabled.body.host.enabled, false);
+    assert.equal((await stack.call("/api/hosts")).body.hosts.find((host: { hostId: string }) => host.hostId === "pool-a").enabled, false);
+
+    const reEnabled = await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: true } });
+    assert.equal(reEnabled.body.host.enabled, true);
+
+    const missing = await stack.call("/api/hosts/nope/enabled", { method: "POST", body: { enabled: false } });
+    assert.equal(missing.status, 404, "a typo must not look like a successful change");
+    assert.equal((await stack.call("/api/hosts/nope/enabled", { method: "POST", body: {} })).status, 404, "an unknown host is 404 whatever the body says");
+    assert.equal((await stack.call("/api/hosts/pool-a/enabled", { method: "POST", body: { enabled: "no" } })).status, 400, "a known host rejects a non-boolean");
+  } finally { await stack.close(); }
+});
