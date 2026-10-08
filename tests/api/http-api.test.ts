@@ -15,7 +15,7 @@ import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-d
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
-import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
+import { JobCoordinator, type DeliveryHooks } from "../../apps/server/src/workflow/coordinator.js";
 import { StatusReports } from "../../apps/server/src/workflow/status-reports.js";
 import { NotificationService } from "../../apps/server/src/workflow/notifications.js";
 import { NotificationStore } from "../../apps/server/src/records/notification-store.js";
@@ -37,7 +37,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(options: { deliveryStore?: DeliveryStore; runner?: RunnerGateway; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore; runner?: RunnerGateway; hooks?: DeliveryHooks; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -46,7 +46,9 @@ async function startStack(options: { deliveryStore?: DeliveryStore; runner?: Run
   models.setProvider(faux.provider);
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, options.runner ?? fakeRunner());
+  // Without hooks the coordinator blocks at workspace-ready with delivery_not_configured; tests that
+  // exercise a job continuing past that point pass a stub.
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, options.runner ?? fakeRunner(), options.hooks ?? null);
   const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }), ...(options.makeNotifications === undefined ? {} : { notifications: options.makeNotifications(workflows, state) }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
@@ -78,6 +80,11 @@ async function startStack(options: { deliveryStore?: DeliveryStore; runner?: Run
     },
   };
   return stack;
+}
+
+/** A delivery that accepts the workspace handoff so a job genuinely continues past workspace-ready. */
+function stubHooks(): DeliveryHooks {
+  return { onWorkspaceReady: async () => { /* the delivery loop would take the work here */ }, withdrawReadiness: async () => { /* readiness withdrawn */ } };
 }
 
 async function login(stack: TestStack): Promise<void> {
@@ -172,7 +179,7 @@ test("a job is created once per request ID, asks its question, and continues on 
 });
 
 test("pause, resume, cancel, and stale steering behave over HTTP", async () => {
-  const stack = await startStack();
+  const stack = await startStack({ hooks: stubHooks() });
   try {
     await login(stack);
     await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
@@ -600,7 +607,7 @@ test("a toolchain check that the host cannot answer is reported, not hidden", as
 });
 
 test("a blocked job retries after the owner fixes the environment", async () => {
-  const stack = await startStack();
+  const stack = await startStack({ hooks: stubHooks() });
   try {
     await login(stack);
     await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });

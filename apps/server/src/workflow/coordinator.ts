@@ -297,6 +297,14 @@ export class JobCoordinator {
       if (this.#delivery !== null) {
         // Phase 2: hand the prepared workspace to the delivery loop, carrying the baseline evidence.
         await this.#delivery.onWorkspaceReady(this.#workflows.getJob(jobId)!, workspace.baseCommit, baseline);
+      } else {
+        // Without a delivery pipeline nothing can take the work. Leaving the job "running" made it
+        // look alive forever; the owner is told what is missing instead.
+        this.#workflows.appendEvent(jobId, "blocked", {
+          reason: "delivery_not_configured",
+          detail: "the workspace is prepared and its baseline checks passed, but no delivery roles are configured; set the author, code-review, and security-review model profiles to continue",
+        });
+        this.#workflows.setRunState(jobId, ["running"], "blocked");
       }
     } catch (error) {
       this.#workflows.appendEvent(jobId, "blocked", { reason: `workspace preparation failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown"}` });

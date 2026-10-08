@@ -8,7 +8,7 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-durable-adapter.js";
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { toolchainDigest, WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
-import { JobCoordinator, parseRequirementsOutput } from "../../apps/server/src/workflow/coordinator.js";
+import { JobCoordinator, parseRequirementsOutput, type DeliveryHooks } from "../../apps/server/src/workflow/coordinator.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner as buildFakeRunner } from "../support/fake-runner.js";
 
@@ -28,7 +28,14 @@ type Harness = {
   close: () => Promise<void>;
 };
 
-async function newHarness(): Promise<Harness> {
+/** A delivery that takes the handoff and does nothing else, so state-transition tests can watch a
+// job that genuinely continues past workspace preparation instead of one that blocks for want of a
+// pipeline. */
+function deliveryStub(): DeliveryHooks {
+  return { onWorkspaceReady: async () => { /* the delivery loop would take the work here */ }, withdrawReadiness: async () => { /* readiness withdrawn */ } };
+}
+
+async function newHarness(options: { delivery?: DeliveryHooks } = {}): Promise<Harness> {
   const directory = mkdtempSync(join(tmpdir(), "slice-coordinator-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -43,7 +50,7 @@ async function newHarness(): Promise<Harness> {
     models,
     registry: createRegistry(),
   });
-  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner);
+  const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner, options.delivery ?? null);
   return {
     coordinator,
     adapter,
@@ -81,11 +88,15 @@ test("a request that needs an answer waits for the user, then continues on the a
     const answered = await h.coordinator.answerQuestion(job.jobId, questions[0]!.questionId, questions[0]!.revision, "front");
     assert.equal(answered.accepted, true);
     assert.equal(answered.job.stage, "implementation", "settled requirements prepare the workspace and run the checks");
-    assert.equal(answered.job.runState, "running");
     const events = h.workflows.eventsAfter(job.jobId, 0);
     assert.deepEqual(events.map((event) => event.type), [
-      "job_created", "question_asked", "stage", "question_answered", "requirements_ready", "workspace_ready", "check_result", "stage",
+      "job_created", "question_asked", "stage", "question_answered", "requirements_ready", "workspace_ready", "check_result", "stage", "blocked",
     ]);
+    // With no delivery pipeline nothing can take the prepared workspace. It used to sit "running"
+    // indefinitely; now it says what is missing.
+    assert.equal(answered.job.runState, "blocked");
+    const blocked = events[events.length - 1]!;
+    assert.deepEqual((blocked.payload as { reason: string }).reason, "delivery_not_configured");
   } finally { await h.close(); }
 });
 
@@ -113,7 +124,7 @@ test("a job with no configured requirements profile blocks with a stated reason"
 });
 
 test("pause, resume, and cancel move the job through the declared states", async () => {
-  const h = await newHarness();
+  const h = await newHarness({ delivery: deliveryStub() });
   try {
     h.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
     const job = await h.coordinator.createJob({ requestId: "req-1", payloadHash: "h1", projectId: "demo", title: "Allocation", requestText: "Add a screen", issue: null });
@@ -139,7 +150,7 @@ test("pause, resume, and cancel move the job through the declared states", async
 });
 
 test("steering with a stale command revision is refused without applying the instruction", async () => {
-  const h = await newHarness();
+  const h = await newHarness({ delivery: deliveryStub() });
   try {
     h.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
     const job = await h.coordinator.createJob({ requestId: "req-1", payloadHash: "h1", projectId: "demo", title: "Allocation", requestText: "Add a screen", issue: null });
