@@ -11,6 +11,7 @@ import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.j
 import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
 import type { StatusReports } from "../workflow/status-reports.js";
 import type { NotificationService } from "../workflow/notifications.js";
+import type { ReleaseService } from "../workflow/releases.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -22,6 +23,7 @@ export type ApiDependencies = {
   delivery?: DeliveryLoop | null;
   status?: StatusReports | null;
   notifications?: NotificationService | null;
+  releases?: ReleaseService | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -335,6 +337,46 @@ export class SliceApi {
         })()),
       });
       json(response, 201, { project });
+      return;
+    }
+
+    const releaseRestore = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/releases\/([A-Za-z0-9._:-]{1,128})\/restore-staging$/.exec(path);
+    if (method === "POST" && releaseRestore !== null) {
+      if (this.#deps.releases === undefined || this.#deps.releases === null) {
+        json(response, 409, { error: "releases_not_configured", message: "Release rehearsal needs a configured runner" });
+        return;
+      }
+      type RestoreResult = Awaited<ReturnType<ReleaseService["restoreStaging"]>>;
+      let result: RestoreResult;
+      try {
+        result = await this.#deps.releases.restoreStaging(releaseRestore[1]!, releaseRestore[2]!);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 200) : "unknown";
+        json(response, reason === "project_not_found" || reason === "release_not_found" ? 404 : 502, { error: "rehearsal_failed", message: reason });
+        return;
+      }
+      json(response, 200, { rehearsal: result.rehearsal, release: result.release, checks: result.checks });
+      return;
+    }
+
+    const projectReleases = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/(releases|rollback-rehearsals)$/.exec(path);
+    if (method === "GET" && projectReleases !== null) {
+      const projectId = projectReleases[1]!;
+      if (this.#deps.workflows.getProject(projectId) === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      if (this.#deps.releases === undefined || this.#deps.releases === null) {
+        json(response, 200, { releases: [], rehearsals: [], configured: false });
+        return;
+      }
+      if (projectReleases[2] === "releases") {
+        const releases = this.#deps.releases.listReleases(projectId);
+        const restorable = new Set(this.#deps.releases.restorableReleases(projectId).map((release) => release.releaseId));
+        json(response, 200, { releases: releases.map((release) => ({ ...release, restorable: restorable.has(release.releaseId) })) });
+        return;
+      }
+      json(response, 200, { rehearsals: this.#deps.releases.listRehearsals(projectId) });
       return;
     }
 

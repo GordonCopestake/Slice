@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,8 @@ import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-d
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
 import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
+import { ReleaseStore } from "../../apps/server/src/records/release-store.js";
+import { ReleaseService } from "../../apps/server/src/workflow/releases.js";
 import { ExternalOperationJournal } from "../../apps/server/src/workflow/external-operation-journal.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
 import { GATE_CHECK_CONTEXTS, DeliveryLoop, parseAuthorOutput, parseReviewOutput, validatePatch } from "../../apps/server/src/workflow/delivery.js";
@@ -162,7 +165,10 @@ class FakeGitHost implements GitHost {
     const pr = this.prs.find((entry) => entry.number === prNumber);
     if (pr === undefined) throw new Error(`PR ${prNumber} not found`);
     pr.state = "merged";
-    pr.mergedRevision = "deadbeef0123456789abcdef0123456789abcd";
+    // A squash merge lands the reviewed head itself. The merged revision must be a real commit or a
+    // rollback rehearsal against it could never restore anything.
+    pr.mergedRevision = this.remoteHead(pr.head) ?? "";
+    if (pr.mergedRevision.length === 0) throw new Error(`PR ${prNumber} has no pushed head to merge`);
     return pr.mergedRevision;
   }
 
@@ -176,6 +182,9 @@ type Harness = {
   coordinator: JobCoordinator;
   delivery: DeliveryLoop;
   deliveryStore: DeliveryStore;
+  releases: ReleaseStore;
+  releaseService: ReleaseService;
+  runner: RunnerAdapter;
   workflows: WorkflowStore;
   gitHost: FakeGitHost;
   originDir: string;
@@ -210,10 +219,13 @@ async function newHarness(options: { preview?: boolean; policy?: { localProvider
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
   const deliveryStore = DeliveryStore.open(state.database);
+  const releaseStore = ReleaseStore.open(state.database);
   const journal = new ExternalOperationJournal(state.database);
   const runner = new RunnerAdapter(journal, () => transport, { pollIntervalMs: 100, pollLimitMs: 30_000 });
 
-  workflows.registerHost({ hostId: "runner-a", address: "localhost", os: "linux", sshUser: "slice", runnerRoot });
+  // Capacity 2: a rollback rehearsal occupies a real worker slot, and these tests run one alongside
+  // a job workspace that has not been reclaimed yet.
+  workflows.registerHost({ hostId: "runner-a", address: "localhost", os: "linux", sshUser: "slice", runnerRoot, capacity: 2 });
   workflows.createProject({
     projectId: "demo",
     repoSlug: "owner/demo",
@@ -239,12 +251,14 @@ async function newHarness(options: { preview?: boolean; policy?: { localProvider
 
   const gitHost = new FakeGitHost(originDir);
   const artifactsDir = join(directory, "artifacts");
+  const releaseService = new ReleaseService({ workflows, releases: releaseStore, delivery: deliveryStore, runner, artifactsDir });
   const delivery = new DeliveryLoop({
     adapter,
     workflows,
     delivery: deliveryStore,
     runner,
     gitHost,
+    releases: releaseStore,
     publisher: new GitBundlePublisher(directory),
     journal,
     profiles: {
@@ -261,6 +275,9 @@ async function newHarness(options: { preview?: boolean; policy?: { localProvider
     coordinator,
     delivery,
     deliveryStore,
+    releases: releaseStore,
+    releaseService,
+    runner,
     workflows,
     gitHost,
     originDir,
@@ -611,4 +628,137 @@ test("a project with no preview states screenshots are not applicable", async ()
   } finally {
     await h.close();
   }
+});
+
+test("a verified merge records a release that can be restored from its retained artifact", async () => {
+  const h = await newHarness();
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "office notes\n"));
+    const jobId = await createReadyJob(h, "rel1", [patch]);
+    const before = h.deliveryStore.getDelivery(jobId)!;
+    const mergedRevision = h.gitHost.ownerMerge(before.prNumber!);
+    assert.equal(await h.delivery.observeMerge(jobId), "merged");
+
+    const release = h.releases.currentRelease("demo");
+    assert.notEqual(release, undefined);
+    assert.equal(release!.commitSha, mergedRevision);
+    assert.equal(release!.jobId, jobId);
+    assert.equal(release!.prNumber, before.prNumber);
+    assert.equal(release!.hostId, "runner-a");
+    assert.notEqual(release!.artifactId, null, "the release carries the bundle that restores it");
+    const bundle = h.deliveryStore.getArtifact(jobId, release!.artifactId!);
+    assert.notEqual(bundle, undefined);
+    assert.equal(release!.artifactDigest, bundle!.digest);
+    assert.ok(existsSync(bundle!.path), "the retained bundle survives workspace cleanup");
+    assert.deepEqual(h.releases.restorableReleases("demo", new Set([release!.artifactId!])), [release!]);
+    assert.ok(h.workflows.eventsAfter(jobId, 0).some((event) => event.type === "release_recorded"));
+  } finally { await h.close(); }
+});
+
+test("a database-sensitive change cannot pass the gate without rollback evidence, then passes after a rehearsal", async () => {
+  const h = await newHarness();
+  try {
+    const plain = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "first\n"));
+    const dbPatch = makePatch(h.originDir, h.artifactsDir, (work) => {
+      mkdirSync(join(work, "migrations"), { recursive: true });
+      writeFileSync(join(work, "migrations", "001_add_column.sql"), "ALTER TABLE orders ADD COLUMN goods TEXT;\n");
+    });
+    const followPatch = makePatch(h.originDir, h.artifactsDir, (work) => {
+      writeFileSync(join(work, "migrations", "002_add_index.sql"), "CREATE INDEX idx_orders_goods ON orders (goods);\n");
+    }, (work) => {
+      mkdirSync(join(work, "migrations"), { recursive: true });
+      writeFileSync(join(work, "migrations", "001_add_column.sql"), "ALTER TABLE orders ADD COLUMN goods TEXT;\n");
+    });
+    h.scriptResponses({
+      "req-1": [READY_JSON, READY_JSON, READY_JSON],
+      "author-1": [patchJson(plain), patchJson(dbPatch), patchJson(followPatch)],
+      "review-1": [PASS_JSON, PASS_JSON, PASS_JSON],
+      "security-1": [PASS_JSON, PASS_JSON, PASS_JSON],
+    });
+
+    // First release: an ordinary change, merged and recorded as restorable.
+    const firstJob = await h.coordinator.createJob({ requestId: "rel2a", payloadHash: "hash-rel2a", projectId: "demo", title: "Add notes", requestText: "Add a notes file", issue: null });
+    const mergedRevision = h.gitHost.ownerMerge(h.deliveryStore.getDelivery(firstJob.jobId)!.prNumber!);
+    assert.equal(await h.delivery.observeMerge(firstJob.jobId), "merged");
+    const target = h.releases.rollbackTarget("demo");
+    assert.notEqual(target, undefined);
+    assert.equal(target!.commitSha, mergedRevision);
+
+    // Second change touches a migration path. The gate must not accept "trust me".
+    const dbJob = await h.coordinator.createJob({ requestId: "rel2b", payloadHash: "hash-rel2b", projectId: "demo", title: "Add column", requestText: "Add a database column", issue: null });
+    const blocked = h.deliveryStore.getDelivery(dbJob.jobId)!;
+    assert.notEqual(blocked.stage, "ready", "a database-sensitive change does not reach ready on assertion");
+    assert.equal(blocked.gateVerdict, "blocked");
+    const gateEvent = h.workflows.eventsAfter(dbJob.jobId, 0).filter((event) => event.type === "gate_evaluated").at(-1)!;
+    assert.ok(JSON.stringify(gateEvent.payload).includes("database paths"), JSON.stringify(gateEvent.payload));
+    const blockedRecord = h.deliveryStore.getGateRecord(dbJob.jobId) as { rollbackCompatibility: { required: boolean; satisfied: boolean; paths: string[] } };
+    assert.equal(blockedRecord.rollbackCompatibility.required, true);
+    assert.equal(blockedRecord.rollbackCompatibility.satisfied, false);
+    assert.ok(blockedRecord.rollbackCompatibility.paths.some((path) => path.includes("migrations/")));
+
+    // The owner rehearses restoring the release a rollback would return to. It passes.
+    const rehearsal = await h.releaseService.restoreStaging("demo", target!.releaseId);
+    assert.equal(rehearsal.rehearsal.outcome, "passed", JSON.stringify(rehearsal.checks));
+    assert.notEqual(rehearsal.rehearsal.evidenceArtifactId, null);
+    assert.ok(rehearsal.checks.length > 0 && rehearsal.checks.every((check) => check.status === "succeeded"));
+
+    // Steering a blocked job records the instruction but deliberately does not resume blocked work;
+    // the owner retries the job, which re-enters the same gate with the evidence now present.
+    const steered = await h.coordinator.steer(dbJob.jobId, "steer-rel2b", "hash-steer-rel2b", dbJob.commandRevision, "Proceed; the rollback rehearsal has been run.");
+    assert.equal(steered.recorded, true);
+    await h.coordinator.retryBlocked(dbJob.jobId);
+    const settled = h.deliveryStore.getDelivery(dbJob.jobId)!;
+    assert.equal(settled.stage, "ready", JSON.stringify(h.deliveryStore.getGateRecord(dbJob.jobId)));
+    assert.equal(settled.gateVerdict, "pass");
+    const finalRecord = h.deliveryStore.getGateRecord(dbJob.jobId) as { rollbackCompatibility: { satisfied: boolean; rehearsalId: string | null; paths: string[] } };
+    assert.equal(finalRecord.rollbackCompatibility.satisfied, true);
+    assert.equal(finalRecord.rollbackCompatibility.rehearsalId, rehearsal.rehearsal.rehearsalId);
+    assert.ok(finalRecord.rollbackCompatibility.paths.some((path) => path.includes("migrations/")));
+  } finally { await h.close(); }
+});
+
+test("a rehearsal that fails against the restored release is recorded as failed, not hidden", async () => {
+  const h = await newHarness();
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => {
+      // The release itself carries a failing check, so restoring it cannot report a pass.
+      writeFileSync(join(work, "check.js"), "console.error('release check broken'); process.exit(4);\n");
+    });
+    const jobId = await createReadyJob(h, "rel3", [patch]);
+    const delivery = h.deliveryStore.getDelivery(jobId)!;
+    assert.notEqual(delivery.stage, "ready", "a change whose checks fail never reaches publishing");
+    // Record the release directly: the rehearsal path is what is under test here.
+    // Retain the release's bundle the way a published release would, then rehearse against it.
+    const bundle = await h.runner.exportCommit({ jobId, hostId: "runner-a", commit: delivery.headCommit });
+    const bundlePath = join(h.artifactsDir, jobId, `bundle-${delivery.headCommit.slice(0, 12)}`);
+    mkdirSync(join(h.artifactsDir, jobId), { recursive: true });
+    writeFileSync(bundlePath, bundle, { mode: 0o600 });
+    h.deliveryStore.recordArtifact({ jobId, id: `bundle-${delivery.headCommit.slice(0, 12)}`, kind: "bundle", digest: createHash("sha256").update(bundle).digest("hex"), sizeBytes: bundle.length, path: bundlePath, verificationKey: "rehearsal-fixture", expiresAt: Date.now() + 86_400_000 });
+    const release = h.releases.recordRelease({ projectId: "demo", jobId, commitSha: delivery.headCommit, branch: "slice/demo/x", prNumber: null, hostId: "runner-a", artifactId: `bundle-${delivery.headCommit.slice(0, 12)}`, artifactDigest: createHash("sha256").update(bundle).digest("hex") });
+    const rehearsal = await h.releaseService.restoreStaging("demo", release.releaseId);
+    assert.equal(rehearsal.rehearsal.outcome, "failed", rehearsal.rehearsal.reason ?? "");
+    assert.ok(rehearsal.checks.some((check) => check.status !== "succeeded"));
+    assert.equal(rehearsal.rehearsal.reason, "one or more project checks failed against the restored release");
+  } finally { await h.close(); }
+});
+
+test("a release whose retained artifact is gone is not restorable, and the rehearsal says so", async () => {
+  const h = await newHarness();
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "notes\n"));
+    const jobId = await createReadyJob(h, "rel4", [patch]);
+    const mergedRevision = h.gitHost.ownerMerge(h.deliveryStore.getDelivery(jobId)!.prNumber!);
+    assert.equal(await h.delivery.observeMerge(jobId), "merged");
+    const release = h.releases.rollbackTarget("demo")!;
+    assert.equal(release.commitSha, mergedRevision);
+
+    const bundle = h.deliveryStore.getArtifact(jobId, release.artifactId!)!;
+    rmSync(bundle.path, { force: true });
+    assert.deepEqual(h.releaseService.restorableReleases("demo"), [], "an unreadable artifact is not restorable");
+
+    const rehearsal = await h.releaseService.restoreStaging("demo", release.releaseId);
+    assert.equal(rehearsal.rehearsal.outcome, "uncertain");
+    assert.match(rehearsal.rehearsal.reason ?? "", /retained artifact/);
+    assert.equal(rehearsal.rehearsal.evidenceArtifactId, null);
+  } finally { await h.close(); }
 });

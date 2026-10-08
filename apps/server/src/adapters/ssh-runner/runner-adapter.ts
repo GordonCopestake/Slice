@@ -43,6 +43,7 @@ export interface RunnerGateway {
   captureScreenshot(input: { jobId: string; hostId: string; scenarioId: string; route: string; commit: string; width: number; height: number }): Promise<Buffer>;
   stopPreview(input: { jobId: string; hostId: string }): Promise<void>;
   probeToolchain(input: { jobId: string; hostId: string; tools: { id: string; command: string }[] }): Promise<{ allPassed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] }>;
+  restoreBundle(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; bundle: Buffer; expectedCommit: string }): Promise<{ head: string }>;
   cleanupJob(input: { jobId: string; hostId: string }): Promise<void>;
   cancelRunning(input: { jobId: string; hostId: string }): Promise<void>;
   reconcile(input: { jobId: string; hostId: string }): Promise<{ operationId: string; status: string }[]>;
@@ -242,6 +243,19 @@ export class RunnerAdapter implements RunnerGateway {
         }))
       : [];
     return { allPassed: response.allPassed === true && tools.length > 0 && tools.every((tool) => tool.exitCode === 0 && tool.version !== null), tools };
+  }
+
+  async restoreBundle(input: { jobId: string; hostId: string; operationId: string; leaseGeneration: number; bundle: Buffer; expectedCommit: string }): Promise<{ head: string }> {
+    const response = await this.#transportFor(input.hostId).request({
+      op: "restore_bundle",
+      jobId: input.jobId,
+      operationId: input.operationId,
+      leaseGeneration: input.leaseGeneration,
+      bundleBase64: input.bundle.toString("base64"),
+      expectedCommit: input.expectedCommit,
+    });
+    okOrThrow(response, "restore_bundle");
+    return { head: String(response.head ?? "") };
   }
 
   async cleanupJob(input: { jobId: string; hostId: string }): Promise<void> {

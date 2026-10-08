@@ -461,6 +461,22 @@ export class WorkflowStore {
     return { ready: true };
   }
 
+  /** Staging workspaces Slice created for rehearsals that have not been reclaimed yet. */
+  stagingWorkspaces(): WorkspaceRecord[] {
+    return (this.#database.prepare("SELECT * FROM slice_workspaces WHERE job_id LIKE 'staging-%' AND released = 0 ORDER BY job_id").all() as Record<string, unknown>[])
+      .map((row) => ({
+        jobId: String(row.job_id),
+        hostId: String(row.host_id),
+        repoPath: String(row.repo_path),
+        worktreePath: String(row.worktree_path),
+        branch: String(row.branch),
+        baseCommit: String(row.base_commit),
+        leaseGeneration: Number(row.lease_generation),
+        released: Number(row.released ?? 0) !== 0,
+        updatedAt: Number(row.updated_at),
+      }));
+  }
+
   /** Jobs currently occupying a host. The job being placed is excluded: its own workspace must not
    * block its own re-placement when delivery re-runs. */
   activeHostCount(hostId: string, excludeJobId?: string): number {

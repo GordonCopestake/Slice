@@ -7,6 +7,7 @@ import type { BranchPublisher } from "../adapters/git/branch-publisher.js";
 import type { GitHost, StatusContext } from "../adapters/github/git-host.js";
 import type { DeliveryStore, FindingInput, ReviewRole } from "../records/delivery-store.js";
 import { verificationKey } from "../records/delivery-store.js";
+import { databaseSensitive, type ReleaseStore } from "../records/release-store.js";
 import type { DeliveryRecord } from "../records/delivery-store.js";
 import type { JobRecord, WorkflowStore } from "../records/workflow-store.js";
 import type { ExternalOperationJournal } from "./external-operation-journal.js";
@@ -132,6 +133,7 @@ export type DeliveryDeps = {
   delivery: DeliveryStore;
   runner: RunnerGateway;
   gitHost: GitHost;
+  releases: ReleaseStore;
   publisher: BranchPublisher;
   journal: ExternalOperationJournal;
   profiles: RoleProfiles;
@@ -231,6 +233,11 @@ export class DeliveryLoop {
   }
 
   /** Advance the state machine until the job quiesces (waiting, blocked, ready, or finished). */
+  /** Archived threads whose workspace deletion has not completed - the recovery sweep's input. */
+  unfinishedCleanups(): DeliveryRecord[] {
+    return this.#deps.delivery.listUnfinishedCleanups();
+  }
+
   async advance(jobId: string): Promise<void> {
     // Four repair rounds can each run author, checks, review, and gate; the cap must exceed a full
     // worst-case delivery so the loop never stops mid-work.
@@ -489,6 +496,30 @@ export class DeliveryLoop {
 
   // ----------------------------------------------------------------- gate
 
+  /** The file paths the authored patch touches, read from the recorded patch artifact. */
+  #changedFiles(jobId: string, delivery: { jobId: string; round: number; baseCommit: string; headCommit: string }): string[] {
+    const patch = this.#deps.delivery.getArtifact(jobId, `patch-r${delivery.round}`);
+    if (patch === undefined) return [];
+    let text: string;
+    try {
+      text = this.#readArtifact(jobId, patch.id);
+    } catch {
+      return [];
+    }
+    const files = new Set<string>();
+    for (const line of text.split("\n")) {
+      // A diff names each file twice on the header line (a/X b/Y) and once on each side marker.
+      const header = /^diff --git a\/(\S+) b\/(\S+)$/.exec(line);
+      if (header !== null) {
+        for (const value of [header[1], header[2]]) if (value !== undefined && value !== "/dev/null") files.add(value);
+        continue;
+      }
+      const side = /^[-+]{3} (\S+)$/.exec(line);
+      if (side?.[1] !== undefined && side[1] !== "/dev/null") files.add(side[1].replace(/^a\/|^b\//, ""));
+    }
+    return [...files];
+  }
+
   async #evaluateGate(job: JobRecord, delivery: { jobId: string; round: number; baseCommit: string; headCommit: string }): Promise<void> {
     const jobId = job.jobId;
     const project = this.#deps.workflows.getProject(job.projectId);
@@ -523,12 +554,34 @@ export class DeliveryLoop {
     const blocking = this.#deps.delivery.openBlockingFindings(jobId);
     if (blocking.length > 0) reasons.push(`${blocking.length} unresolved critical/high/medium finding(s)`);
 
+    // A change that touches database paths cannot claim easy rollback on assertion. The gate demands
+    // evidence: a passing rollback rehearsal that restored the release it would roll back to.
+    const dbSensitive = databaseSensitive(this.#changedFiles(jobId, delivery));
+    let rollback: { required: boolean; satisfied: boolean; paths: string[]; releaseId: string | null; rehearsalId: string | null };
+    if (dbSensitive.length === 0) {
+      rollback = { required: false, satisfied: true, paths: [], releaseId: null, rehearsalId: null };
+    } else {
+      const prior = this.#deps.releases.rollbackTarget(project.projectId);
+      const rehearsal = prior === undefined ? undefined
+        : this.#deps.releases.listRehearsals(project.projectId).find((entry) => entry.releaseId === prior.releaseId && entry.outcome === "passed" && entry.evidenceArtifactId !== null);
+      rollback = {
+        required: true,
+        satisfied: rehearsal !== undefined,
+        paths: dbSensitive.slice(0, 10),
+        releaseId: prior?.releaseId ?? null,
+        rehearsalId: rehearsal?.rehearsalId ?? null,
+      };
+      if (prior === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and there is no recorded release to roll back to, so rollback compatibility cannot be evidenced`);
+      else if (rehearsal === undefined) reasons.push(`the change touches database paths (${dbSensitive.slice(0, 5).join(", ")}) and no passing rollback rehearsal exists for ${prior.releaseId}`);
+    }
+
     const gateRecord = {
       key,
       policyVersion: POLICY_VERSION,
       round: delivery.round,
       checks,
       reviews,
+      rollbackCompatibility: rollback,
       openBlockingFindings: blocking.map((finding) => finding.id),
       reasons,
       evaluatedAt: Date.now(),
@@ -544,7 +597,8 @@ export class DeliveryLoop {
       return;
     }
     // A repair round is scheduled only for failures the author can act on, judged from the
-    // structured gate inputs, not from reason text. At the round limit the job blocks.
+    // structured gate inputs, not from reason text. Missing rollback evidence is an owner action, not
+    // something the author can write its way out of. At the round limit the job blocks.
     const fixable = delivery.round < this.#maxRounds
       && (blocking.length > 0 || reviews.some((review) => review.verdict !== "pass") || checks.some((check) => !check.passed));
     if (fixable) {
@@ -579,6 +633,9 @@ export class DeliveryLoop {
         await this.#deps.journal.run(`${jobId}:push:${head}`, { op: "push", jobId, head, remoteUrl, branch: workspace.branch }, {
           execute: async () => {
             const bundle = await this.#deps.runner.exportCommit({ jobId, hostId: workspace.hostId, commit: head });
+            // The bundle is retained as evidence, not just shipped: it is what a rollback rehearsal
+            // restores a release from after the workspace is long gone.
+            this.#writeBinaryArtifact(jobId, `bundle-${head.slice(0, 12)}`, "bundle", bundle, head);
             await this.#deps.publisher.publish({ jobId, bundle, remoteUrl, branch: workspace.branch, expectedCommit: head, expectedRemoteHead: currentRemote });
             return { pushed: head };
           },
@@ -724,6 +781,19 @@ export class DeliveryLoop {
       // The thread is history: the run state completes so pause/cancel/steer cannot act on it.
       this.#deps.workflows.setRunState(jobId, ["running", "waiting_user", "blocked"], "completed");
       this.#deps.workflows.appendEvent(jobId, "merge_observed", { prNumber: pr.number, mergedRevision: pr.mergedRevision });
+      // The merge is a release: recorded with the retained bundle that can restore it.
+      const bundle = this.#deps.delivery.listArtifacts(jobId).find((artifact) => artifact.kind === "bundle");
+      const release = this.#deps.releases.recordRelease({
+        projectId: job.projectId,
+        jobId,
+        commitSha: pr.mergedRevision,
+        branch: this.#deps.workflows.getWorkspace(jobId)?.branch ?? project.defaultBranch,
+        prNumber: pr.number,
+        hostId: this.#deps.workflows.getWorkspace(jobId)?.hostId ?? project.hostId,
+        artifactId: bundle?.id ?? null,
+        artifactDigest: bundle?.digest ?? null,
+      });
+      this.#deps.workflows.appendEvent(jobId, "release_recorded", { releaseId: release.releaseId, commitSha: release.commitSha, restorable: release.artifactId !== null });
       await this.#exportPacket(jobId);
       await this.#cleanup(jobId);
       return "merged";

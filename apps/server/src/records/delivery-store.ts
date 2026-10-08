@@ -309,6 +309,13 @@ export class DeliveryStore {
     return this.getDelivery(jobId);
   }
 
+  /** The full gate record behind the current verdict: checks, reviews, rollback evidence, reasons. */
+  getGateRecord(jobId: string): unknown {
+    assertId("jobId", jobId);
+    const row = this.#database.prepare("SELECT gate_json FROM slice_delivery WHERE job_id = ?").get(jobId) as { gate_json: string } | undefined;
+    return row === undefined ? undefined : JSON.parse(row.gate_json);
+  }
+
   recordGate(jobId: string, verdict: GateVerdict, gateRecord: unknown): DeliveryRecord | undefined {
     assertId("jobId", jobId);
     this.#database.prepare("UPDATE slice_delivery SET gate_verdict = ?, gate_json = ?, updated_at = ? WHERE job_id = ?")
@@ -343,6 +350,15 @@ export class DeliveryStore {
 
   listActiveDeliveries(): DeliveryRecord[] {
     return (this.#database.prepare("SELECT * FROM slice_delivery WHERE archive_state = 'active' ORDER BY job_id").all() as Record<string, unknown>[])
+      .map(toDelivery);
+  }
+
+  /**
+   * Archived threads whose workspace deletion has not completed. A host outage leaves cleanup failed
+   * or pending; the recovery sweep retries these until the deletion is confirmed.
+   */
+  listUnfinishedCleanups(): DeliveryRecord[] {
+    return (this.#database.prepare("SELECT * FROM slice_delivery WHERE archive_state = 'archived' AND cleanup_state IN ('pending', 'failed') ORDER BY updated_at").all() as Record<string, unknown>[])
       .map(toDelivery);
   }
 

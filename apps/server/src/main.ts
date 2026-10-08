@@ -12,6 +12,7 @@ import { RunnerAdapter } from "./adapters/ssh-runner/runner-adapter.js";
 import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/runner-transport.js";
 import { WorkflowStore } from "./records/workflow-store.js";
 import { DeliveryStore } from "./records/delivery-store.js";
+import { ReleaseStore } from "./records/release-store.js";
 import { StatusStore } from "./records/status-store.js";
 import { NotificationStore } from "./records/notification-store.js";
 import { NotificationService } from "./workflow/notifications.js";
@@ -21,6 +22,7 @@ import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
 import { ExternalOperationJournal } from "./workflow/external-operation-journal.js";
 import { DeliveryLoop } from "./workflow/delivery.js";
+import { ReleaseService } from "./workflow/releases.js";
 import { JobCoordinator, type ModelProfile } from "./workflow/coordinator.js";
 import { StatusReports } from "./workflow/status-reports.js";
 import { roleProfiles } from "./workflow/role-config.js";
@@ -127,6 +129,7 @@ function buildDelivery(
     gitHost: new GithubClient({ token }),
     publisher: new GitBundlePublisher(stateDirectory),
     journal: new ExternalOperationJournal(state.database),
+    releases: ReleaseStore.open(state.database),
     profiles,
     policy: modelPolicy(process.env),
     artifactsDir: join(stateDirectory, "artifacts"),
@@ -146,6 +149,7 @@ export async function startSlice(): Promise<void> {
   let workflows: WorkflowStore | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
   let mergePoller: NodeJS.Timeout | undefined;
+  let cleanupTimer: NodeJS.Timeout | undefined;
   let reportTimer: NodeJS.Timeout | undefined;
   let notifyTimer: NodeJS.Timeout | undefined;
 
@@ -169,7 +173,14 @@ export async function startSlice(): Promise<void> {
     const telegramClient = telegramToken !== undefined && telegramToken.trim().length > 0 ? new TelegramClient({ token: telegramToken }) : null;
     const notifications = new NotificationService({ workflows, notifications: notificationStore, status: statusStore, telegram: telegramClient });
     const statusReports = new StatusReports({ workflows, deliveryStore: DeliveryStore.open(state.database), status: statusStore, notify: (jobId, kind, dueAt) => notifications.enqueueReport(jobId, dueAt) });
-    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports, notifications });
+    const releases = runner === null ? null : new ReleaseService({
+      workflows,
+      releases: ReleaseStore.open(state.database),
+      delivery: DeliveryStore.open(state.database),
+      runner,
+      artifactsDir: join(stateDirectory, "artifacts"),
+    });
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports, notifications, releases });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
@@ -213,6 +224,15 @@ export async function startSlice(): Promise<void> {
       mergePoller.unref();
     }
 
+    // Cleanup recovery: an archived thread whose workspace deletion failed (offline host, refused
+    // deletion, uncertain operation) is retried on a schedule. Evidence is never touched by this sweep.
+    if (delivery !== null) {
+      cleanupTimer = setInterval(() => {
+        void retryFailedCleanups(delivery, releases).catch(() => { /* the next tick retries */ });
+      }, 300_000);
+      cleanupTimer.unref();
+    }
+
     // Periodic status reports: overdue ticks coalesce into one current report per job.
     reportTimer = setInterval(() => {
       try {
@@ -242,6 +262,7 @@ export async function startSlice(): Promise<void> {
   } finally {
     if (retentionTimer !== undefined) clearInterval(retentionTimer);
     if (mergePoller !== undefined) clearInterval(mergePoller);
+    if (cleanupTimer !== undefined) clearInterval(cleanupTimer);
     if (reportTimer !== undefined) clearInterval(reportTimer);
     if (notifyTimer !== undefined) clearInterval(notifyTimer);
     await shutdown(server, adapter, state, lock);
@@ -266,6 +287,22 @@ async function resumeDelivery(delivery: DeliveryLoop, workflows: WorkflowStore):
 }
 
 /** Periodic reconciliation: check merges for ready jobs and nudge publishing jobs stuck on an outage. */
+/**
+ * Cleanup recovery across host outages. An archived thread whose deletion failed stays retryable:
+ * the sweep re-attempts it on the host the workspace is recorded against. Evidence, the release
+ * record, and the archived thread are never touched here - only the workspace.
+ */
+async function retryFailedCleanups(delivery: DeliveryLoop, releases: ReleaseService | null): Promise<void> {
+  for (const record of delivery.unfinishedCleanups()) {
+    await delivery.retryCleanup(record.jobId);
+  }
+  if (releases !== null) {
+    for (const project of releases.stagingProjects()) {
+      await releases.reclaimStaging(project);
+    }
+  }
+}
+
 async function pollMerges(delivery: DeliveryLoop, workflows: WorkflowStore): Promise<void> {
   for (const record of delivery.activeDeliveries()) {
     const job = workflows.getJob(record.jobId);
