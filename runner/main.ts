@@ -630,6 +630,13 @@ function handleStopPreview(journal: Journal, root: string, request: Extract<Requ
   if (record === undefined) return { ok: true, status: "absent" };
   const cancelled = handleCancel(journal, { op: "cancel_process", jobId: request.jobId, operationId: record.operationId });
   if (!cancelled.ok) return cancelled;
+  // Deletion waits for confirmed termination: only settle the journal row once the process group
+  // is gone. If it is still dying, leave the operation running so cleanup refuses and retries.
+  const deadline = Date.now() + 3_000;
+  while (pidAliveOf(journal, record.operationId) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+  }
+  if (pidAliveOf(journal, record.operationId)) return { ok: true, status: "cancel_signalled" };
   journal.setStatus(record.operationId, "succeeded", 0);
   try {
     rmSync(recordPath, { force: true });
