@@ -41,8 +41,17 @@ function badge(text) {
   return el("span", { class: `badge ${text}` }, text);
 }
 
+/**
+ * crypto.randomUUID is only exposed in a secure context (https, or http on localhost). The owner may
+ * serve this UI over plain HTTP on a tailnet or LAN address, where it is undefined, so fall back to
+ * getRandomValues, which is available in any context.
+ */
 function newRequestId() {
-  return `web-${crypto.randomUUID()}`;
+  if (typeof crypto.randomUUID === "function") return `web-${crypto.randomUUID()}`;
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `web-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 async function render() {
