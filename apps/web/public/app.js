@@ -185,6 +185,9 @@ async function projectsView() {
   const checkId = el("input", { placeholder: "test" });
   const checkCommand = el("input", { placeholder: "npm test" });
   const toolchainTool = el("input", { placeholder: "node --version", title: "A tool this project's build profile needs on its worker" });
+  // A project's required worker OS is its own choice; tying it to the host form's select would let a
+  // Linux project be created as a Windows one (and demand a toolchain) by accident.
+  const projectOs = el("select", {}, el("option", { value: "linux" }, "needs linux"), el("option", { value: "windows" }, "needs windows"));
   const error = el("p", { class: "error" });
   const hostsCard = el("div", { class: "card" },
     el("h3", {}, "Registered hosts"),
@@ -237,13 +240,13 @@ async function projectsView() {
         } }, "Verify toolchain") : null,
       )),
       projects.projects.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
-      el("div", { class: "row" }, projectId, repoSlug, branch, checkId, checkCommand, toolchainTool,
+      el("div", { class: "row" }, projectId, repoSlug, branch, checkId, checkCommand, toolchainTool, projectOs,
         el("button", { class: "primary", onclick: async () => {
           try {
             await api("/api/projects", { method: "POST", body: JSON.stringify({
               projectId: projectId.value, repoSlug: repoSlug.value, defaultBranch: branch.value,
               hostId: hostId.value || (hosts.hosts[0] && hosts.hosts[0].hostId),
-              requiredOs: hostOs.value,
+              requiredOs: projectOs.value,
               ...(toolchainTool.value ? { toolchain: [{ id: toolchainTool.value.split(/\s+/)[0], command: toolchainTool.value }] } : {}),
               buildProfile: { setup: [], checks: [{ id: checkId.value, command: checkCommand.value }] },
             }) });
