@@ -36,12 +36,22 @@ export type ProjectRecord = {
   buildProfile: BuildProfile;
   /** Where the feature branch is pushed; defaults to https://github.com/<slug>.git. */
   gitRemoteUrl: string | null;
+  /** Isolated preview and browser scenarios for screenshot evidence; null when the project has no UI to preview. */
+  preview: PreviewConfig | null;
   status: ProjectStatus;
   createdAt: number;
   updatedAt: number;
 };
 
 export type JobStage = "requirements" | "planning" | "implementation";
+
+export type BrowserScenario = { id: string; route: string; width: number; height: number };
+export type PreviewConfig = {
+  /** Plain argv text, like a build command: no shell metacharacters. */
+  command: string;
+  port: number;
+  scenarios: BrowserScenario[];
+};
 export type JobRunState =
   | "running"
   | "waiting_user"
@@ -285,6 +295,10 @@ export class WorkflowStore {
     if (!columns.some((column) => column.name === "git_remote_url")) {
       this.#database.exec("ALTER TABLE slice_projects ADD COLUMN git_remote_url TEXT");
     }
+    // Migration: Phase 3 adds per-project preview and browser scenarios.
+    if (!columns.some((column) => column.name === "preview_json")) {
+      this.#database.exec("ALTER TABLE slice_projects ADD COLUMN preview_json TEXT");
+    }
   }
 
   static open(database: DatabaseSync): WorkflowStore {
@@ -339,6 +353,7 @@ export class WorkflowStore {
     hostId: string;
     buildProfile: BuildProfile;
     gitRemoteUrl?: string | null;
+    preview?: PreviewConfig | null;
   }): ProjectRecord {
     assertId("projectId", project.projectId);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(project.repoSlug)) {
@@ -352,12 +367,13 @@ export class WorkflowStore {
         throw new TypeError("Git remote URLs must be https:// or file:// without embedded credentials");
       }
     }
+    if (project.preview !== undefined && project.preview !== null) validatePreview(project.preview);
     const now = Date.now();
     this.#database
       .prepare(`INSERT INTO slice_projects
-        (project_id, revision, git_provider, repo_slug, default_branch, host_id, build_profile_json, git_remote_url, status, created_at, updated_at)
-        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, 'active', ?, ?)`)
-      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId, JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null, now, now);
+        (project_id, revision, git_provider, repo_slug, default_branch, host_id, build_profile_json, git_remote_url, preview_json, status, created_at, updated_at)
+        VALUES (?, 1, 'github', ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+      .run(project.projectId, project.repoSlug, project.defaultBranch, project.hostId, JSON.stringify(project.buildProfile), project.gitRemoteUrl ?? null, project.preview === undefined || project.preview === null ? null : JSON.stringify(project.preview), now, now);
     return this.getProject(project.projectId)!;
   }
 
@@ -893,6 +909,28 @@ function validateBuildProfile(profile: BuildProfile): void {
   }
 }
 
+function validatePreview(preview: PreviewConfig): void {
+  if (typeof preview.command !== "string" || preview.command.length === 0 || preview.command.length > 500) {
+    throw new TypeError("Preview commands must be 1-500 characters");
+  }
+  if (/[<>$`&|;(){}\\\n\r]/.test(preview.command)) throw new TypeError("Preview commands must be a plain command without shell metacharacters");
+  if (!Number.isSafeInteger(preview.port) || preview.port < 1024 || preview.port > 65_535) throw new TypeError("Preview ports must be between 1024 and 65535");
+  if (!Array.isArray(preview.scenarios) || preview.scenarios.length === 0 || preview.scenarios.length > 10) {
+    throw new TypeError("A preview declares between 1 and 10 browser scenarios");
+  }
+  const seen = new Set<string>();
+  for (const scenario of preview.scenarios) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(scenario.id)) throw new TypeError("Scenario ids must be 1-64 safe characters");
+    if (seen.has(scenario.id)) throw new TypeError("Scenario ids must be unique within a preview");
+    seen.add(scenario.id);
+    if (typeof scenario.route !== "string" || !/^\/[A-Za-z0-9._/?=&-]{0,200}$/.test(scenario.route)) {
+      throw new TypeError("Scenario routes must be a path beginning with /");
+    }
+    if (!Number.isSafeInteger(scenario.width) || scenario.width < 320 || scenario.width > 2000) throw new TypeError("Scenario widths must be 320-2000 pixels");
+    if (!Number.isSafeInteger(scenario.height) || scenario.height < 320 || scenario.height > 2000) throw new TypeError("Scenario heights must be 320-2000 pixels");
+  }
+}
+
 function toProject(row: Record<string, unknown>): ProjectRecord {
   return {
     projectId: String(row.project_id),
@@ -903,6 +941,7 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     hostId: String(row.host_id),
     buildProfile: parseJson<BuildProfile>(String(row.build_profile_json), { setup: [], checks: [] }),
     gitRemoteUrl: row.git_remote_url === null || row.git_remote_url === undefined ? null : String(row.git_remote_url),
+    preview: row.preview_json === null || row.preview_json === undefined ? null : parseJson<PreviewConfig | null>(String(row.preview_json), null),
     status: String(row.status) as ProjectStatus,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),

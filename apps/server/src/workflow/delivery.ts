@@ -189,6 +189,8 @@ export class DeliveryLoop {
       });
     }
     this.#deps.delivery.setDeliveryStage(job.jobId, "authoring");
+    // Baseline evidence is captured at the recorded base revision, before any authoring work.
+    await this.#capturePhase(job, "baseline", baseCommit);
     await this.advance(job.jobId);
   }
 
@@ -516,6 +518,9 @@ export class DeliveryLoop {
     this.#deps.delivery.recordGate(jobId, verdict, gateRecord);
     this.#deps.workflows.appendEvent(jobId, "gate_evaluated", { verdict, round: delivery.round, reasons });
     if (verdict === "pass") {
+      // The 'after' capture runs on the reviewed head, before publication, with the same scenarios
+      // and viewports as the baseline.
+      await this.#capturePhase(job, "after", delivery.headCommit);
       this.#deps.delivery.setDeliveryStage(jobId, "publishing");
       return;
     }
@@ -738,6 +743,64 @@ export class DeliveryLoop {
     return join(dir, artifactId);
   }
 
+  /**
+   * Preview and screenshot evidence. Screenshots come only from a running preview on the runner,
+   * at the stated commit, with the project's registered scenarios and viewports. A project with no
+   * preview is stated as not applicable; a failed capture is stated, never replaced with an image.
+   */
+  async #capturePhase(job: JobRecord, phase: "baseline" | "after", commit: string): Promise<void> {
+    const jobId = job.jobId;
+    const project = this.#deps.workflows.getProject(job.projectId);
+    const workspace = this.#deps.workflows.getWorkspace(jobId);
+    if (project === undefined || workspace === undefined) return;
+    if (project.preview === null) {
+      if (phase === "baseline") this.#deps.workflows.appendEvent(jobId, "screenshots_not_applicable", { reason: "the project declares no preview or browser scenarios" });
+      return;
+    }
+    try {
+      const started = await this.#deps.runner.startPreview({
+        jobId, hostId: workspace.hostId, operationId: `${jobId}:preview`, leaseGeneration: workspace.leaseGeneration,
+        command: project.preview.command, port: project.preview.port,
+      });
+      const host = this.#deps.workflows.getHost(workspace.hostId);
+      this.#deps.workflows.appendEvent(jobId, "preview_available", {
+        phase, url: `http://${host?.address ?? "127.0.0.1"}:${started.port}`, note: "closing this preview never affects the job",
+      });
+    } catch (error) {
+      this.#deps.workflows.appendEvent(jobId, "preview_failed", { phase, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" });
+      return;
+    }
+    for (const scenario of project.preview.scenarios) {
+      try {
+        const png = await this.#deps.runner.captureScreenshot({ jobId, hostId: workspace.hostId, scenarioId: scenario.id, route: scenario.route, commit, width: scenario.width, height: scenario.height });
+        const artifactId = `${phase}-${scenario.id}-${commit.slice(0, 12)}`;
+        this.#writeBinaryArtifact(jobId, artifactId, phase === "baseline" ? "screenshot-baseline" : "screenshot-after", png, commit);
+        this.#writeArtifact(jobId, `${artifactId}.meta`, "screenshot-meta", JSON.stringify({
+          scenario: scenario.id, route: scenario.route, viewport: { width: scenario.width, height: scenario.height }, commit, phase, capturedAt: Date.now(),
+        }), commit);
+        this.#deps.workflows.appendEvent(jobId, "screenshot_captured", { phase, scenario: scenario.id, commit });
+      } catch (error) {
+        this.#deps.workflows.appendEvent(jobId, "screenshot_failed", { phase, scenario: scenario.id, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" });
+      }
+    }
+  }
+
+  #writeBinaryArtifact(jobId: string, artifactId: string, kind: string, bytes: Buffer, headCommit: string): void {
+    const path = this.#artifactPath(jobId, artifactId);
+    writeFileSync(path, bytes, { mode: 0o600 });
+    const key = verificationKey({ repoSlug: jobId, baseCommit: "", headCommit, requirementsRevision: 0, profileRevision: 0, policyVersion: POLICY_VERSION });
+    this.#deps.delivery.recordArtifact({
+      jobId,
+      id: artifactId,
+      kind,
+      digest: createHash("sha256").update(bytes).digest("hex"),
+      sizeBytes: bytes.byteLength,
+      path,
+      verificationKey: key,
+      expiresAt: Date.now() + RETENTION_DAYS * 86_400_000,
+    });
+  }
+
   #writeArtifact(jobId: string, artifactId: string, kind: string, content: string, headCommit: string): void {
     const path = this.#artifactPath(jobId, artifactId);
     writeFileSync(path, content, { mode: 0o600 });
@@ -787,6 +850,11 @@ export class DeliveryLoop {
     }
     this.#deps.delivery.setCleanupState(jobId, "pending");
     try {
+      // Cleanup requires confirmed stop: the preview is stopped first, and the runner refuses to
+      // delete while any operation remains unsettled.
+      try {
+        await this.#deps.runner.stopPreview({ jobId, hostId: workspace.hostId });
+      } catch { /* the runner's own stop check still guards deletion */ }
       await this.#deps.runner.cleanupJob({ jobId, hostId: workspace.hostId });
       this.#deps.delivery.setCleanupState(jobId, "cleaned");
       this.#deps.workflows.appendEvent(jobId, "workspace_cleaned", { hostId: workspace.hostId });

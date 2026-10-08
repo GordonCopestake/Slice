@@ -290,6 +290,18 @@ export class SliceApi {
             : [],
         },
         ...(typeof body.gitRemoteUrl === "string" ? { gitRemoteUrl: body.gitRemoteUrl } : {}),
+        ...(body.preview === undefined || body.preview === null ? {} : (() => {
+          if (typeof body.preview !== "object" || Array.isArray(body.preview)) throw new TypeError("preview must be an object");
+          const preview = body.preview as Record<string, JsonValue>;
+          const scenarios = Array.isArray(preview.scenarios)
+            ? preview.scenarios.map((item) => {
+                if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("scenario entries must be objects");
+                const scenario = item as Record<string, unknown>;
+                return { id: String(scenario.id ?? ""), route: String(scenario.route ?? ""), width: Number(scenario.width), height: Number(scenario.height) };
+              })
+            : [];
+          return { preview: { command: String(preview.command ?? ""), port: Number(preview.port), scenarios } };
+        })()),
       });
       json(response, 201, { project });
       return;
