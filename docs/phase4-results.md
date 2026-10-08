@@ -1,6 +1,6 @@
 # Phase 4 results — more hosts, release readiness, and rollback evidence
 
-Status: **synthetic checks pass (156 Node tests; 14 were added in Phase 4). The live exit check has
+Status: **synthetic checks pass (161 Node tests; 19 were added in Phase 4). The live exit check has
 not been run** — it needs a real Windows worker, a real second Linux host, and a real staging
 environment. No claim below is presented as a live result.
 
@@ -92,7 +92,7 @@ unchanged).
 
 ## Verification
 
-`npm run check` passes: format, typecheck, build, and **156 Node tests** (14 added in this phase).
+`npm run check` passes: format, typecheck, build, and **161 Node tests** (19 added in this phase).
 
 | Exit-check row | Synthetic stand-in | Status |
 |---|---|---|
@@ -127,6 +127,32 @@ host, a real second Linux host, or a real staging environment.**
   beyond "first host in registration order with room".
 - Release recording depends on a verified merge observation from the git host. A merge Slice cannot
   verify records no release.
+
+## Review rounds
+
+Five independent review passes were run over the Phase 4 diff before this record was written. Each
+round is a separate commit; each finding is stated with its consequence:
+
+1. **Attestation binding, staging isolation, journal reuse.** Toolchain evidence was bound to the
+   project's profile revision, so pausing and resuming silently invalidated a passing check; it is now
+   bound to a digest of the declared probes, and editing probes (which had no path at all) invalidates
+   the evidence. Two concurrent rehearsals could share one staging workspace and report results from
+   each other's checkout — one rehearsal per project now. A second rehearsal of the same release could
+   not re-create its workspace because the journal's settled `prepare` row for the shared staging id
+   made the adapter skip preparation; each attempt now gets its own workspace and check operation ids.
+2. **Maintenance workspaces leaked host slots.** A rehearsal cleaned its staging workspace but never
+   released it, so the host kept counting a slot for a workspace that no longer existed. A second
+   toolchain check hit the same settled-`prepare` problem after the first had cleaned its probe
+   workspace; each verification now gets its own maintenance workspace, reclaimed by the sweep.
+3. **Policy re-checked per step; latest rehearsal wins.** Model and privacy rules were enforced only
+   at workspace-ready, so a rule tightened later would still let author and review rounds run on a
+   forbidden model; every step of the state machine re-checks now. Rollback evidence had taken the
+   best rehearsal ever recorded — a later failure is real signal, so the gate reads the most recent
+   rehearsal for the rollback target.
+4. **A project chooses its own worker OS.** The web form took a project's required OS from the host
+   form's select, so a Linux project could be created as a Windows one by accident.
+5. **Full-diff review.** Scope, secrets, generated files, and documentation counts checked; no code
+   change beyond this record.
 
 ## Running Phase 4 locally
 
