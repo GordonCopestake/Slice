@@ -16,6 +16,8 @@ import { WorkflowStore } from "../../apps/server/src/records/workflow-store.js";
 import { DeliveryStore } from "../../apps/server/src/records/delivery-store.js";
 import { JobCoordinator } from "../../apps/server/src/workflow/coordinator.js";
 import { StatusReports } from "../../apps/server/src/workflow/status-reports.js";
+import { NotificationService } from "../../apps/server/src/workflow/notifications.js";
+import { NotificationStore } from "../../apps/server/src/records/notification-store.js";
 import { StatusStore } from "../../apps/server/src/records/status-store.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner } from "../support/fake-runner.js";
@@ -34,7 +36,7 @@ type TestStack = {
   faux: ReturnType<typeof fauxProvider>;
 };
 
-async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports } = {}): Promise<TestStack> {
+async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?: (workflows: WorkflowStore, state: ApplicationStateStore) => StatusReports; makeNotifications?: (workflows: WorkflowStore, state: ApplicationStateStore) => NotificationService } = {}): Promise<TestStack> {
   const directory = mkdtempSync(join(tmpdir(), "slice-api-"));
   const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
   const workflows = WorkflowStore.open(state.database);
@@ -44,7 +46,7 @@ async function startStack(options: { deliveryStore?: DeliveryStore; makeStatus?:
   const adapter = await PiDurableAdapter.open({ durableDatabasePath: join(directory, "state.sqlite"), state, models, registry: createRegistry() });
   const auth = new OwnerAuth(workflows, { SLICE_OWNER_PASSWORD: PASSWORD });
   const coordinator = new JobCoordinator(adapter, workflows, { provider: "faux", modelId: "faux-1" }, fakeRunner());
-  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }) });
+  const api = new SliceApi({ auth, workflows, coordinator, webDirectory: join(process.cwd(), "apps/web/public"), ...(options.deliveryStore === undefined ? {} : { deliveryStore: options.deliveryStore }), ...(options.makeStatus === undefined ? {} : { status: options.makeStatus(workflows, state) }), ...(options.makeNotifications === undefined ? {} : { notifications: options.makeNotifications(workflows, state) }) });
   const server = createServer((request, response) => { void api.handle(request, response); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -345,6 +347,45 @@ test("status report settings and history are exposed through the API", async () 
 
     const missing = await stack.call("/api/jobs/no-such-job/status-reports");
     assert.equal(missing.status, 404);
+  } finally {
+    await stack.close();
+  }
+});
+
+test("telegram linking state and the job notification view are exposed", async () => {
+  const stack = await startStack({
+    makeNotifications: (workflows, state) => new NotificationService({
+      workflows,
+      notifications: NotificationStore.open(state.database),
+      status: StatusStore.open(state.database),
+      telegram: null,
+    }),
+  });
+  try {
+    await login(stack);
+    const status = await stack.call("/api/telegram");
+    assert.equal(status.status, 200);
+    assert.equal(status.body.telegram.botConfigured, false, "no bot token: the service says so instead of pretending");
+    assert.equal(status.body.telegram.linked, false);
+
+    const code = await stack.call("/api/telegram/link-code", { method: "POST", body: {} });
+    assert.equal(code.status, 200);
+    assert.match(code.body.code, /^[a-f0-9]{12}$/);
+
+    const periodic = await stack.call("/api/telegram/periodic", { method: "POST", body: { enabled: true } });
+    assert.equal(periodic.status, 200);
+    assert.equal(periodic.body.telegram.periodicEnabled, true);
+
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(QUESTION_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "web-n1", projectId: "demo", title: "Notify", request: "Add alerts" } });
+    const notifications = await stack.call(`/api/jobs/${created.body.job.jobId}/notifications`);
+    assert.equal(notifications.status, 200);
+    assert.deepEqual(notifications.body.notifications, [], "nothing queued while the channel is unconfigured");
   } finally {
     await stack.close();
   }

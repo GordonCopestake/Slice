@@ -13,6 +13,9 @@ import { LocalRunnerTransport, SshRunnerTransport } from "./adapters/ssh-runner/
 import { WorkflowStore } from "./records/workflow-store.js";
 import { DeliveryStore } from "./records/delivery-store.js";
 import { StatusStore } from "./records/status-store.js";
+import { NotificationStore } from "./records/notification-store.js";
+import { NotificationService } from "./workflow/notifications.js";
+import { TelegramClient } from "./adapters/telegram/telegram.js";
 import { ApplicationStateStore } from "./state/application-state.js";
 import { FileCredentialStore } from "./state/credential-store.js";
 import { SingleOwnerLock } from "./state/single-owner-lock.js";
@@ -142,6 +145,7 @@ export async function startSlice(): Promise<void> {
   let retentionTimer: NodeJS.Timeout | undefined;
   let mergePoller: NodeJS.Timeout | undefined;
   let reportTimer: NodeJS.Timeout | undefined;
+  let notifyTimer: NodeJS.Timeout | undefined;
 
   try {
     const databasePath = join(stateDirectory, "state.sqlite");
@@ -157,8 +161,13 @@ export async function startSlice(): Promise<void> {
     const runner = buildRunner(workflows, state, stateDirectory);
     const delivery = buildDelivery(adapter, workflows, state, stateDirectory, runner);
     const coordinator = new JobCoordinator(adapter, workflows, requirementsProfile(process.env), runner, delivery);
-    const statusReports = new StatusReports({ workflows, deliveryStore: DeliveryStore.open(state.database), status: StatusStore.open(state.database) });
-    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports });
+    const statusStore = StatusStore.open(state.database);
+    const notificationStore = NotificationStore.open(state.database);
+    const telegramToken = process.env.SLICE_TELEGRAM_BOT_TOKEN;
+    const telegramClient = telegramToken !== undefined && telegramToken.trim().length > 0 ? new TelegramClient({ token: telegramToken }) : null;
+    const notifications = new NotificationService({ workflows, notifications: notificationStore, status: statusStore, telegram: telegramClient });
+    const statusReports = new StatusReports({ workflows, deliveryStore: DeliveryStore.open(state.database), status: statusStore, notify: (jobId, kind, dueAt) => notifications.enqueueReport(jobId, dueAt) });
+    const api = new SliceApi({ auth, workflows, coordinator, webDirectory: resolve(process.env.SLICE_WEB_DIR ?? "apps/web/public"), deliveryStore: DeliveryStore.open(state.database), delivery, status: statusReports, notifications });
     // F7 carry-over: terminal request-index and operation rows are pruned on a schedule.
     workflows.pruneExpired();
     retentionTimer = setInterval(() => workflows?.pruneExpired(), 3_600_000);
@@ -210,6 +219,19 @@ export async function startSlice(): Promise<void> {
     }, 30_000);
     reportTimer.unref();
 
+    // Outbox delivery, alert scan, and the Telegram linking poll. Failure here never stops work.
+    if (telegramClient !== null) {
+      notifyTimer = setInterval(() => {
+        const now = Date.now();
+        try {
+          notifications.scanAlerts();
+        } catch { /* the next tick retries */ }
+        void notifications.deliverDue(now).catch(() => { /* the next tick retries */ });
+        void notifications.pollLink().catch(() => { /* the next tick retries */ });
+      }, 15_000);
+      notifyTimer.unref();
+    }
+
     await new Promise<void>((resolveStop) => {
       const stop = (): void => resolveStop();
       process.once("SIGINT", stop);
@@ -219,6 +241,7 @@ export async function startSlice(): Promise<void> {
     if (retentionTimer !== undefined) clearInterval(retentionTimer);
     if (mergePoller !== undefined) clearInterval(mergePoller);
     if (reportTimer !== undefined) clearInterval(reportTimer);
+    if (notifyTimer !== undefined) clearInterval(notifyTimer);
     await shutdown(server, adapter, state, lock);
   }
 }

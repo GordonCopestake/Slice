@@ -9,6 +9,7 @@ import { verificationKey } from "../records/delivery-store.js";
 import { JobCoordinator, JobStateConflictError } from "../workflow/coordinator.js";
 import { POLICY_VERSION, type DeliveryLoop } from "../workflow/delivery.js";
 import type { StatusReports } from "../workflow/status-reports.js";
+import type { NotificationService } from "../workflow/notifications.js";
 import { listGithubIssues } from "../adapters/github/github-issues.js";
 
 export type ApiDependencies = {
@@ -19,6 +20,7 @@ export type ApiDependencies = {
   deliveryStore?: DeliveryStore;
   delivery?: DeliveryLoop | null;
   status?: StatusReports | null;
+  notifications?: NotificationService | null;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -211,6 +213,37 @@ export class SliceApi {
     }
     if (method === "GET" && path === "/api/session") {
       json(response, 200, { authenticated: true });
+      return;
+    }
+
+    if (path === "/api/telegram" || path.startsWith("/api/telegram/")) {
+      if (this.#deps.notifications === undefined || this.#deps.notifications === null) {
+        json(response, 404, { error: "notifications_not_configured" });
+        return;
+      }
+      const rest = path.slice("/api/telegram".length);
+      if (method === "GET" && rest === "") {
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      if (method === "POST" && rest === "/link-code") {
+        const code = this.#deps.notifications.startLinkCode();
+        json(response, 200, { code, instructions: `Send "/link ${code}" to your Slice bot. The code works once and expires in 15 minutes.` });
+        return;
+      }
+      if (method === "POST" && rest === "/unlink") {
+        this.#deps.notifications.unlinkTelegram();
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      if (method === "POST" && rest === "/periodic") {
+        const body = asObject(await readBody(request));
+        if (typeof body.enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+        this.#deps.notifications.setPeriodicReports(body.enabled);
+        json(response, 200, { telegram: this.#deps.notifications.telegramStatus() });
+        return;
+      }
+      json(response, 404, { error: "not_found" });
       return;
     }
 
@@ -409,6 +442,14 @@ export class SliceApi {
         if (result.recorded) this.#deps.status?.onSteering(jobId);
         // A stale command revision returns the current state without applying the instruction.
         json(response, result.recorded ? 200 : 409, { job: publicJob(result.job), recorded: result.recorded });
+        return;
+      }
+      if (method === "GET" && rest === "/notifications") {
+        if (this.#deps.notifications === undefined || this.#deps.notifications === null) {
+          json(response, 404, { error: "notifications_not_configured" });
+          return;
+        }
+        json(response, 200, { notifications: this.#deps.notifications.notificationsFor(jobId) });
         return;
       }
       if (method === "GET" && rest === "/status-reports") {

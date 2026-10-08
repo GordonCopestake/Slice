@@ -143,7 +143,9 @@ function newJobView() {
 }
 
 async function projectsView() {
-  const [{ body: hosts }, { body: projects }] = await Promise.all([api("/api/hosts"), api("/api/projects")]);
+  const [{ body: hosts }, { body: projects }, telegramResult] = await Promise.all([
+    api("/api/hosts"), api("/api/projects"), api("/api/telegram").catch(() => null),
+  ]);
   const hostId = el("input", { placeholder: "runner-a" });
   const address = el("input", { placeholder: "runner.internal" });
   const sshUser = el("input", { placeholder: "slice-runner" });
@@ -188,6 +190,33 @@ async function projectsView() {
         } }, "Add project")),
       error,
     ),
+    telegramCard(telegramResult),
+  );
+}
+
+/** Telegram linking and periodic-report opt-in. Status only: the token never reaches the browser. */
+function telegramCard(result) {
+  if (result === null || result.status !== 200 || !result.body.telegram) return null;
+  const t = result.body.telegram;
+  const codeLine = el("p", { class: "muted" });
+  const periodic = el("input", { type: "checkbox", checked: t.periodicEnabled });
+  return el("div", { class: "card" },
+    el("h3", {}, "Telegram alerts"),
+    el("div", { class: "row" },
+      badge(t.botConfigured ? "configured" : "not configured"),
+      badge(t.linked ? "linked" : "unlinked"),
+      el("span", { class: "muted" }, t.botConfigured
+        ? "alerts cover questions, blocks, readiness, merges, and cleanup; periodic reports are opt-in"
+        : "set SLICE_TELEGRAM_BOT_TOKEN to enable alerts")),
+    t.botConfigured ? el("div", { class: "row" },
+      el("button", { onclick: async () => {
+        const { body } = await api("/api/telegram/link-code", { method: "POST", body: "{}" });
+        codeLine.textContent = body.instructions;
+      } }, "Get link code"),
+      t.linked ? el("button", { onclick: async () => { await api("/api/telegram/unlink", { method: "POST", body: "{}" }); await render(); } }, "Unlink") : null,
+      el("label", { class: "row" }, periodic, " periodic reports on Telegram"),
+      el("button", { onclick: async () => { await api("/api/telegram/periodic", { method: "POST", body: JSON.stringify({ enabled: periodic.checked }) }); await render(); } }, "Save")) : null,
+    codeLine,
   );
 }
 
@@ -354,6 +383,16 @@ async function buildReportsPanel(jobId) {
     card.append(el("details", {},
       el("summary", {}, `earlier reports (${reports.length - 1})`),
       el("ul", { class: "events" }, ...reports.slice(1).map((entry) => el("li", {}, el("time", {}, new Date(entry.dueAt).toLocaleString()), entry.final ? " final report" : ` generation ${entry.generation}`))));
+  }
+  let notifyResult = null;
+  try {
+    notifyResult = await api(`/api/jobs/${jobId}/notifications`);
+  } catch { /* the view still renders without the outbox */ }
+  if (notifyResult !== null && notifyResult.status === 200 && notifyResult.body.notifications.length > 0) {
+    card.append(el("h4", {}, "Notification delivery"),
+      el("table", {}, el("tr", {}, el("th", {}, "kind"), el("th", {}, "channel"), el("th", {}, "status"), el("th", {}, "attempts")),
+        ...notifyResult.body.notifications.map((entry) => el("tr", {},
+          el("td", {}, entry.kind), el("td", {}, entry.channel), el("td", {}, badge(entry.status)), el("td", {}, String(entry.attempts))))));
   }
   return card;
 }
