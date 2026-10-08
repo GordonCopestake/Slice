@@ -842,6 +842,22 @@ export class WorkflowStore {
     return { jobId, seq, type, payload, createdAt };
   }
 
+  /**
+   * Why a job is currently blocked, taken from its own ledger. A thread list that only says
+   * "blocked" makes the owner open every thread to find out what is wrong.
+   */
+  latestBlockedReason(jobId: string): { reason: string; detail: string | null } | undefined {
+    assertId("jobId", jobId);
+    const row = this.#database
+      .prepare("SELECT payload_json FROM slice_job_events WHERE job_id = ? AND type = 'blocked' ORDER BY seq DESC LIMIT 1")
+      .get(jobId) as { payload_json: string } | undefined;
+    if (row === undefined) return undefined;
+    const payload = parseJson<Record<string, unknown>>(String(row.payload_json), {});
+    const reason = typeof payload.reason === "string" ? payload.reason : "no reason recorded";
+    const detail = typeof payload.detail === "string" ? payload.detail : null;
+    return { reason, detail };
+  }
+
   eventsAfter(jobId: string, cursor: number, limit = 200): JobEvent[] {
     assertId("jobId", jobId);
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError("Event cursors must be non-negative integers");

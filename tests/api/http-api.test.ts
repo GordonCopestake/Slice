@@ -770,3 +770,45 @@ test("a host's declared capacity is honoured instead of silently defaulting to o
     assert.equal(notNumber.status, 400);
   } finally { await stack.close(); }
 });
+
+test("the thread list states why each blocked thread is blocked", async () => {
+  // A delivery stub so that, once the owner fixes the environment, the thread genuinely continues
+  // rather than blocking again for want of a pipeline.
+  const stack = await startStack({ hooks: stubHooks() });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "triage-host", address: "triage.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: { projectId: "triage", repoSlug: "owner/triage", defaultBranch: "main", hostId: "triage-host", buildProfile: { checks: [{ id: "test", command: "npm test" }] } } });
+    // The host is taken out of rotation, so placement refuses the job with a stated reason.
+    await stack.call("/api/hosts/triage-host/enabled", { method: "POST", body: { enabled: false } });
+
+    fauxReady(stack);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "triage-1", projectId: "triage", title: "Triage me", request: "Add a screen" } });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const jobId = created.body.job.jobId;
+
+    const listed = await stack.call("/api/jobs");
+    const row = listed.body.jobs.find((job: { jobId: string }) => job.jobId === jobId);
+    assert.ok(row !== undefined, "the thread must appear in the list");
+    assert.equal(row.runState, "blocked");
+    assert.equal(row.blockedReason, "host_disabled", "the list must say why, not just that it is blocked");
+
+    const detail = await stack.call(`/api/jobs/${jobId}`);
+    assert.equal(detail.body.blocked.reason, "host_disabled");
+    assert.equal(typeof detail.body.blocked.detail, "string");
+
+    // A thread that is not blocked carries no reason, so a stale one cannot resurface.
+    await stack.call("/api/hosts/triage-host/enabled", { method: "POST", body: { enabled: true } });
+    // Retrying re-enters the requirements step, so the role needs an answer to give.
+    fauxReady(stack);
+    const retried = await stack.call(`/api/jobs/${jobId}/retry`, { method: "POST", body: {} });
+    assert.equal(retried.status, 200, JSON.stringify(retried.body));
+    const relisted = await stack.call("/api/jobs");
+    const again = relisted.body.jobs.find((job: { jobId: string }) => job.jobId === jobId);
+    assert.equal(`${again.runState}/${again.stage}/${again.blockedReason}`, "running/implementation/null");
+  } finally { await stack.close(); }
+});
+
+function fauxReady(stack: TestStack): void {
+  stack.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+}

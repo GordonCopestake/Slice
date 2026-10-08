@@ -119,13 +119,20 @@ async function main() {
     const collected = await cdp.send("Runtime.evaluate", { expression: "window.__sliceErrors ?? []", returnByValue: true });
     const log = cdp.events.filter((event) => event.method === "Log.entryAdded").map((event) => event.params.entry);
     console.log(JSON.stringify({ page: collected.result.value, browserLog: log }, null, 2));
+  } else if (command === "viewport") {
+    // Real phone and tablet sizes, not a narrow desktop window: device pixel ratio and mobile metrics
+    // change what actually overflows.
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: Number(rest[0]), height: Number(rest[1]), deviceScaleFactor: Number(rest[2] ?? 2), mobile: true,
+    });
+    console.log(JSON.stringify({ viewport: `${rest[0]}x${rest[1]}`, mobile: true }));
   } else if (command === "shot") {
     const shot = await cdp.send("Page.captureScreenshot", { format: "png" });
     const { writeFileSync } = await import("node:fs");
     writeFileSync(rest[0], Buffer.from(shot.data, "base64"));
     console.log(rest[0]);
   } else {
-    console.log("usage: cdp.mjs nav <url> | eval <expr> | errors | shot <file>");
+    console.log("usage: cdp.mjs nav <url> | eval <expr> | errors | shot <file> | viewport <w> <h> [dsf]");
   }
   cdp.close();
 }

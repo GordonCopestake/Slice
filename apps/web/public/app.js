@@ -42,6 +42,37 @@ function badge(text) {
 }
 
 /**
+ * A ledger event rendered in words. The raw record is still available behind a details element, but
+ * it is no longer the primary thing a person reads - a wall of JSON is unreadable on a phone and
+ * pushed the page sideways past the viewport width.
+ */
+function shortValue(value) {
+  if (typeof value === "string") return value.length > 160 ? `${value.slice(0, 160)}…` : value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `${value.length} item${value.length === 1 ? "" : "s"}`;
+  const json = JSON.stringify(value);
+  return json.length > 160 ? `${json.slice(0, 160)}…` : json;
+}
+
+/** A labelled control. Placeholders alone are unusable once a person has typed into them. */
+function field(labelText, control, hint) {
+  return el("div", { class: "field" }, el("label", {}, labelText), control,
+    hint === undefined ? null : el("span", { class: "muted" }, hint));
+}
+
+function eventItem(event) {
+  const payload = event.payload;
+  const entries = payload === null || payload === undefined ? [] : Object.entries(payload).filter(([, value]) => value !== null && value !== undefined);
+  const readable = entries.length === 0
+    ? event.type
+    : `${event.type} — ${entries.map(([key, value]) => `${key}: ${shortValue(value)}`).join(", ")}`;
+  return el("li", {},
+    el("time", {}, new Date(event.createdAt).toLocaleTimeString()),
+    readable,
+    entries.length === 0 ? null : el("details", {}, el("summary", {}, "raw"), el("code", {}, JSON.stringify(payload))));
+}
+
+/**
  * crypto.randomUUID is only exposed in a secure context (https, or http on localhost). The owner may
  * serve this UI over plain HTTP on a tailnet or LAN address, where it is undefined, so fall back to
  * getRandomValues, which is available in any context.
@@ -128,6 +159,7 @@ async function jobsView() {
             job.branch ? el("span", { class: "muted" }, job.branch) : null,
             el("span", { class: "muted" }, new Date(job.updatedAt).toLocaleString()),
           ),
+          job.blockedReason ? el("p", { class: "muted" }, `why: ${job.blockedReason}`) : null,
           job.issue ? el("p", { class: "muted" }, `issue ${job.issue.repoSlug}#${job.issue.issueNumber}`) : null,
           el("button", { onclick: () => { state.jobId = job.jobId; state.view = "job"; void render(); } }, job.archived ? "Open result" : "Open"),
         ))));
@@ -203,34 +235,45 @@ async function projectsView() {
   // Linux project be created as a Windows one (and demand a toolchain) by accident.
   const projectOs = el("select", {}, el("option", { value: "linux" }, "needs linux"), el("option", { value: "windows" }, "needs windows"));
   const error = el("p", { class: "error" });
+  // A successful toolchain probe is not an error and must not render as one.
+  const statusLine = el("p", { class: "status" });
   const hostsCard = el("div", { class: "card" },
     el("h3", {}, "Registered hosts"),
     ...hosts.hosts.map((host) => el("p", {},
       `${host.hostId} — ${host.address} (${host.os}, ${host.sshUser}, ${host.runnerRoot}) `,
       badge(host.enabled ? `capacity ${host.capacity}` : "disabled"),
       " ", el("button", { onclick: async () => {
-        await api(`/api/hosts/${host.hostId}/enabled`, { method: "POST", body: JSON.stringify({ enabled: !host.enabled }) });
-        await render();
+        try {
+          await api(`/api/hosts/${host.hostId}/enabled`, { method: "POST", body: JSON.stringify({ enabled: !host.enabled }) });
+          await render();
+        } catch (cause) { error.textContent = String(cause.message); }
       } }, host.enabled ? "Disable" : "Enable"),
     )),
     hosts.hosts.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
-    el("div", { class: "row" }, hostId, address, hostOs, sshUser, runnerRoot, hostCapacity,
-      el("button", { class: "primary", onclick: async () => {
-        try {
-          await api("/api/hosts", { method: "POST", body: JSON.stringify({
-            hostId: hostId.value, address: address.value, os: hostOs.value, sshUser: sshUser.value,
-            runnerRoot: runnerRoot.value, capacity: Number(hostCapacity.value || 1),
-          }) });
-          await render();
-        } catch (cause) { error.textContent = String(cause.message); }
-      } }, "Add host")),
-    el("div", { class: "row" }, poolId,
-      el("button", { onclick: async () => {
-        try {
-          await api("/api/host-pools", { method: "POST", body: JSON.stringify({ poolId: poolId.value, hosts: hosts.hosts.map((host) => host.hostId) }) });
-          await render();
-        } catch (cause) { error.textContent = String(cause.message); }
-      } }, "Pool all hosts (a job uses one worker with room)")),
+    el("div", { class: "fields" },
+      field("Host id", hostId), field("Address", address), field("Worker OS", hostOs),
+      field("SSH user", sshUser), field("Runner root", runnerRoot),
+      field("Capacity", hostCapacity, "how many jobs this worker may carry at once"),
+      el("div", { class: "field" },
+        el("button", { class: "primary", onclick: async () => {
+          try {
+            await api("/api/hosts", { method: "POST", body: JSON.stringify({
+              hostId: hostId.value, address: address.value, os: hostOs.value, sshUser: sshUser.value,
+              runnerRoot: runnerRoot.value, capacity: Number(hostCapacity.value || 1),
+            }) });
+            await render();
+          } catch (cause) { error.textContent = String(cause.message); }
+        } }, "Add host"))),
+    el("div", { class: "fields" },
+      field("Pool id", poolId, "a job draws one worker from the pool"),
+      el("div", { class: "field" },
+        el("button", { onclick: async () => {
+          try {
+            await api("/api/host-pools", { method: "POST", body: JSON.stringify({ poolId: poolId.value, hosts: hosts.hosts.map((host) => host.hostId) }) });
+            statusLine.textContent = `Pool ${poolId.value} registered with ${hosts.hosts.length} host(s).`;
+            await render();
+          } catch (cause) { error.textContent = String(cause.message); }
+        } }, "Pool all hosts"))),
   );
   return el("section", {},
     hostsCard,
@@ -241,33 +284,45 @@ async function projectsView() {
         badge(project.requiredOs),
         project.toolchain && project.toolchain.length > 0 ? badge(`toolchain ${project.toolchain.length}`) : null,
         " ", el("button", { onclick: async () => {
-          await api(`/api/projects/${project.projectId}/status`, { method: "POST", body: JSON.stringify({ status: project.status === "active" ? "paused" : "active" }) });
-          await render();
+          try {
+            await api(`/api/projects/${project.projectId}/status`, { method: "POST", body: JSON.stringify({ status: project.status === "active" ? "paused" : "active" }) });
+            await render();
+          } catch (cause) { error.textContent = String(cause.message); }
         } }, project.status === "active" ? "Pause" : "Activate"),
         project.toolchain && project.toolchain.length > 0 ? el("button", { onclick: async () => {
           try {
+            statusLine.textContent = `Probing ${project.projectId} on its worker…`;
             const { body } = await api(`/api/projects/${project.projectId}/toolchain-check`, { method: "POST" });
-            error.textContent = body.passed
+            statusLine.className = body.passed ? "status ok" : "error";
+            statusLine.textContent = body.passed
               ? `${project.projectId} on ${body.hostId}: ${body.tools.map((tool) => `${tool.id} ${tool.version}`).join(", ")}`
               : `${project.projectId} on ${body.hostId}: ${body.tools.map((tool) => `${tool.id} exit ${tool.exitCode}`).join(", ")}`;
-          } catch (cause) { error.textContent = String(cause.message); }
+          } catch (cause) { statusLine.className = "error"; statusLine.textContent = String(cause.message); }
         } }, "Verify toolchain") : null,
       )),
       projects.projects.length === 0 ? el("p", { class: "muted" }, "None yet.") : null,
-      el("div", { class: "row" }, projectId, repoSlug, branch, checkId, checkCommand, toolchainTool, projectOs,
-        el("button", { class: "primary", onclick: async () => {
-          try {
-            await api("/api/projects", { method: "POST", body: JSON.stringify({
-              projectId: projectId.value, repoSlug: repoSlug.value, defaultBranch: branch.value,
-              hostId: hostId.value || (hosts.hosts[0] && hosts.hosts[0].hostId),
-              requiredOs: projectOs.value,
-              ...(toolchainTool.value ? { toolchain: [{ id: toolchainTool.value.split(/\s+/)[0], command: toolchainTool.value }] } : {}),
-              buildProfile: { setup: [], checks: [{ id: checkId.value, command: checkCommand.value }] },
-            }) });
-            await render();
-          } catch (cause) { error.textContent = String(cause.message); }
-        } }, "Add project")),
-      error,
+      el("div", { class: "fields" },
+        field("Project id", projectId), field("Repository", repoSlug, "owner/repo"),
+        field("Default branch", branch), field("Check id", checkId),
+        field("Check command", checkCommand, "plain arguments, no shell"),
+        field("Toolchain probe", toolchainTool, "required for a Windows project, e.g. node --version"),
+        field("Worker OS", projectOs),
+        el("div", { class: "field" },
+          el("button", { class: "primary", onclick: async () => {
+            try {
+              await api("/api/projects", { method: "POST", body: JSON.stringify({
+                projectId: projectId.value, repoSlug: repoSlug.value, defaultBranch: branch.value,
+                hostId: hostId.value || (hosts.hosts[0] && hosts.hosts[0].hostId),
+                requiredOs: projectOs.value,
+                ...(toolchainTool.value ? { toolchain: [{ id: toolchainTool.value.split(/\s+/)[0], command: toolchainTool.value }] } : {}),
+                buildProfile: { setup: [], checks: [{ id: checkId.value, command: checkCommand.value }] },
+              }) });
+              await render();
+            } catch (cause) { error.textContent = String(cause.message); }
+          } }, "Add project")),
+        ),
+        error,
+        statusLine,
     ),
     releasesCard(projects.projects),
     telegramCard(telegramResult),
@@ -347,8 +402,12 @@ async function jobView(jobId) {
   const followUpRequest = el("textarea", { placeholder: "Describe the follow-up work" });
   const status = el("div", { class: "row" }, badge(job.stage), badge(job.runState), el("span", { class: "muted" }, `command revision ${job.commandRevision}`));
 
-  for (const event of body.events) {
-    events.append(el("li", {}, el("time", {}, new Date(event.createdAt).toLocaleTimeString()), `${event.type} `, el("span", { class: "muted" }, JSON.stringify(event.payload))));
+  // Newest first: the current state is what a person is looking for, and on a phone the oldest
+  // events used to bury it.
+  let lastRenderedSeq = 0;
+  for (const event of [...body.events].reverse()) {
+    events.append(eventItem(event));
+    lastRenderedSeq = Math.max(lastRenderedSeq, event.seq);
   }
 
   for (const question of body.questions) {
@@ -374,6 +433,17 @@ async function jobView(jobId) {
   }
 
   const actionError = el("p", { class: "error" });
+  // Why the thread is stuck, stated at the top rather than left as JSON at the bottom of the log.
+  const lastBlocked = [...body.events].reverse().find((event) => event.type === "blocked");
+  const reasonPanel = job.runState === "blocked" && lastBlocked !== undefined
+    ? el("div", { class: "reason" },
+        el("strong", {}, `Blocked: ${(lastBlocked.payload && lastBlocked.payload.reason) || "no reason recorded"}`),
+        lastBlocked.payload && lastBlocked.payload.detail ? el("span", { class: "detail" }, String(lastBlocked.payload.detail)) : null)
+    : null;
+  const waitingPanel = job.runState === "waiting_user"
+    ? el("div", { class: "reason" }, el("strong", {}, "Waiting for you"), el("span", { class: "detail" }, "Answer the question below to continue this thread."))
+    : null;
+
   const act = async (path) => {
     try {
       const result = await api(`/api/jobs/${jobId}/${path}`, { method: "POST", body: "{}" });
@@ -386,15 +456,23 @@ async function jobView(jobId) {
       actionError.textContent = String(cause.message);
     }
   };
+  // Only the actions the job's state actually allows. Offering Resume on a blocked job taught the
+  // state machine through 409 errors.
+  const canPause = job.runState === "running" || job.runState === "waiting_user";
+  const canResume = job.runState === "paused";
+  const canCancel = ["running", "waiting_user", "pause_requested", "paused", "blocked"].includes(job.runState);
+  const canRetry = job.runState === "blocked";
   const actions = el("div", {},
     el("div", { class: "row" },
-      el("button", { onclick: () => void act("pause") }, "Pause"),
-      el("button", { onclick: () => void act("resume") }, "Resume"),
-      el("button", { onclick: () => void act("cancel") }, "Cancel"),
-      // A job that blocked on the environment (no worker, no capacity, wrong OS, unverified toolchain,
-      // model rules, or missing rollback evidence) is retried after the owner fixes it.
-      job.runState === "blocked" ? el("button", { class: "primary", onclick: () => void act("retry") }, "Retry") : null,
-    ),
+      canPause ? el("button", { onclick: () => void act("pause") }, "Pause") : null,
+      canResume ? el("button", { class: "primary", onclick: () => void act("resume") }, "Resume") : null,
+      canRetry ? el("button", { class: "primary", onclick: () => void act("retry") }, "Retry") : null,
+      canCancel ? el("button", { class: "danger", onclick: () => {
+        // Cancelling is not reversible, and the button used to fire on a single tap.
+        if (!window.confirm("Cancel this thread? Its workspace is cleaned up and the thread is finished. Start a new request to continue.")) return;
+        void act("cancel");
+      } }, "Cancel") : null),
+    canPause || canResume || canCancel || canRetry ? null : el("p", { class: "muted" }, "No actions apply to this thread in its current state."),
     actionError,
   );
 
@@ -405,17 +483,20 @@ async function jobView(jobId) {
   // new stream that replays the same event again: an endless loop that opens a fresh EventSource each
   // time, saturates the browser's six-connections-per-host limit, and leaves the page blank.
   const refreshOn = new Set(["paused", "resumed", "cancelled", "requirements_ready", "question_asked", "question_answered", "blocked"]);
-  let snapshotCursor = 0;
   let refreshQueued = false;
   stream.addEventListener("snapshot", (message) => {
     const snapshot = JSON.parse(message.data);
-    snapshotCursor = snapshot.cursor;
     status.replaceChildren(badge(snapshot.job.stage), badge(snapshot.job.runState), el("span", { class: "muted" }, `command revision ${snapshot.job.commandRevision}`));
   });
   stream.addEventListener("event", (message) => {
     const event = JSON.parse(message.data);
-    events.append(el("li", {}, el("time", {}, new Date(event.createdAt).toLocaleTimeString()), `${event.type} `, el("span", { class: "muted" }, JSON.stringify(event.payload))));
-    if (event.seq > snapshotCursor && refreshOn.has(event.type) && !refreshQueued) {
+    // The stream replays the whole ledger from the beginning on every connect, and the history above
+    // already came from the REST read. Rendering the replay again showed every event twice; skipping
+    // anything already shown also stops the re-render loop it used to start.
+    if (event.seq <= lastRenderedSeq) return;
+    lastRenderedSeq = event.seq;
+    events.prepend(eventItem(event));
+    if (refreshOn.has(event.type) && !refreshQueued) {
       // Coalesced: a burst of new events refreshes the view once, not once per event.
       refreshQueued = true;
       setTimeout(() => { refreshQueued = false; void render(); }, 250);
@@ -452,24 +533,34 @@ async function jobView(jobId) {
       body.predecessorJobId ? el("p", { class: "muted" }, `follow-up of thread ${body.predecessorJobId}`) : null,
       body.followUpJobId ? el("p", {}, el("button", { onclick: () => { state.jobId = body.followUpJobId; state.view = "job"; void render(); } }, `Open follow-up ${body.followUpJobId}`)) : null),
     reports,
+    reasonPanel,
+    waitingPanel,
     questions,
     deliveryPanel,
     archived ? followUp : (() => {
+      const steerError = el("p", { class: "error" });
       const steerForm = el("form", { class: "card", onsubmit: async (event) => {
         event.preventDefault();
-        const result = await api(`/api/jobs/${jobId}/steer`, { method: "POST", body: JSON.stringify({
-          requestId: newRequestId(), instruction: instruction.value, expectedCommandRevision: job.commandRevision,
-        }) });
-        if (result.status === 409) {
-          // A stale revision is refused without applying anything; show why and keep the current view.
-          steerForm.append(el("p", { class: "error" }, "Stale command revision — the thread state is shown instead; nothing was applied."));
-          return;
+        steerError.textContent = "";
+        try {
+          const result = await api(`/api/jobs/${jobId}/steer`, { method: "POST", body: JSON.stringify({
+            requestId: newRequestId(), instruction: instruction.value, expectedCommandRevision: job.commandRevision,
+          }) });
+          if (result.status === 409) {
+            // A stale revision is refused without applying anything; show why and keep the current view.
+            steerError.textContent = "Stale command revision — nothing was applied. The thread has moved on since this view was opened.";
+            return;
+          }
+          await render();
+        } catch (cause) {
+          // Without this the instruction silently vanished into an unhandled rejection.
+          steerError.textContent = String(cause.message);
         }
-        await render();
       } },
         el("label", {}, "Steer this thread"),
         instruction,
-        el("p", {}, el("button", { class: "primary", type: "submit" }, "Send instruction")));
+        el("p", {}, el("button", { class: "primary", type: "submit" }, "Send instruction")),
+        steerError);
       return steerForm;
     })(),
     archived ? null : actions,
@@ -495,14 +586,19 @@ async function buildReportsPanel(jobId) {
 
   const settingsForm = el("form", { class: "row", onsubmit: async (event) => {
     event.preventDefault();
-    const outcome = await api(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: JSON.stringify({
-      enabled: enabledCheck.checked, intervalMinutes: Number(intervalInput.value),
-    }) });
-    if (outcome.status === 400) {
-      settingsError.textContent = outcome.body.message ?? "Report intervals must be between 1 and 60 minutes.";
-      return;
+    settingsError.textContent = "";
+    try {
+      const outcome = await api(`/api/jobs/${jobId}/report-settings`, { method: "POST", body: JSON.stringify({
+        enabled: enabledCheck.checked, intervalMinutes: Number(intervalInput.value),
+      }) });
+      if (outcome.status === 400) {
+        settingsError.textContent = outcome.body.message ?? "Report intervals must be between 1 and 60 minutes.";
+        return;
+      }
+      await render();
+    } catch (cause) {
+      settingsError.textContent = String(cause.message);
     }
-    await render();
   } });
   const enabledCheck = el("input", { type: "checkbox", checked: plan.enabled });
   const intervalInput = el("input", { type: "number", min: "1", max: "60", value: String(plan.intervalMinutes) });
@@ -547,11 +643,16 @@ async function buildReportsPanel(jobId) {
   } catch { /* the view still renders without the outbox */ }
   if (notifyResult !== null && notifyResult.status === 200 && notifyResult.body.notifications.length > 0) {
     card.append(el("h4", {}, "Notification delivery"),
-      el("table", {}, el("tr", {}, el("th", {}, "kind"), el("th", {}, "channel"), el("th", {}, "status"), el("th", {}, "attempts")),
-        ...notifyResult.body.notifications.map((entry) => el("tr", {},
-          el("td", {}, entry.kind), el("td", {}, entry.channel), el("td", {}, badge(entry.status)), el("td", {}, String(entry.attempts))))));
+      table(["kind", "channel", "status", "attempts"], notifyResult.body.notifications.map((entry) => el("tr", {},
+        el("td", {}, entry.kind), el("td", {}, entry.channel), el("td", {}, badge(entry.status)), el("td", {}, String(entry.attempts))))));
   }
   return card;
+}
+
+/** A table that scrolls itself instead of pushing the whole page sideways on a phone. */
+function table(headers, rows) {
+  return el("div", { class: "table-wrap" },
+    el("table", {}, el("tr", {}, ...headers.map((header) => el("th", {}, header))), ...rows));
 }
 
 /**
@@ -616,13 +717,13 @@ async function buildDeliveryPanel(jobId) {
     d.archiveState === "archived" ? el("p", {}, `Archived: ${d.archiveReason ?? ""} ${d.mergedRevision ? `merged revision ${String(d.mergedRevision).slice(0, 10)}` : ""}`) : null,
     d.cleanupState !== "available" ? el("p", { class: "muted" }, `workspace cleanup: ${d.cleanupState}`) : null,
     el("h4", {}, "Checks"),
-    checkRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "check"), el("th", {}, "status"), el("th", {}, "exit"), el("th", {}, "commit")), ...checkRows) : el("p", { class: "muted" }, "no checks recorded yet"),
+    checkRows.length > 0 ? table(["check", "status", "exit", "commit"], checkRows) : el("p", { class: "muted" }, "no checks recorded yet"),
     el("h4", {}, "Independent reviews"),
-    reviewRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "role"), el("th", {}, "verdict"), el("th", {}, "model"), el("th", {}, "commit")), ...reviewRows) : el("p", { class: "muted" }, "no reviews recorded yet"),
+    reviewRows.length > 0 ? table(["role", "verdict", "model", "commit"], reviewRows) : el("p", { class: "muted" }, "no reviews recorded yet"),
     el("h4", {}, "Findings"),
-    findingRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "id"), el("th", {}, "severity"), el("th", {}, "status"), el("th", {}, "file")), ...findingRows) : el("p", { class: "muted" }, "no findings recorded"),
+    findingRows.length > 0 ? table(["id", "severity", "status", "file"], findingRows) : el("p", { class: "muted" }, "no findings recorded"),
     el("h4", {}, "Retained evidence"),
-    artifactRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "artifact"), el("th", {}, "kind"), el("th", {}, "size"), el("th", {}, "retention"), el("th", {}, "")), ...artifactRows) : el("p", { class: "muted" }, "no evidence artifacts recorded yet"),
+    artifactRows.length > 0 ? table(["artifact", "kind", "size", "retention", ""], artifactRows) : el("p", { class: "muted" }, "no evidence artifacts recorded yet"),
     ownerActions,
     panelError,
   );

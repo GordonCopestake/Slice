@@ -567,6 +567,8 @@ export class SliceApi {
           archived: row.delivery?.archiveState === "archived",
           prNumber: row.delivery?.prNumber ?? null,
           branch: row.workspace?.branch ?? null,
+          // A list of blocked threads with no stated reason makes the owner open each one.
+          blockedReason: row.job.runState === "blocked" ? this.#deps.workflows.latestBlockedReason(row.job.jobId)?.reason ?? null : null,
         }));
       json(response, 200, { jobs: rows });
       return;
@@ -648,6 +650,7 @@ export class SliceApi {
       if (method === "GET" && rest === "") {
         json(response, 200, {
           job: publicJob(job),
+          blocked: job.runState === "blocked" ? this.#deps.workflows.latestBlockedReason(jobId) ?? null : null,
           questions: this.#deps.workflows.openQuestions(jobId),
           events: this.#deps.workflows.eventsAfter(jobId, Math.max(this.#deps.workflows.latestEventSeq(jobId) - 50, 0)),
           workspace: this.#deps.workflows.getWorkspace(jobId) ?? null,

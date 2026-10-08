@@ -45,3 +45,43 @@ a { color: var(--accent); }
 .badge.sent, .badge.configured, .badge.linked { color: var(--ok); }
 .badge.queued { color: var(--warn); }
 .badge.failed, .badge.uncertain, .badge.suppressed, .badge.unlinked, .badge.not_configured { color: var(--bad); }
+
+/* --- usability: measured at 390px (iPhone) after these were missing --- */
+
+/* Long commit hashes, branch names, and event payloads are unbreakable strings. Without this the
+   page scrolls sideways on a phone: the job view measured 555px of content in a 390px viewport. */
+.card, .events li, .reason, td, th { overflow-wrap: anywhere; }
+
+/* Wide evidence tables (checks, reviews, findings, artifacts) stay readable on a narrow screen by
+   scrolling themselves rather than pushing the whole page. */
+.table-wrap { overflow-x: auto; }
+.table-wrap table { min-width: 320px; }
+
+/* Why a thread is stuck belongs at the top of the thread, in words. It used to be reachable only as
+   raw JSON at the bottom of a long activity list. */
+.reason { border-left: 4px solid var(--warn); padding: 10px 12px; background: #212a34; border-radius: 8px; margin: 10px 0; }
+.reason strong { display: block; margin-bottom: 4px; }
+.reason .detail { color: var(--muted); }
+
+/* Registration forms: labelled fields in a grid. Placeholders alone are unusable once typed into. */
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-top: 10px; }
+.fields label { margin: 0 0 2px; }
+.fields .field { min-width: 0; }
+
+/* A confirmation or a successful check is not an error, and must not render as one. */
+.status { color: var(--muted); }
+.status.ok { color: var(--ok); }
+
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.danger { color: var(--bad); }
+
+/* Event payloads are machine records; the readable line is primary, the raw record stays available. */
+.events details { display: inline; }
+.events summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+.events code { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+@media (max-width: 640px) {
+  table { font-size: 13px; }
+  th, td { padding: 5px 6px; }
+  .fields { grid-template-columns: 1fr; }
+}
