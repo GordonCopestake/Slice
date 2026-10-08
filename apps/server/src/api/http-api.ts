@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -321,7 +322,22 @@ export class SliceApi {
     }
 
     if (method === "GET" && path === "/api/jobs") {
-      json(response, 200, { jobs: this.#deps.workflows.listJobs().map(publicJob) });
+      // Searchable thread picker: Active and Archived views, searchable by title, project, job id,
+      // PR number, branch, and creation date. Searching never attaches to or resumes a worker.
+      const view = url.searchParams.get("view") === "archived" ? "archived" : "active";
+      const query = (url.searchParams.get("query") ?? "").trim().toLowerCase().slice(0, 100);
+      const rows = this.#deps.workflows.listJobs()
+        .map((job) => ({ job, delivery: this.#deps.deliveryStore?.getDelivery(job.jobId), workspace: this.#deps.workflows.getWorkspace(job.jobId) }))
+        .filter((row) => (view === "archived") === (row.delivery?.archiveState === "archived"))
+        .filter((row) => query.length === 0
+          || `${row.job.title} ${row.job.projectId} ${row.job.jobId} ${row.delivery?.prNumber ?? ""} ${row.workspace?.branch ?? ""} ${new Date(row.job.createdAt).toISOString().slice(0, 10)}`.toLowerCase().includes(query))
+        .map((row) => ({
+          ...publicJob(row.job),
+          archived: row.delivery?.archiveState === "archived",
+          prNumber: row.delivery?.prNumber ?? null,
+          branch: row.workspace?.branch ?? null,
+        }));
+      json(response, 200, { jobs: rows });
       return;
     }
     if (method === "POST" && path === "/api/jobs") {
@@ -404,7 +420,68 @@ export class SliceApi {
           questions: this.#deps.workflows.openQuestions(jobId),
           events: this.#deps.workflows.eventsAfter(jobId, Math.max(this.#deps.workflows.latestEventSeq(jobId) - 50, 0)),
           workspace: this.#deps.workflows.getWorkspace(jobId) ?? null,
+          archived: this.#deps.deliveryStore?.getDelivery(jobId)?.archiveState === "archived",
+          predecessorJobId: this.#deps.workflows.getJobLink(jobId)?.predecessorJobId ?? null,
+          followUpJobId: this.#deps.workflows.getFollowUpJob(jobId)?.jobId ?? null,
         });
+        return;
+      }
+      if (method === "GET" && rest.startsWith("/artifacts/")) {
+        if (this.#deps.deliveryStore === undefined) {
+          json(response, 404, { error: "delivery_not_configured" });
+          return;
+        }
+        // Artifact ids are validated against the job; a URL parameter never becomes a path.
+        const artifact = this.#deps.deliveryStore.getArtifact(jobId, rest.slice("/artifacts/".length));
+        if (artifact === undefined) {
+          json(response, 404, { error: "artifact_not_found" });
+          return;
+        }
+        if (artifact.expiresAt < Date.now()) {
+          // Retention removed the file; the manifest and policy record remain visible.
+          json(response, 410, { error: "artifact_expired", kind: artifact.kind, digest: artifact.digest, expiresAt: artifact.expiresAt, message: "This evidence artifact has expired. Its manifest record remains." });
+          return;
+        }
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(artifact.path);
+        } catch {
+          json(response, 410, { error: "artifact_file_missing", kind: artifact.kind, digest: artifact.digest });
+          return;
+        }
+        if (createHash("sha256").update(bytes).digest("hex") !== artifact.digest) {
+          json(response, 500, { error: "artifact_digest_mismatch", kind: artifact.kind });
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          // Served as an attachment so evidence can never execute inside the authenticated page.
+          "content-disposition": `attachment; filename="${jobId}-${artifact.id}"`,
+          "cache-control": "no-store",
+        });
+        response.end(bytes);
+        return;
+      }
+      if (method === "POST" && rest === "/follow-up") {
+        const delivery = this.#deps.deliveryStore?.getDelivery(jobId);
+        if (delivery === undefined || delivery.archiveState !== "archived") {
+          json(response, 409, { error: "job_not_archived", message: "Only an archived thread needs a follow-up job; active work uses steering." });
+          return;
+        }
+        const body = asObject(await readBody(request));
+        const requestId = requiredId(body, "requestId");
+        const title = requiredString(body, "title", 200);
+        const requestText = requiredString(body, "request", 100_000);
+        const created = await this.#deps.coordinator.createJob({
+          requestId,
+          payloadHash: hashJson({ predecessor: jobId, projectId: job.projectId, title, request: requestText }),
+          projectId: job.projectId,
+          title,
+          requestText,
+          issue: null,
+        });
+        this.#deps.workflows.recordJobLink(created.jobId, jobId);
+        json(response, 201, { job: publicJob(created), predecessorJobId: jobId });
         return;
       }
       if (method === "GET" && rest === "/events") {

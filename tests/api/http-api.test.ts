@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -388,5 +389,140 @@ test("telegram linking state and the job notification view are exposed", async (
     assert.deepEqual(notifications.body.notifications, [], "nothing queued while the channel is unconfigured");
   } finally {
     await stack.close();
+  }
+});
+
+test("the thread picker searches active and archived views without touching workers", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-search-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON), fauxAssistantMessage(READY_JSON)]);
+    const a = await stack.call("/api/jobs", { method: "POST", body: { requestId: "s1", projectId: "demo", title: "Goods ready screen", request: "Add a goods ready screen" } });
+    const b = await stack.call("/api/jobs", { method: "POST", body: { requestId: "s2", projectId: "demo", title: "Allocation report", request: "Add an allocation report" } });
+
+    const byTitle = await stack.call("/api/jobs?query=allocation");
+    assert.deepEqual(byTitle.body.jobs.map((job: { jobId: string }) => job.jobId), [b.body.job.jobId]);
+
+    // Archive job a through the delivery records, exactly as a verified merge would.
+    deliveryStore.ensureDelivery(a.body.job.jobId, "abc1234");
+    deliveryStore.setPr(a.body.job.jobId, { number: 47, url: "https://example.test/pr/47", state: "ready" });
+    deliveryStore.recordMerge(a.body.job.jobId, "def5678", "test archive");
+
+    const active = await stack.call("/api/jobs?view=active");
+    assert.deepEqual(active.body.jobs.map((job: { jobId: string }) => job.jobId), [b.body.job.jobId], "archived threads leave the active view");
+    const archived = await stack.call("/api/jobs?view=archived");
+    assert.deepEqual(archived.body.jobs.map((job: { jobId: string }) => job.jobId), [a.body.job.jobId]);
+    assert.equal(archived.body.jobs[0].prNumber, 47);
+
+    // Search by PR number works in the archived view without resuming anything.
+    const byPr = await stack.call("/api/jobs?view=archived&query=47");
+    assert.deepEqual(byPr.body.jobs.map((job: { jobId: string }) => job.jobId), [a.body.job.jobId]);
+
+    // Archived threads stay read-only.
+    const steer = await stack.call(`/api/jobs/${a.body.job.jobId}/steer`, { method: "POST", body: { requestId: "s3", instruction: "reopen", expectedCommandRevision: 1 } });
+    assert.equal(steer.status, 409);
+    assert.equal(steer.body.error, "job_archived");
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a merged archived thread offers a linked follow-up job and stays untouched", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-followup-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const workflows = WorkflowStore.open(state.database);
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON), fauxAssistantMessage(QUESTION_JSON)]);
+    const original = await stack.call("/api/jobs", { method: "POST", body: { requestId: "f1", projectId: "demo", title: "Merged work", request: "Do the thing" } });
+    const jobId = original.body.job.jobId;
+
+    // Follow-up before archiving is refused: active work uses steering.
+    const early = await stack.call(`/api/jobs/${jobId}/follow-up`, { method: "POST", body: { requestId: "f2", title: "too early", request: "more" } });
+    assert.equal(early.status, 409);
+    assert.equal(early.body.error, "job_not_archived");
+
+    deliveryStore.ensureDelivery(jobId, "abc1234");
+    deliveryStore.recordMerge(jobId, "def5678", "test merge");
+
+    const follow = await stack.call(`/api/jobs/${jobId}/follow-up`, { method: "POST", body: { requestId: "f3", title: "Follow-up work", request: "Extend the merged feature" } });
+    assert.equal(follow.status, 201);
+    assert.equal(follow.body.predecessorJobId, jobId);
+
+    const originalView = await stack.call(`/api/jobs/${jobId}`);
+    assert.equal(originalView.body.archived, true);
+    assert.equal(originalView.body.followUpJobId, follow.body.job.jobId);
+    const followView = await stack.call(`/api/jobs/${follow.body.job.jobId}`);
+    assert.equal(followView.body.predecessorJobId, jobId);
+    assert.equal(followView.body.archived, false, "the follow-up is a live thread of its own");
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("evidence artifacts download safely, expire honestly, and never resolve a URL to a path", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "slice-api-artifact-"));
+  const state = ApplicationStateStore.open(join(directory, "state.sqlite"));
+  const workflows = WorkflowStore.open(state.database);
+  const deliveryStore = DeliveryStore.open(state.database);
+  const stack = await startStack({ deliveryStore });
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "runner-a", address: "runner.internal", os: "linux", sshUser: "slice", runnerRoot: "/srv/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "demo", repoSlug: "owner/demo", defaultBranch: "main", hostId: "runner-a",
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    stack.faux.setResponses([fauxAssistantMessage(READY_JSON)]);
+    const created = await stack.call("/api/jobs", { method: "POST", body: { requestId: "art1", projectId: "demo", title: "Evidence", request: "Keep the proof" } });
+    const jobId = created.body.job.jobId;
+
+    const content = "final packet contents";
+    const digest = createHash("sha256").update(content).digest("hex");
+    const file = join(directory, "packet.json");
+    writeFileSync(file, content);
+    deliveryStore.ensureDelivery(jobId, "abc1234");
+    deliveryStore.recordArtifact({ jobId, id: "final-packet", kind: "packet", digest, sizeBytes: content.length, path: file, verificationKey: "k", expiresAt: Date.now() + 86_400_000 });
+    deliveryStore.recordArtifact({ jobId, id: "old-log", kind: "log", digest, sizeBytes: 3, path: file, verificationKey: "k", expiresAt: Date.now() - 1_000 });
+
+    const response = await fetch(`${stack.base}/api/jobs/${jobId}/artifacts/final-packet`, { headers: { cookie: stack.cookie } });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-disposition") ?? "", /attachment/);
+    assert.equal(await response.text(), content);
+
+    const expired = await stack.call(`/api/jobs/${jobId}/artifacts/old-log`);
+    assert.equal(expired.status, 410);
+    assert.equal(expired.body.error, "artifact_expired");
+    assert.equal(expired.body.digest, digest, "the manifest record remains after the file expires");
+
+    const missing = await stack.call(`/api/jobs/${jobId}/artifacts/nothing-here`);
+    assert.equal(missing.status, 404);
+
+    // A path-traversal attempt is rejected by the id rule before any file access.
+    const traversal = await fetch(`${stack.base}/api/jobs/${jobId}/artifacts/..%2Fstate`, { headers: { cookie: stack.cookie } });
+    assert.ok(traversal.status === 404 || traversal.status === 400);
+  } finally {
+    await stack.close();
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });

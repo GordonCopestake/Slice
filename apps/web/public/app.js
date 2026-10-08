@@ -92,19 +92,37 @@ function loginView() {
 }
 
 async function jobsView() {
-  const { body } = await api("/api/jobs");
-  const list = el("div", {}, ...(body.jobs.length === 0
-    ? [el("p", { class: "muted card" }, "No threads yet. Start one with New request.")]
+  const view = state.threadsView ?? "active";
+  const query = state.threadsQuery ?? "";
+  const { body } = await api(`/api/jobs?view=${encodeURIComponent(view)}&query=${encodeURIComponent(query)}`);
+  let debounce;
+  const search = el("input", {
+    placeholder: "search by title, project, PR number, branch, or date",
+    value: query,
+    oninput: () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => { state.threadsQuery = search.value; void render(); }, 400);
+    },
+  });
+  const tabs = el("div", { class: "row" },
+    el("button", { class: view === "active" ? "primary" : "", onclick: () => { state.threadsView = "active"; void render(); } }, "Active"),
+    el("button", { class: view === "archived" ? "primary" : "", onclick: () => { state.threadsView = "archived"; void render(); } }, "Archived"),
+    search);
+  const list = el("div", {}, tabs, ...(body.jobs.length === 0
+    ? [el("p", { class: "muted card" }, view === "archived" ? "No archived threads match." : "No threads yet. Start one with New request.")]
     : body.jobs.map((job) => el("div", { class: "card" },
         el("div", { class: "row" },
           el("strong", {}, job.title),
           badge(job.stage),
           badge(job.runState),
+          job.archived ? badge("archived") : null,
           el("span", { class: "muted" }, job.projectId),
+          job.prNumber ? el("span", { class: "muted" }, `PR #${job.prNumber}`) : null,
+          job.branch ? el("span", { class: "muted" }, job.branch) : null,
           el("span", { class: "muted" }, new Date(job.updatedAt).toLocaleString()),
         ),
         job.issue ? el("p", { class: "muted" }, `issue ${job.issue.repoSlug}#${job.issue.issueNumber}`) : null,
-        el("button", { onclick: () => { state.jobId = job.jobId; state.view = "job"; void render(); } }, "Open"),
+        el("button", { onclick: () => { state.jobId = job.jobId; state.view = "job"; void render(); } }, job.archived ? "Open result" : "Open"),
       ))));
   return list;
 }
@@ -226,6 +244,8 @@ async function jobView(jobId) {
   const events = el("ul", { class: "events" });
   const questions = el("div", {});
   const instruction = el("input", { placeholder: "Keep the old screen until the new one is live" });
+  const followUpTitle = el("input", { value: `${job.title} — follow-up` });
+  const followUpRequest = el("textarea", { placeholder: "Describe the follow-up work" });
   const status = el("div", { class: "row" }, badge(job.stage), badge(job.runState), el("span", { class: "muted" }, `command revision ${job.commandRevision}`));
 
   for (const event of body.events) {
@@ -255,7 +275,7 @@ async function jobView(jobId) {
   }
 
   const actionError = el("p", { class: "error" });
-  const act = async (path: string): Promise<void> => {
+  const act = async (path) => {
     try {
       const result = await api(`/api/jobs/${jobId}/${path}`, { method: "POST", body: "{}" });
       if (result.status === 409) {
@@ -290,14 +310,37 @@ async function jobView(jobId) {
 
   const reports = await buildReportsPanel(jobId);
   const deliveryPanel = await buildDeliveryPanel(jobId);
+  const archived = body.archived === true;
+  const followUp = archived ? el("div", { class: "card" },
+    el("h3", {}, "Start a linked follow-up"),
+    el("p", { class: "muted" }, "This thread is archived. Follow-up work gets its own job, branch, and workspace; the archived thread stays exactly as it is."),
+    el("label", {}, "Follow-up title"),
+    followUpTitle,
+    el("label", {}, "What should change?"),
+    followUpRequest,
+    el("p", {}, el("button", { class: "primary", onclick: async () => {
+      try {
+        const result = await api(`/api/jobs/${jobId}/follow-up`, { method: "POST", body: JSON.stringify({
+          requestId: newRequestId(), title: followUpTitle.value, request: followUpRequest.value,
+        }) });
+        state.jobId = result.body.job.jobId;
+        state.view = "job";
+        await render();
+      } catch (cause) {
+        actionError.textContent = String(cause.message);
+      }
+    } }, "Create follow-up job")),
+    actionError) : null;
 
   return el("section", {},
     el("div", { class: "card" }, el("h3", {}, job.title), status,
-      job.issue ? el("p", { class: "muted" }, `from issue ${job.issue.repoSlug}#${job.issue.issueNumber} (${job.issue.url})`) : null),
+      job.issue ? el("p", { class: "muted" }, `from issue ${job.issue.repoSlug}#${job.issue.issueNumber} (${job.issue.url})`) : null,
+      body.predecessorJobId ? el("p", { class: "muted" }, `follow-up of thread ${body.predecessorJobId}`) : null,
+      body.followUpJobId ? el("p", {}, el("button", { onclick: () => { state.jobId = body.followUpJobId; state.view = "job"; void render(); } }, `Open follow-up ${body.followUpJobId}`)) : null),
     reports,
     questions,
     deliveryPanel,
-    (() => {
+    archived ? followUp : (() => {
       const steerForm = el("form", { class: "card", onsubmit: async (event) => {
         event.preventDefault();
         const result = await api(`/api/jobs/${jobId}/steer`, { method: "POST", body: JSON.stringify({
@@ -315,7 +358,7 @@ async function jobView(jobId) {
         el("p", {}, el("button", { class: "primary", type: "submit" }, "Send instruction")));
       return steerForm;
     })(),
-    actions,
+    archived ? null : actions,
     el("div", { class: "card" }, el("h3", {}, "Thread activity"), events),
   );
 }
@@ -361,7 +404,7 @@ async function buildReportsPanel(jobId) {
     el("h3", {}, "Status reports"),
     el("div", { class: "row" },
       badge(latest ? "available" : "pending"),
-      el("span", { class: "muted" }, plan.final ? "periodic reports finished" : plan.nextReportAt ? `next report ${new Date(plan.nextReportAt).toLocaleString()}` : "periodic reports off"));
+      el("span", { class: "muted" }, plan.final ? "periodic reports finished" : plan.nextReportAt ? `next report ${new Date(plan.nextReportAt).toLocaleString()}` : "periodic reports off")));
   if (latest !== undefined) {
     const report = latest.report;
     card.append(
@@ -382,7 +425,7 @@ async function buildReportsPanel(jobId) {
   if (reports.length > 1) {
     card.append(el("details", {},
       el("summary", {}, `earlier reports (${reports.length - 1})`),
-      el("ul", { class: "events" }, ...reports.slice(1).map((entry) => el("li", {}, el("time", {}, new Date(entry.dueAt).toLocaleString()), entry.final ? " final report" : ` generation ${entry.generation}`))));
+      el("ul", { class: "events" }, ...reports.slice(1).map((entry) => el("li", {}, el("time", {}, new Date(entry.dueAt).toLocaleString()), entry.final ? " final report" : ` generation ${entry.generation}`)))));
   }
   let notifyResult = null;
   try {
@@ -432,6 +475,11 @@ async function buildDeliveryPanel(jobId) {
     el("td", { class: "muted" }, review.headCommit.slice(0, 10))));
   const findingRows = (d.findings ?? []).map((finding) => el("tr", {},
     el("td", {}, finding.id), el("td", {}, finding.severity), el("td", {}, finding.status), el("td", { class: "muted" }, finding.file)));
+  // Evidence stays downloadable after workspace cleanup; expired artifacts show their expiry.
+  const artifactRows = (d.artifacts ?? []).map((artifact) => el("tr", {},
+    el("td", {}, artifact.id), el("td", {}, artifact.kind), el("td", {}, `${Math.round(artifact.sizeBytes / 1024)} KB`),
+    el("td", {}, artifact.expired ? badge("expired") : el("span", { class: "muted" }, `until ${new Date(artifact.expiresAt).toLocaleDateString()}`)),
+    el("td", {}, artifact.expired ? el("span", { class: "muted" }, "manifest only") : el("a", { href: `/api/jobs/${d.jobId}/artifacts/${encodeURIComponent(artifact.id)}` }, "Download"))));
 
   const ownerActions = el("div", { class: "row" });
   if (d.stage === "ready" && d.gateVerdict === "pass") {
@@ -459,6 +507,8 @@ async function buildDeliveryPanel(jobId) {
     reviewRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "role"), el("th", {}, "verdict"), el("th", {}, "model"), el("th", {}, "commit")), ...reviewRows) : el("p", { class: "muted" }, "no reviews recorded yet"),
     el("h4", {}, "Findings"),
     findingRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "id"), el("th", {}, "severity"), el("th", {}, "status"), el("th", {}, "file")), ...findingRows) : el("p", { class: "muted" }, "no findings recorded"),
+    el("h4", {}, "Retained evidence"),
+    artifactRows.length > 0 ? el("table", {}, el("tr", {}, el("th", {}, "artifact"), el("th", {}, "kind"), el("th", {}, "size"), el("th", {}, "retention"), el("th", {}, "")), ...artifactRows) : el("p", { class: "muted" }, "no evidence artifacts recorded yet"),
     ownerActions,
     panelError,
   );

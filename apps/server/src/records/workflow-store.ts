@@ -231,6 +231,11 @@ export class WorkflowStore {
           created_at INTEGER NOT NULL,
           PRIMARY KEY (provider, repo_slug, issue_number, job_id)
         );
+        CREATE TABLE IF NOT EXISTS slice_job_links (
+          job_id TEXT PRIMARY KEY,
+          predecessor_job_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS slice_workspaces (
           job_id TEXT PRIMARY KEY,
           host_id TEXT NOT NULL,
@@ -456,6 +461,30 @@ export class WorkflowStore {
     const row = this.#database
       .prepare("SELECT job_id FROM slice_issue_links WHERE provider = 'github' AND repo_slug = ? AND issue_number = ? ORDER BY created_at LIMIT 1")
       .get(repoSlug, issueNumber) as { job_id: string } | undefined;
+    return row === undefined ? undefined : this.getJob(row.job_id);
+  }
+
+  /**
+   * A follow-up job is a new thread linked to the archived one it came from. The archived thread
+   * itself never changes: reopening merged work would rewrite history.
+   */
+  recordJobLink(jobId: string, predecessorJobId: string): void {
+    assertId("jobId", jobId);
+    assertId("predecessorJobId", predecessorJobId);
+    this.#database
+      .prepare("INSERT INTO slice_job_links (job_id, predecessor_job_id, created_at) VALUES (?, ?, ?) ON CONFLICT(job_id) DO NOTHING")
+      .run(jobId, predecessorJobId, Date.now());
+  }
+
+  getJobLink(jobId: string): { jobId: string; predecessorJobId: string } | undefined {
+    assertId("jobId", jobId);
+    const row = this.#database.prepare("SELECT job_id, predecessor_job_id FROM slice_job_links WHERE job_id = ?").get(jobId) as { job_id: string; predecessor_job_id: string } | undefined;
+    return row === undefined ? undefined : { jobId: row.job_id, predecessorJobId: row.predecessor_job_id };
+  }
+
+  getFollowUpJob(predecessorJobId: string): JobRecord | undefined {
+    assertId("predecessorJobId", predecessorJobId);
+    const row = this.#database.prepare("SELECT job_id FROM slice_job_links WHERE predecessor_job_id = ? ORDER BY created_at LIMIT 1").get(predecessorJobId) as { job_id: string } | undefined;
     return row === undefined ? undefined : this.getJob(row.job_id);
   }
 
