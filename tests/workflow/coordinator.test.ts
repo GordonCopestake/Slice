@@ -7,7 +7,7 @@ import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-work
 import { createRegistry } from "@earendil-works/pi-durable";
 import { PiDurableAdapter } from "../../apps/server/src/adapters/pi-durable/pi-durable-adapter.js";
 import { ApplicationStateStore } from "../../apps/server/src/state/application-state.js";
-import { WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
+import { toolchainDigest, WorkflowStore, type BuildProfile } from "../../apps/server/src/records/workflow-store.js";
 import { JobCoordinator, parseRequirementsOutput } from "../../apps/server/src/workflow/coordinator.js";
 import type { RunnerGateway } from "../../apps/server/src/adapters/ssh-runner/runner-adapter.js";
 import { fakeRunner as buildFakeRunner } from "../support/fake-runner.js";
@@ -173,7 +173,7 @@ test("a project with a declared toolchain blocks until the worker is actually at
 
     // Attesting the worker lets the same job proceed; nothing else about it changes.
     const project = h.workflows.getProject("gated")!;
-    h.workflows.recordAttestation({ hostId: "runner-a", projectId: "gated", profileRevision: project.revision, passed: true, tools: [
+    h.workflows.recordAttestation({ hostId: "runner-a", projectId: "gated", profileRevision: project.revision, toolchainDigest: toolchainDigest(project.toolchain), passed: true, tools: [
       { id: "node", command: "node --version", exitCode: 0, version: "v22.19.0", outputTail: "" },
     ] });
     const resumed = await h.coordinator.retryBlocked(job.jobId);

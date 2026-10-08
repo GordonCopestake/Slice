@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, type ConversationId, type EntryId } from "@earendil-works/pi-durable";
 import { PiDurableAdapter } from "../adapters/pi-durable/pi-durable-adapter.js";
 import type { RunnerGateway } from "../adapters/ssh-runner/runner-adapter.js";
-import type { IssueSnapshot, JobRecord, WorkflowStore } from "../records/workflow-store.js";
+import { toolchainDigest, type IssueSnapshot, type JobRecord, type WorkflowStore } from "../records/workflow-store.js";
 import { modelPolicyViolation, type ModelPolicy } from "./model-policy.js";
 
 /** The requirements role's only output contract. Anything else is a failed task, never a pass. */
@@ -127,7 +127,7 @@ export class JobCoordinator {
       const result = await this.#runner.probeToolchain({ jobId: probeJobId, hostId: host.hostId, tools: project.toolchain });
       tools = result.tools;
       const passed = result.allPassed;
-      this.#workflows.recordAttestation({ hostId: host.hostId, projectId, profileRevision: project.revision, passed, tools });
+      this.#workflows.recordAttestation({ hostId: host.hostId, projectId, profileRevision: project.revision, toolchainDigest: toolchainDigest(project.toolchain), passed, tools });
       this.#workflows.appendEvent(probeJobId, "toolchain_checked", { hostId: host.hostId, projectId, passed, tools: tools.map((tool) => ({ id: tool.id, version: tool.version, exitCode: tool.exitCode })) });
       return { hostId: host.hostId, passed, tools };
     } finally {

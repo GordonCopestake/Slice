@@ -5,7 +5,7 @@ import type { RunnerGateway } from "../adapters/ssh-runner/runner-adapter.js";
 import type { DeliveryStore } from "../records/delivery-store.js";
 import type { ReleaseRecord, ReleaseStore, RehearsalRecord } from "../records/release-store.js";
 import { rehearsalId as makeRehearsalId, releaseId as makeReleaseId } from "../records/release-store.js";
-import type { WorkflowStore } from "../records/workflow-store.js";
+import type { ProjectRecord, WorkflowStore } from "../records/workflow-store.js";
 
 /** How long restored staging work keeps its evidence. */
 const EVIDENCE_DAYS = 90;
@@ -34,6 +34,8 @@ export type RestoreResult = {
  */
 export class ReleaseService {
   readonly #deps: ReleaseDeps;
+  /** One rehearsal per project at a time: two concurrent restores would share one staging workspace. */
+  readonly #inFlight = new Set<string>();
 
   constructor(deps: ReleaseDeps) {
     this.#deps = deps;
@@ -52,8 +54,11 @@ export class ReleaseService {
     return this.#deps.releases.listReleases(projectId).filter((release) => this.#artifactBytes(release) !== null);
   }
 
-  #stagingJobId(projectId: string): string {
-    return `staging-${projectId}`;
+  #stagingJobId(projectId: string, attempt: number): string {
+    // Each rehearsal gets its own staging workspace. Reusing one id would collide with the journal's
+    // settled prepare row after the first workspace was cleaned, which would leave the next rehearsal
+    // unable to re-create its own workspace.
+    return `staging-${projectId}-a${attempt}`;
   }
 
   /** Read a release's retained bundle, verifying its digest. A missing or expired artifact yields null. */
@@ -80,6 +85,17 @@ export class ReleaseService {
   async restoreStaging(projectId: string, targetReleaseId: string): Promise<RestoreResult> {
     const project = this.#deps.workflows.getProject(projectId);
     if (project === undefined) throw new Error("project_not_found");
+    if (this.#inFlight.has(projectId)) throw new Error("rehearsal_in_progress");
+    this.#inFlight.add(projectId);
+    try {
+      return await this.#restoreStaging(project, targetReleaseId);
+    } finally {
+      this.#inFlight.delete(projectId);
+    }
+  }
+
+  async #restoreStaging(project: ProjectRecord, targetReleaseId: string): Promise<RestoreResult> {
+    const projectId = project.projectId;
     const release = this.#deps.releases.getRelease(targetReleaseId);
     if (release === undefined || release.projectId !== projectId) throw new Error("release_not_found");
 
@@ -105,8 +121,8 @@ export class ReleaseService {
       return { rehearsal, release, checks: [] };
     }
     const host = placement.host;
-    const stagingJobId = this.#stagingJobId(projectId);
     const attempt = this.#deps.releases.listRehearsals(projectId).filter((entry) => entry.releaseId === targetReleaseId).length + 1;
+    const stagingJobId = this.#stagingJobId(projectId, attempt);
     const id = makeRehearsalId(targetReleaseId, attempt);
     const checks: { checkId: string; status: string; exitCode: number | null; outputTail: string }[] = [];
 
@@ -121,13 +137,15 @@ export class ReleaseService {
       await this.#deps.runner.restoreBundle({
         jobId: stagingJobId,
         hostId: host.hostId,
-        operationId: `${stagingJobId}:${targetReleaseId}`,
+        operationId: `${stagingJobId}:${targetReleaseId}:a${attempt}`,
         leaseGeneration: 1,
         bundle,
         expectedCommit: release.commitSha,
       });
       for (const check of project.buildProfile.checks) {
-        const result = await this.#deps.runner.runCheck({ jobId: stagingJobId, hostId: host.hostId, leaseGeneration: 1, checkId: check.id, command: check.command });
+        // Each attempt gets its own operation ids: a settled check from an earlier rehearsal must not
+        // stand in for this one.
+        const result = await this.#deps.runner.runCheck({ jobId: stagingJobId, hostId: host.hostId, leaseGeneration: 1, checkId: `${check.id}:reh${attempt}`, command: check.command });
         checks.push({ checkId: check.id, status: result.status, exitCode: result.exitCode, outputTail: result.outputTail.slice(-2_000) });
       }
       const allPassed = project.buildProfile.checks.length > 0 && checks.length === project.buildProfile.checks.length && checks.every((check) => check.status === "succeeded");
@@ -199,10 +217,16 @@ export class ReleaseService {
   stagingProjects(): string[] {
     const projects = new Set<string>();
     for (const workspace of this.#deps.workflows.stagingWorkspaces()) {
-      const projectId = workspace.jobId.slice("staging-".length);
-      if (projectId.length > 0) projects.add(projectId);
+      const projectId = this.#projectOfStaging(workspace.jobId);
+      if (projectId !== null) projects.add(projectId);
     }
     return [...projects];
+  }
+
+  #projectOfStaging(jobId: string): string | null {
+    if (!jobId.startsWith("staging-")) return null;
+    const stripped = jobId.slice("staging-".length).replace(/-a\d+$/, "");
+    return stripped.length > 0 ? stripped : null;
   }
 
   /**
@@ -210,17 +234,17 @@ export class ReleaseService {
    * reclaiming it is safe; the retained artifacts live outside the workspace.
    */
   async reclaimStaging(projectId: string): Promise<boolean> {
-    const project = this.#deps.workflows.getProject(projectId);
-    if (project === undefined) return false;
-    const stagingJobId = this.#stagingJobId(projectId);
-    const workspace = this.#deps.workflows.getWorkspace(stagingJobId);
-    if (workspace === undefined || workspace.released) return false;
-    try {
-      await this.#deps.runner.cleanupJob({ jobId: stagingJobId, hostId: workspace.hostId });
-      this.#deps.workflows.releaseWorkspace(stagingJobId);
-      return true;
-    } catch {
-      return false;
+    let reclaimed = false;
+    for (const workspace of this.#deps.workflows.stagingWorkspaces()) {
+      if (this.#projectOfStaging(workspace.jobId) !== projectId) continue;
+      try {
+        await this.#deps.runner.cleanupJob({ jobId: workspace.jobId, hostId: workspace.hostId });
+        this.#deps.workflows.releaseWorkspace(workspace.jobId);
+        reclaimed = true;
+      } catch {
+        // The next sweep retries; an offline host never loses the record.
+      }
     }
+    return reclaimed;
   }
 }

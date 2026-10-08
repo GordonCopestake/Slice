@@ -565,11 +565,11 @@ test("a project cannot be activated until its declared toolchain passes on a usa
     const activated = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
     assert.equal(activated.status, 200, "the attested project can be activated");
 
-    // Changing the project invalidates the attestation for the new profile revision.
+    // Pausing and resuming is not a toolchain change; the evidence survives it.
     const paused = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "paused" } });
     assert.equal(paused.status, 200);
-    const afterChange = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
-    assert.equal(afterChange.status, 409, "a changed project must be re-attested");
+    const reactivated = await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } });
+    assert.equal(reactivated.status, 200, "a status change does not demand a fresh probe");
   } finally { await stack.close(); }
 });
 
@@ -631,5 +631,29 @@ test("a blocked job retries after the owner fixes the environment", async () => 
     assert.equal(retried.status, 200);
     assert.equal(retried.body.job.runState, "running");
     assert.equal(retried.body.job.stage, "implementation");
+  } finally { await stack.close(); }
+});
+
+test("editing a project's probes invalidates its attestation instead of leaving a stale pass", async () => {
+  const stack = await startStack();
+  try {
+    await login(stack);
+    await stack.call("/api/hosts", { method: "POST", body: { hostId: "win-a", address: "win.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice/jobs" } });
+    await stack.call("/api/projects", { method: "POST", body: {
+      projectId: "win", repoSlug: "owner/win", defaultBranch: "main", hostId: "win-a", requiredOs: "windows",
+      toolchain: [{ id: "node", command: "node --version" }],
+      buildProfile: { setup: [], checks: [{ id: "test", command: "npm test" }] },
+    } });
+    assert.equal((await stack.call("/api/projects/win/toolchain-check", { method: "POST" })).body.passed, true);
+    assert.equal((await stack.call("/api/projects/win/status", { method: "POST", body: { status: "active" } })).status, 200);
+
+    const edited = await stack.call("/api/projects/win/toolchain", { method: "POST", body: { toolchain: [{ id: "node", command: "node --version" }, { id: "git", command: "git --version" }] } });
+    assert.equal(edited.status, 200);
+    assert.equal(edited.body.attested.ready, false, "the new probe set is not attested");
+    assert.match(edited.body.attested.reason, /different set of probes/);
+
+    // A hostile edit is refused outright, not stored and not silently dropped.
+    const hostile = await stack.call("/api/projects/win/toolchain", { method: "POST", body: { toolchain: [{ id: "evil", command: "git --version && calc.exe" }] } });
+    assert.equal(hostile.status, 400);
   } finally { await stack.close(); }
 });

@@ -352,6 +352,10 @@ export class SliceApi {
         result = await this.#deps.releases.restoreStaging(releaseRestore[1]!, releaseRestore[2]!);
       } catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : "unknown";
+        if (reason === "rehearsal_in_progress") {
+          json(response, 409, { error: "rehearsal_in_progress", message: "A rehearsal for this project is already running on its worker" });
+          return;
+        }
         json(response, reason === "project_not_found" || reason === "release_not_found" ? 404 : 502, { error: "rehearsal_failed", message: reason });
         return;
       }
@@ -377,6 +381,26 @@ export class SliceApi {
         return;
       }
       json(response, 200, { rehearsals: this.#deps.releases.listRehearsals(projectId) });
+      return;
+    }
+
+    const toolchainEdit = /^\/api\/projects\/([A-Za-z0-9._:-]{1,128})\/toolchain$/.exec(path);
+    if (method === "POST" && toolchainEdit !== null) {
+      const body = asObject(await readBody(request));
+      if (!Array.isArray(body.toolchain)) throw new TypeError("toolchain must be an array of { id, command } probes");
+      const project = this.#deps.workflows.getProject(toolchainEdit[1]!);
+      if (project === undefined) {
+        json(response, 404, { error: "project_not_found" });
+        return;
+      }
+      const updated = this.#deps.workflows.setProjectToolchain(toolchainEdit[1]!, body.toolchain.map((item) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) throw new TypeError("toolchain entries must be objects");
+        const tool = item as Record<string, unknown>;
+        return { id: String(tool.id ?? ""), command: String(tool.command ?? "") };
+      }));
+      // The new probe set is not attested yet, and the response says so rather than leaving a stale
+      // green badge in the UI.
+      json(response, 200, { project: updated, attested: this.#deps.workflows.toolchainReady(updated, project.hostId) });
       return;
     }
 

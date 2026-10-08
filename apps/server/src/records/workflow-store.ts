@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { IdempotencyConflictError } from "../state/application-state.js";
 
@@ -213,6 +213,7 @@ export class WorkflowStore {
           passed INTEGER NOT NULL,
           tools_json TEXT NOT NULL,
           profile_revision INTEGER NOT NULL,
+          toolchain_digest TEXT NOT NULL DEFAULT '',
           verified_at INTEGER NOT NULL,
           PRIMARY KEY (host_id, project_id)
         );
@@ -414,18 +415,18 @@ export class WorkflowStore {
    * Record what a worker actually reported for a project's declared tools. An attestation is only
    * valid for the profile revision it was taken against, so a changed toolchain invalidates it.
    */
-  recordAttestation(input: { hostId: string; projectId: string; profileRevision: number; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] }): void {
+  recordAttestation(input: { hostId: string; projectId: string; profileRevision: number; toolchainDigest: string; passed: boolean; tools: { id: string; command: string; exitCode: number | null; version: string | null; outputTail: string }[] }): void {
     assertId("hostId", input.hostId);
     assertId("projectId", input.projectId);
     this.#database.prepare(
-      `INSERT INTO slice_toolchain_attestations (host_id, project_id, passed, tools_json, profile_revision, verified_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO slice_toolchain_attestations (host_id, project_id, passed, tools_json, profile_revision, toolchain_digest, verified_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(host_id, project_id) DO UPDATE SET passed = excluded.passed, tools_json = excluded.tools_json,
-         profile_revision = excluded.profile_revision, verified_at = excluded.verified_at`,
-    ).run(input.hostId, input.projectId, input.passed ? 1 : 0, JSON.stringify(input.tools), input.profileRevision, Date.now());
+         profile_revision = excluded.profile_revision, toolchain_digest = excluded.toolchain_digest, verified_at = excluded.verified_at`,
+    ).run(input.hostId, input.projectId, input.passed ? 1 : 0, JSON.stringify(input.tools), input.profileRevision, input.toolchainDigest, Date.now());
   }
 
-  getAttestation(hostId: string, projectId: string): { hostId: string; projectId: string; passed: boolean; profileRevision: number; verifiedAt: number; tools: Record<string, unknown>[] } | undefined {
+  getAttestation(hostId: string, projectId: string): { hostId: string; projectId: string; passed: boolean; profileRevision: number; toolchainDigest: string; verifiedAt: number; tools: Record<string, unknown>[] } | undefined {
     assertId("hostId", hostId);
     assertId("projectId", projectId);
     const row = this.#database.prepare("SELECT * FROM slice_toolchain_attestations WHERE host_id = ? AND project_id = ?").get(hostId, projectId) as Record<string, unknown> | undefined;
@@ -434,22 +435,25 @@ export class WorkflowStore {
       projectId: String(row.project_id),
       passed: Number(row.passed) !== 0,
       profileRevision: Number(row.profile_revision),
+      toolchainDigest: String(row.toolchain_digest ?? ""),
       verifiedAt: Number(row.verified_at),
       tools: parseJson<Record<string, unknown>[]>(String(row.tools_json), []),
     };
   }
 
   /**
-   * Whether a project's declared tools are attested on a given worker, for the project's current
-   * profile revision. A missing, failed, or stale attestation is not ready - never assumed.
+   * Whether a project's declared tools are attested on a given worker, for the probes the project
+   * declares now. A missing, failed, stale, or partial attestation is not ready - never assumed.
+   * The evidence is bound to the probe set itself, so pausing or resuming a project keeps it valid
+   * and editing a probe invalidates it.
    */
   toolchainReady(project: ProjectRecord, hostId: string): { ready: true } | { ready: false; reason: string } {
     if (project.toolchain.length === 0) return { ready: true };
     const attestation = this.getAttestation(hostId, project.projectId);
     if (attestation === undefined) return { ready: false, reason: `no toolchain attestation on ${hostId} for project ${project.projectId}` };
     if (!attestation.passed) return { ready: false, reason: `the last toolchain check on ${hostId} for ${project.projectId} failed` };
-    if (attestation.profileRevision !== project.revision) {
-      return { ready: false, reason: `the toolchain attestation on ${hostId} is for profile revision ${attestation.profileRevision}; the project is on ${project.revision}` };
+    if (attestation.toolchainDigest !== toolchainDigest(project.toolchain)) {
+      return { ready: false, reason: `the toolchain attestation on ${hostId} was taken against a different set of probes for ${project.projectId}` };
     }
     const attested = new Map(attestation.tools.map((tool) => [String(tool.id ?? ""), tool]));
     for (const tool of project.toolchain) {
@@ -597,6 +601,22 @@ export class WorkflowStore {
       .prepare("UPDATE slice_projects SET status = ?, revision = revision + 1, updated_at = ? WHERE project_id = ?")
       .run(status, Date.now(), projectId);
     return this.getProject(projectId);
+  }
+
+  /**
+   * Refine a project's declared probes. The new probe set has a different digest, so any existing
+   * attestation stops satisfying the project until the worker is probed again.
+   */
+  setProjectToolchain(projectId: string, toolchain: { id: string; command: string }[]): ProjectRecord {
+    assertId("projectId", projectId);
+    const project = this.getProject(projectId);
+    if (project === undefined) throw new Error("project_not_found");
+    const rules = toolchainRules(toolchain);
+    if (rules.length === 0) throw new TypeError("A project's toolchain must contain at least one well-formed probe");
+    if (project.requiredOs === "windows" && rules.length === 0) throw new TypeError("A Windows project must declare the toolchain its build profile needs");
+    this.#database.prepare("UPDATE slice_projects SET toolchain_json = ?, updated_at = ? WHERE project_id = ?")
+      .run(JSON.stringify(rules), Date.now(), projectId);
+    return this.getProject(projectId)!;
   }
 
   // ----------------------------------------------------------------- jobs
@@ -1177,6 +1197,14 @@ function toProject(row: Record<string, unknown>): ProjectRecord {
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
+}
+
+/**
+ * What a toolchain attestation is bound to. A status change is not a toolchain change, so the
+ * evidence survives pausing and resuming; editing a probe invalidates it.
+ */
+export function toolchainDigest(toolchain: { id: string; command: string }[]): string {
+  return createHash("sha256").update(JSON.stringify(toolchain.map((tool) => [tool.id, tool.command]))).digest("hex");
 }
 
 /** Toolchain entries are plain argv commands, validated the same way the runner validates them. */

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { WorkflowStore, type BuildProfile, type ProjectRecord } from "../../apps/server/src/records/workflow-store.js";
+import { toolchainDigest, WorkflowStore, type BuildProfile, type ProjectRecord } from "../../apps/server/src/records/workflow-store.js";
 import { modelPolicy, modelPolicyViolation } from "../../apps/server/src/workflow/model-policy.js";
 
 const PROFILE: BuildProfile = { setup: [], checks: [{ id: "test", command: "npm test" }] };
@@ -218,21 +218,21 @@ test("a declared toolchain is only satisfied by an attestation that actually pas
     assert.equal(missing.ready, false);
     assert.ok(!missing.ready && missing.reason.includes("no toolchain attestation"), missing.reason);
 
-    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, passed: false, tools: [
+    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, toolchainDigest: toolchainDigest(win.toolchain), passed: false, tools: [
       { id: "node", command: "node --version", exitCode: 1, version: null, outputTail: "not found" },
     ] });
     const failed = store.toolchainReady(win, "win-a");
     assert.equal(failed.ready, false);
     assert.ok(!failed.ready && failed.reason.includes("failed"), failed.reason);
 
-    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, passed: true, tools: [
+    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, toolchainDigest: toolchainDigest(win.toolchain), passed: true, tools: [
       { id: "node", command: "node --version", exitCode: 0, version: "v22.19.0", outputTail: "" },
     ] });
     const partial = store.toolchainReady(win, "win-a");
     assert.equal(partial.ready, false);
     assert.ok(!partial.ready && partial.reason.includes("git was never probed"), partial.reason);
 
-    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, passed: true, tools: [
+    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, toolchainDigest: toolchainDigest(win.toolchain), passed: true, tools: [
       { id: "node", command: "node --version", exitCode: 0, version: "v22.19.0", outputTail: "" },
       { id: "git", command: "git --version", exitCode: 0, version: "git version 2.47.0", outputTail: "" },
     ] });
@@ -242,12 +242,20 @@ test("a declared toolchain is only satisfied by an attestation that actually pas
     store.registerHost({ hostId: "win-b", address: "w2.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice2" });
     assert.equal(store.toolchainReady(win, "win-b").ready, false, "attestations are per host");
 
-    // Changing the project bumps its revision and invalidates the attestation.
-    const bumped = store.setProjectStatus("win", "paused")!;
-    assert.notEqual(bumped.revision, win.revision);
-    const stale = store.toolchainReady(bumped, "win-a");
-    assert.equal(stale.ready, false);
-    assert.ok(!stale.ready && stale.reason.includes("profile revision"), stale.reason);
+    // Pausing and resuming is a status change, not a toolchain change: the evidence stays valid.
+    const paused = store.setProjectStatus("win", "paused")!;
+    assert.notEqual(paused.revision, win.revision);
+    assert.deepEqual(store.toolchainReady(paused, "win-a"), { ready: true }, "a status change does not invalidate toolchain evidence");
+
+    // Editing a probe does invalidate it: the attestation no longer describes what the project asks.
+    const edited = store.setProjectToolchain("win", [{ id: "node", command: "node --version" }, { id: "git", command: "git version" }]);
+    const mismatched = store.toolchainReady(edited, "win-a");
+    assert.equal(mismatched.ready, false);
+    assert.ok(!mismatched.ready && mismatched.reason.includes("different set of probes"), mismatched.reason);
+
+    // Hostile edits are refused rather than stored.
+    assert.throws(() => store.setProjectToolchain("win", [{ id: "evil", command: "git --version && calc.exe" }]), /at least one well-formed probe/);
+    assert.throws(() => store.setProjectToolchain("missing", [{ id: "node", command: "node --version" }]), /project_not_found/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -258,7 +266,7 @@ test("an attestation cannot smuggle a command the project did not declare", () =
   try {
     store.registerHost({ hostId: "win-a", address: "w.internal", os: "windows", sshUser: "slice", runnerRoot: "D:/slice" });
     const win = project(store, { projectId: "win", requiredOs: "windows", hostId: "win-a", toolchain: [{ id: "node", command: "node --version" }] });
-    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, passed: true, tools: [
+    store.recordAttestation({ hostId: "win-a", projectId: "win", profileRevision: win.revision, toolchainDigest: toolchainDigest(win.toolchain), passed: true, tools: [
       // Same tool id, different command: the probe that ran is not the probe the project asked for.
       { id: "node", command: "node -e process.exit(0)", exitCode: 0, version: "v22.19.0", outputTail: "" },
     ] });

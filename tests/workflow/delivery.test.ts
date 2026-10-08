@@ -762,3 +762,23 @@ test("a release whose retained artifact is gone is not restorable, and the rehea
     assert.equal(rehearsal.rehearsal.evidenceArtifactId, null);
   } finally { await h.close(); }
 });
+
+test("two rehearsals for one project cannot share a staging workspace", async () => {
+  const h = await newHarness();
+  try {
+    const patch = makePatch(h.originDir, h.artifactsDir, (work) => writeFileSync(join(work, "notes.md"), "notes\n"));
+    const jobId = await createReadyJob(h, "rel5", [patch]);
+    h.gitHost.ownerMerge(h.deliveryStore.getDelivery(jobId)!.prNumber!);
+    assert.equal(await h.delivery.observeMerge(jobId), "merged");
+    const release = h.releases.rollbackTarget("demo")!;
+    const first = h.releaseService.restoreStaging("demo", release.releaseId);
+    // The second request arrives while the first is still running on the same worker.
+    await assert.rejects(() => h.releaseService.restoreStaging("demo", release.releaseId), /rehearsal_in_progress/);
+    const settled = await first;
+    assert.equal(settled.rehearsal.outcome, "passed", settled.rehearsal.reason ?? "");
+    // The guard releases: a later rehearsal is allowed.
+    const second = await h.releaseService.restoreStaging("demo", release.releaseId);
+    assert.equal(second.rehearsal.outcome, "passed", second.rehearsal.reason ?? "");
+    assert.equal(h.releases.listRehearsals("demo").length, 2, "each attempt is its own record");
+  } finally { await h.close(); }
+});
